@@ -23,8 +23,10 @@ feature selections in the pinned txiki.js artifact workflow, including libuv,
 QuickJS, mimalloc, mbedTLS crypto, miniz, SQLite and embedded JavaScript.
 
 A binary release must include the unmodified MPL-covered Cargo source archives,
-with SHA256 values matching Cargo.lock. AppImage redistribution is deferred
-until the extra bundled Linux system libraries are inventoried separately.
+with SHA256 values matching Cargo.lock; `scripts/release/mpl-sources.mjs`
+collects and verifies them. Every package also bundles these notice files. No
+AppImage is distributed: its extra bundled Linux system libraries have not been
+inventoried.
 
 Regenerate and review the inventory when the source pins, dependency locks or
 packaging change. Preserve upstream copyright and attribution notices.
