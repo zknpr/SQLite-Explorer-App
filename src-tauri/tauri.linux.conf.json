@@ -1,9 +1,9 @@
 {
   "bundle": {
-    "targets": ["deb", "appimage"],
+    "targets": ["deb"],
     "linux": {
       "deb": {
-        "depends": ["libsm6", "libice6"],
+        "depends": ["libsm6", "libice6", "libc6 (>= 2.38)"],
         "desktopTemplate": "linux/sqlite-explorer.desktop"
       }
     }

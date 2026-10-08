@@ -4302,6 +4302,7 @@ mod tests {
             ("tauri.conf.json", include_str!("../tauri.conf.json")),
             ("tauri.windows.conf.json", include_str!("../tauri.windows.conf.json")),
             ("tauri.linux.conf.json", include_str!("../tauri.linux.conf.json")),
+            ("tauri.macos.conf.json", include_str!("../tauri.macos.conf.json")),
             ("tauri.qa.conf.json", include_str!("../tauri.qa.conf.json")),
         ] {
             assert!(!text.contains("useHttpsScheme"), "{name} sets useHttpsScheme");
