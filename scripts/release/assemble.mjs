@@ -86,7 +86,7 @@ ${rows.join('\n')}
 
 - **macOS:** the app has an ad-hoc signature and is not notarized. The first launch is blocked; open **System Settings → Privacy & Security** and choose **Open Anyway** for SQLite Explorer.
 - **Windows:** the installer is unsigned. SmartScreen shows "Windows protected your PC"; choose **More info → Run anyway**. If **Smart App Control** is on, Windows blocks unsigned programs and offers no override, so this release cannot be installed there.
-- **Linux:** the package needs glibc 2.38 or newer (Ubuntu 24.04+, Debian 13+). Install it with \`sudo apt install ./${PLATFORMS.linux.asset(version)}\`.
+- **Linux:** the package needs glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+). Install it with \`sudo apt install ./${PLATFORMS.linux.asset(version)}\`.
 
 See the [installation notes](https://github.com/${REPOSITORY}#install) for uninstalling and for the platforms this release was tested on.
 

@@ -62,14 +62,15 @@ anyway**. If **Smart App Control** is on, Windows blocks unsigned programs and
 offers no override, so the installer cannot run there. To uninstall, use
 **Settings → Apps → Installed apps → SQLite Explorer → Uninstall**.
 
-**Linux (x86-64, Debian/Ubuntu).** The package needs glibc 2.38 or newer
+**Linux (x86-64, Debian/Ubuntu).** The package needs glibc 2.39 or newer
 (Ubuntu 24.04+, Debian 13+):
 
 ```sh
 sudo apt install ./SQLite-Explorer-<version>-linux-amd64.deb
 ```
 
-To uninstall, run `sudo apt remove sqlite-explorer`. AppImage packages are not
+To uninstall, run `sudo apt remove sq-lite-explorer` (the package name Tauri
+derives from the product name). AppImage packages are not
 provided.
 
 ## Build from a checkout

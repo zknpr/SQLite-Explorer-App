@@ -37,6 +37,8 @@
   },
   "bundle": {
     "active": true,
+    "shortDescription": "Browse and edit SQLite databases",
+    "longDescription": "A desktop SQLite browser and editor: browse tables and views, edit cells with undo and explicit save, run SQL with parameters and query plans, and import or export CSV and JSON.",
     "targets": ["dmg", "app"],
     "resources": {
       "../viewer-dist/native/": "native/",

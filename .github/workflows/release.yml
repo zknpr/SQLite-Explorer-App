@@ -37,8 +37,8 @@ jobs:
           - platform: macos
             runner: macos-latest
             bundles: app,dmg
-          # tjs needs glibc 2.38, so older build hosts would not widen support;
-          # 24.04 is also the release-tested Linux.
+          # tjs needs glibc 2.38 and the app built here 2.39, so an older build
+          # host would not widen support much; 24.04 is the release-tested Linux.
           - platform: linux
             runner: ubuntu-24.04
             bundles: deb

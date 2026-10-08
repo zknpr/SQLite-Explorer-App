@@ -41,7 +41,7 @@ downloaded package or close the macOS interaction gates.
 | Release pipeline | Builds macOS, Linux and Windows packages on their own OS from the viewer pin, with no cache, and drafts a release for a `v*` tag. Each asset gets SHA256SUMS and a build-provenance attestation. Publishing is manual |
 | Third-party notices | Bundled inside every package; the release also attaches them with the MPL Cargo sources, which are checksum-verified against Cargo.lock |
 | AppImage distribution | Not distributed: its extra bundled Linux system libraries have no notice/source inventory. Linux ships as `.deb` |
-| Linux glibc floor | The native engine needs glibc 2.38; the `.deb` declares `libc6 (>= 2.38)` and the workflow fails if any packaged binary needs more |
+| Linux glibc floor | The native engine needs glibc 2.38 and the app built on Ubuntu 24.04 needs 2.39; the `.deb` declares `libc6 (>= 2.39)` and the workflow fails if any packaged binary needs more |
 | Final macOS installed-package checks | Open cases and older tested source are recorded in [macOS QA](macos-release-qa.md); rerun against the final candidate |
 | Linux/Windows installed-package checks | Passed for the packages and environments in [Linux/Windows QA](linux-windows-release-qa.md), including real shutdown/restart. Those packages predate the navigation pin and CSP change; rerun the affected checks on new packages |
 | Other Linux desktops, Wayland and physical keyboards | Unverified; limit platform claims to observed coverage |
