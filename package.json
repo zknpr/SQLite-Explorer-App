@@ -1,0 +1,17 @@
+{
+  "name": "sqlite-explorer-desktop",
+  "version": "0.2.0",
+  "description": "SQLite Explorer desktop shell (Tauri v2) around the extension's desktop viewer artifacts",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "sync-viewer": "node scripts/sync-viewer.mjs",
+    "test": "node --test scripts/*.test.mjs",
+    "test:gui": "node scripts/qa/port-regressions.mjs"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "playwright-core": "1.63.0"
+  }
+}

@@ -1,0 +1,53 @@
+name: CI
+
+# The committed viewer-dist/ carries the Apple Silicon macOS native runtime, so
+# the shell is tested on the platform those artifacts were built for. Other
+# targets need their native artifacts synced from the upstream pin first (see
+# CONTRIBUTING.md); installed-app checks remain manual (docs/*-release-qa.md).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Verify artifacts, test & lint
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify viewer artifacts against the manifest
+        run: node scripts/sync-viewer.mjs --verify
+
+      - name: Script tests
+        run: npm test
+
+      # Pinned so a new stable's lints cannot turn `-D warnings` red on an
+      # unchanged tree; bump together with the notices' Rust inventory.
+      - name: Install Rust 1.93.0
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal --component clippy
+          rustup default 1.93.0
+
+      - name: Shell unit tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

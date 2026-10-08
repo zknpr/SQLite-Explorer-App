@@ -1,0 +1,18 @@
+{
+  "productName": "SQLite Explorer QA",
+  "identifier": "xyz.zknpr.sqlite-explorer.qa",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "SQLite Explorer QA",
+        "url": "viewer.html",
+        "width": 1440,
+        "height": 1000,
+        "minWidth": 800,
+        "minHeight": 500,
+        "focus": false
+      }
+    ]
+  }
+}

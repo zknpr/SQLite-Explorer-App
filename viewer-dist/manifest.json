@@ -1,0 +1,18 @@
+{
+  "source": "SQLite-Explorer desktop/ build target",
+  "ref": "d503473a7dd6a3ed3d77aad1b506b45379d1da2a",
+  "target": "aarch64-macos",
+  "syncedAt": "2026-09-22T11:27:39.793Z",
+  "files": {
+    "viewer.html": "0a94f34a9565b29e6830463387dfc0747acece8bc5b0e98848007c5b7d4e0699",
+    "worker.js": "218b81bddc56b8dbf8b9ed1ffb64f3277f92f9bdda824661e33dca85678464cb",
+    "sql-wasm.js": "8d044434bd1ed032816b7fe3559fa77421033b175c080bd9f6190df166bd846a",
+    "sql-wasm.wasm": "10013ab296e8adfa5df66c86e3fc5b10726078185646c7f31d11b527bbbca063",
+    "dev-harness.html": "baf76f7b3494a2e76ff156aed1297d28e8cedd44f0ca383fa9f917ce8a869c2f",
+    "codicons/codicon.css": "04fca10892d8f2be5104c920b640d9a58ddcf87f4902ea300fcf08de6634f3f6",
+    "codicons/codicon.ttf": "2bb558cb693451e73c28c33fe64aa89bc19b1a4b70f95948322c243f93476920",
+    "native/native-worker-desktop.js": "cb9e0869ac442e56b5f33fee3b8d6b030d5091908092ba6ce689b6c55431ad87",
+    "native/query-plan.dylib": "3a51dcd0ebc627e63d664e9b9c317667cb356f197e0d5645262bc3b5ef7b8c3c",
+    "native/tjs": "2927d5dfe7d240310d53d1ad583497ac9fc5f17c84354d43ee020d42e8ba6dfa"
+  }
+}

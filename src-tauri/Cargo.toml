@@ -1,0 +1,52 @@
+[package]
+name = "sqlite-explorer-desktop"
+version = "0.2.0"
+description = "SQLite Explorer desktop shell"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/zknpr/SQLite-Explorer-App"
+
+[lib]
+name = "sqlite_explorer_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# Explicitly opted into by the macOS app test runner; never part of a release.
+qa-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-wdio-webdriver = { version = "=1.4.0", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Tauri already runs on this exact tokio; declared directly so `native_rpc` can
+# await a oneshot with a deadline instead of parking a thread on a blocking
+# recv (see RPC_TIMEOUT / Responder in native.rs). "sync" + "time" only — no
+# runtime is constructed here, tauri's global one is reused.
+tokio = { version = "1", features = ["sync", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `applicationShouldTerminate:` — the only veto macOS offers on an OS-initiated
+# quit, and the one selector tao's app delegate does not implement (see
+# src/terminate.rs). Reaching it means the objc runtime, and objc2 is ALREADY in
+# the lock file at 0.6.4 underneath tao/wry, so this declares a crate the tree
+# already builds rather than adding one. Caret, not `=`: it resolves to that
+# same 0.6.4 today and still unifies if wry moves to a later 0.6.x — an exact
+# pin would eventually make the tree unsatisfiable. The AppKit bindings
+# (objc2-app-kit) are deliberately NOT taken: the hook needs two constants and
+# one selector, not a framework.
+objc2 = "0.6.4"
+
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK for the allowlisted-path read: opening a FIFO or a device without
+# it blocks forever with nothing able to interrupt it (see read_regular_file).
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# File IDs and change times from the same handle that supplied the bytes.
+windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Shutdown", "Win32_System_Threading"] }
+percent-encoding = "2"

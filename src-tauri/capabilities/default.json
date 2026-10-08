@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Least privilege for a page that renders untrusted database content. withGlobalTauri hands that page the whole __TAURI__ JS surface, so THIS FILE is the boundary, not bridge.js. The page's entire ACL-checked usage is getCurrentWebviewWindow().listen (plugin:event|listen / |unlisten) for the desktop-menu and desktop-open-file events; every other call it makes is an app command, which is not ACL-gated. Nothing else is granted: no core:default (its menu/tray members let a page mint a menu item carrying a shell menu id — new-window, quit-app, clear-recents — that this shell's own global handler then runs on a user click, and its event emit/emit-to defeat the per-window emit_to routing), and no dialog:default (the shell opens every dialog from Rust, which bypasses the ACL, while granting it to the page buys spoofable native alerts and widens the asset-protocol scope to whatever a page-opened picker returns). The two core:image denies are kept as tripwires: nothing allows them today, and deny beats allow, so re-adding an aggregate cannot silently reopen the arbitrary-file-read image oracle. capability_grants_only_what_the_bridge_calls holds this list.",
+  "windows": ["main", "db-*"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:image:deny-from-path",
+    "core:image:deny-from-bytes"
+  ]
+}

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Categories=Development;Database;
+Comment={{comment}}
+# File-manager launches must pass the selected paths, including multi-selection.
+Exec={{exec}} %F
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name={{name}}
+Terminal=false
+Type=Application
+MimeType=application/vnd.sqlite3;application/x-sqlite3;application/geopackage+sqlite3;

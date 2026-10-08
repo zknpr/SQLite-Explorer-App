@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SQLite Explorer",
+  "version": "0.2.0",
+  "identifier": "xyz.zknpr.sqlite-explorer",
+  "build": {
+    "frontendDist": "../viewer-dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "SQLite Explorer",
+        "url": "viewer.html",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 500
+      }
+    ],
+    "security": {
+      "dangerousDisableAssetCspModification": ["style-src"],
+      "csp": {
+        "default-src": "'none'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob:",
+        "media-src": "'self' blob:",
+        "font-src": "'self'",
+        "worker-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost 'self'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-ancestors": "'none'"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app"],
+    "resources": {
+      "../viewer-dist/native/": "native/"
+    },
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "fileAssociations": [
+      {
+        "ext": ["db", "sqlite", "sqlite3", "db3", "sdb", "s3db", "gpkg"],
+        "name": "SQLite Database",
+        "description": "SQLite database file",
+        "role": "Editor"
+      }
+    ]
+  }
+}

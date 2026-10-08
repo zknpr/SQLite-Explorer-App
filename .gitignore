@@ -1,0 +1,12 @@
+node_modules/
+.worktrees/
+src-tauri/target/
+docs/superpowers/
+.DS_Store
+.superpowers/
+
+# Playwright MCP scratch (page snapshots, console logs) — debugging artifacts, never source
+.playwright-mcp/
+
+# Local installers and QA evidence.
+artifacts/
