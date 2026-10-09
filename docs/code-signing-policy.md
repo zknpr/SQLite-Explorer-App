@@ -11,7 +11,7 @@ published by a maintainer.
 
 | Package | Signature |
 | --- | --- |
-| macOS `.dmg` | Ad-hoc signature with the hardened runtime. Not signed with an Apple Developer ID and not notarized. |
+| macOS `.dmg` | The disk image is unsigned. The app inside has an ad-hoc signature with the hardened runtime. Neither is signed with an Apple Developer ID, and nothing is notarized. |
 | Windows installer | Unsigned. Signing through the SignPath Foundation is planned. |
 | Linux `.deb` | Unsigned, as is usual for packages installed directly rather than from an apt repository. |
 
@@ -20,9 +20,12 @@ Unsigned and ad-hoc packages are still verifiable. Each release lists
 ties it to the workflow run and commit that produced it:
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS
+shasum -a 256 --check --ignore-missing SHA256SUMS   # macOS
+sha256sum --check --ignore-missing SHA256SUMS       # Linux
 gh attestation verify <downloaded file> --repo zknpr/SQLite-Explorer-App
 ```
+
+On Windows, use the PowerShell `Get-FileHash` command from the release notes.
 
 ### Windows: what signing will and will not cover
 
