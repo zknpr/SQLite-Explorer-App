@@ -47,6 +47,11 @@ objc2 = "0.6.4"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# The request pin (src/request_pin.rs) talks to WebView2 directly. Both crates
+# are already in the lock underneath wry at these versions, so this adds no
+# package to the release graph.
+webview2-com = "0.38"
+windows = "0.61"
 # File IDs and change times from the same handle that supplied the bytes.
 windows-sys = { version = "0.60", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Shutdown", "Win32_System_Threading"] }
 percent-encoding = "2"

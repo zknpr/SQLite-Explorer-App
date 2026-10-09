@@ -4,7 +4,8 @@ name: Release
 # GitHub release for a v* tag. Publishing the draft stays a manual maintainer
 # step. Nothing here restores a cache: every package comes from a clean runner,
 # so a poisoned cache can never reach a release. Pull requests that touch the
-# pipeline run the build jobs only.
+# pipeline or the shell run the build jobs only; ci.yml builds on macOS alone,
+# so this is where Windows- and Linux-only shell code first compiles.
 on:
   push:
     tags: ['v*']
@@ -14,8 +15,8 @@ on:
       - .github/workflows/release.yml
       - scripts/release/**
       - scripts/sync-viewer.mjs
-      - src-tauri/tauri*.conf.json
-      - viewer-dist/manifest.json
+      - src-tauri/**
+      - viewer-dist/**
 
 concurrency:
   group: release-${{ github.ref }}
