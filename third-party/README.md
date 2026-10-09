@@ -30,3 +30,9 @@ inventoried.
 
 Regenerate and review the inventory when the source pins, dependency locks or
 packaging change. Preserve upstream copyright and attribution notices.
+`scripts/release/notices.mjs` runs in CI and in every release build. It fails
+when the inventory's Cargo components differ from the packages a release
+resolves, when the inventory was built for another viewer pin, or when an
+inventoried component has no section in the notices. No generator is checked in
+yet: on a failure, add or remove the affected components and their notice texts
+by hand, then rerun the check.

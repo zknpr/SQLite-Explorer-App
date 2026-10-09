@@ -119,6 +119,11 @@ jobs:
           npm test
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
+      # Every package bundles THIRD_PARTY_NOTICES.txt, so no release may ship
+      # notices that miss a dependency or describe another viewer pin.
+      - name: Third-party notices match the release dependency graph
+        run: node scripts/release/notices.mjs
+
       - name: Build
         run: npm run tauri build -- --bundles "$BUNDLES"
 

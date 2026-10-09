@@ -181,3 +181,31 @@ test('the release notes give a checksum command that exists on each platform', a
   assert.match(notes, /Get-FileHash/, 'Windows');
   assert.match(notes, /sha256sum --check --ignore-missing SHA256SUMS/, 'Linux');
 });
+
+test('notice drift is caught in every direction', async () => {
+  const { checkNotices, releaseCargoPackages } = await import('./notices.mjs');
+  const metadata = {
+    packages: [
+      { id: 'app', name: 'sqlite-explorer-desktop', version: '0.3.0', source: null },
+      { id: 'a', name: 'serde', version: '1.0.0', source: 'registry+x' },
+      { id: 'q', name: 'axum', version: '0.8.9', source: 'registry+x' }
+    ],
+    // `axum` is in the lock (a qa-webdriver dependency) but not resolved for a release.
+    resolve: { nodes: [{ id: 'app' }, { id: 'a' }] }
+  };
+  const releasePackages = releaseCargoPackages(metadata);
+  assert.deepEqual([...releasePackages], ['serde 1.0.0'], 'the workspace crate and unresolved packages are excluded');
+  const inventory = { viewerSource: 'pin', components: [{ component: 'serde 1.0.0', ecosystem: 'Cargo' }, { component: 'sql.js 1.14.1' }] };
+  const noticesText = 'serde 1.0.0\n...\nsql.js 1.14.1\n';
+  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText, viewerRef: 'pin' }), []);
+
+  const bumped = new Set(['serde 1.0.1']);
+  assert.deepEqual(checkNotices({ releasePackages: bumped, inventory, noticesText, viewerRef: 'pin' }), [
+    'release ships serde 1.0.1, which the inventory and notices omit',
+    'inventory lists serde 1.0.0, which a release no longer ships'
+  ]);
+  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText, viewerRef: 'newpin' }),
+    ['inventory was built for viewer pin, but viewer-dist is pinned to newpin']);
+  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText: 'serde 1.0.0\n', viewerRef: 'pin' }),
+    ['THIRD_PARTY_NOTICES.txt has no section for sql.js 1.14.1']);
+});
