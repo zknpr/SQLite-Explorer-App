@@ -1,6 +1,6 @@
 # Release readiness
 
-Status checked October 8, 2026, for desktop 0.2.0 and the extension 1.8.1
+Status checked October 8, 2026, for desktop 0.3.0 and the extension 1.8.1
 integration. The source is public under MIT. Release packages are built by the
 [release workflow](../.github/workflows/release.yml); the gates below separate
 source publication from binary distribution.
