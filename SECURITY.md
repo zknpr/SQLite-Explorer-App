@@ -6,8 +6,8 @@ compromised webview cannot become arbitrary file access on the user's machine.
 
 ## Supported versions
 
-This repository does not publish binary releases yet. Security fixes land on
-`main`.
+Only the latest [release](https://github.com/zknpr/SQLite-Explorer-App/releases/latest)
+receives security fixes. Fixes land on `main` and ship in the next release.
 
 ## Reporting a vulnerability
 
