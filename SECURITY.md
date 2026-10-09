@@ -59,7 +59,10 @@ Out of scope:
 - Writes are atomic: an exclusive temporary file, `fsync`, then rename.
 - The CSP sets `default-src 'none'`, an eval-free `script-src`, and
   `base-uri`, `form-action` and `frame-ancestors` to `'none'`.
-- A navigation handler keeps every webview on the app's own origin.
+- A navigation handler keeps every webview on the app's own origin. On
+  Windows, WebView2 sends a cancelled navigation's request anyway, so a request
+  filter also refuses every web request to a host other than the app's own
+  before it leaves the machine.
 - The native engine refuses `ATTACH`/`DETACH`, and the shell re-checks the
   bound file's identity around every native call.
 

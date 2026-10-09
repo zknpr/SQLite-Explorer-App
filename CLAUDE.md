@@ -82,6 +82,17 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   not cover navigation, so without it a compromised page exfiltrates through `location`.
   A plugin hook runs for every webview, so `db-<n>` windows cannot be built without it.
   `window.open` is already refused: no new-window handler is installed.
+- **Windows request pin** (`request_pin.rs`): WebView2 SENDS a refused navigation's request.
+  `NavigationStarting` is cancelled synchronously and the page stays, but `location.href`,
+  `location.assign`, link clicks and meta refresh still delivered their URL to a foreign
+  server (measured on WebView2 154; WKWebView and WebKitGTK sent nothing). So the same
+  plugin's `on_webview_ready` installs a `*` `WebResourceRequested` filter that answers
+  every web request (http/https/ws/wss) off `app_request_origins` with a local 403.
+  Only `data:`/`blob:`/`about:` pass; every other scheme is refused, `file:` included,
+  because a `file://host/` URI is a UNC/SMB connection that can leak NTLM credentials. wry's custom-protocol handler ignores foreign URIs,
+  so the two coexist. `the_request_pin_admits_what_the_csp_connects_to` keeps IPC admitted.
+  Verify Windows navigation claims by counting hits on a foreign listener, never by
+  checking whether the page moved.
 - **Capabilities are the real boundary** (`withGlobalTauri` hands the page the full
   `__TAURI__` surface, so `bridge.js` is hygiene, not a boundary). The set is exactly
   `core:event:allow-listen` + `allow-unlisten` (all the bridge's `listen` needs; every

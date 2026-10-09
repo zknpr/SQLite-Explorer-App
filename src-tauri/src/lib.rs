@@ -18,6 +18,8 @@ mod native;
 #[cfg(target_os = "linux")]
 mod linux_session;
 #[cfg(windows)]
+mod request_pin;
+#[cfg(windows)]
 mod windows_file_info;
 #[cfg(windows)]
 mod windows_session;
@@ -157,14 +159,66 @@ fn is_app_navigation(target: &tauri::Url, allowed: &[tauri::Url]) -> bool {
     })
 }
 
+/// The origins a webview may send network requests to: the asset origin and,
+/// on Windows, the IPC endpoint the bridge fetches (`connect-src` lists it). Only
+/// `request_pin` consults this; `the_request_pin_admits_what_the_csp_connects_to`
+/// holds it to the CSP.
+// Only `request_pin` (Windows) calls these three; the tests run everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn app_request_origins() -> Vec<tauri::Url> {
+    vec![
+        served_origin(),
+        tauri::Url::parse("http://ipc.localhost").expect("static origin parses"),
+    ]
+}
+
+/// SECURITY: whether a webview request may proceed. Web schemes must target an
+/// app origin. Only schemes whose bytes come from the page itself (`data:`,
+/// `blob:`, `about:`) pass. Every other scheme is refused, because "not a web
+/// scheme" does not mean local: on Windows a `file://host/…` URI is a UNC path,
+/// an SMB connection to that host that can also hand it the user's NTLM
+/// credentials. On Windows the app's own custom protocols arrive as
+/// `http://<name>.localhost`, so nothing legitimate is lost. A URI that does not
+/// parse is refused.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_app_request(target: &str, allowed: &[tauri::Url]) -> bool {
+    let Ok(url) = tauri::Url::parse(target) else {
+        return false;
+    };
+    match url.scheme() {
+        "http" | "https" | "ws" | "wss" => is_app_navigation(&url, allowed),
+        "data" | "blob" | "about" => true,
+        _ => false,
+    }
+}
+
+/// `scheme://host` of a refused URL for the log. The rest is whatever the page
+/// tried to smuggle out, and it does not belong in a log.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn origin_for_log(target: &str) -> String {
+    match tauri::Url::parse(target) {
+        Ok(url) => format!("{}://{}", url.scheme(), url.host_str().unwrap_or("")),
+        Err(_) => "an unparseable URI".into(),
+    }
+}
+
 /// Installs `is_app_navigation` on EVERY webview, the config-declared window and
 /// the `db-<n>` windows alike: a plugin's navigation hook runs for each webview
 /// the app creates, so no window can be built without it. In a `tauri dev` build
 /// the page comes from `devUrl` instead (tauri's `get_app_url`), so that origin is
 /// admitted there and only there. `window.open` needs no hook — with no new-window
 /// handler installed, wry refuses every new-window request on all three platforms.
+///
+/// On Windows the navigation hook is not enough on its own: WebView2 has already
+/// sent a refused navigation's request when the cancel lands, so `request_pin`
+/// also refuses foreign requests at the network layer, installed on each webview
+/// as it becomes ready.
 fn navigation_pin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new("navigation-pin")
+        .on_webview_ready(|_webview| {
+            #[cfg(windows)]
+            install_request_pin(&_webview);
+        })
         .on_navigation(|webview, url| {
             let mut allowed = vec![served_origin()];
             if tauri::is_dev() {
@@ -183,6 +237,26 @@ fn navigation_pin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
             permitted
         })
         .build()
+}
+
+/// A webview without the request pin still has the navigation pin, so a failure
+/// here is reported, not fatal: closing the window would leave the app unusable
+/// on a WebView2 that lacks an API this needs.
+#[cfg(windows)]
+fn install_request_pin<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
+    let mut allowed = app_request_origins();
+    if tauri::is_dev() {
+        allowed.extend(webview.config().build.dev_url.clone());
+    }
+    let label = webview.label().to_string();
+    let reached = webview.with_webview(move |platform| {
+        if let Err(e) = request_pin::install(platform.controller(), platform.environment(), allowed) {
+            eprintln!("could not install the request pin on webview {label}: {e}");
+        }
+    });
+    if let Err(e) = reached {
+        eprintln!("could not reach webview {} to install the request pin: {e}", webview.label());
+    }
 }
 
 /// Source of `db-<n>` labels. Monotonic for the life of the process — see
@@ -4313,6 +4387,62 @@ mod tests {
         let source = include_str!("lib.rs");
         let live = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests module")];
         assert!(live.contains(".plugin(navigation_pin())"));
+    }
+
+    /// WebView2 sends a refused navigation's request anyway, so on Windows the
+    /// request pin must refuse every web request off the app's origins, in any
+    /// form a page can issue one, while leaving local schemes alone.
+    #[test]
+    fn the_request_pin_refuses_web_requests_off_the_app_origins() {
+        let url = |text: &str| tauri::Url::parse(text).expect("test URL parses");
+        let windows = [url("http://tauri.localhost"), url("http://ipc.localhost")];
+        for allowed in [
+            "http://tauri.localhost/viewer.html",
+            "http://tauri.localhost/viewer.html?nav=control",
+            "http://ipc.localhost/plugin%3Aevent%7Clisten",
+            "data:image/png;base64,iVBORw0KGgo=",
+            "blob:http://tauri.localhost/2a7c1f80-5d1e-4b7e-9c55-8d1f3b0a6e21",
+        ] {
+            assert!(is_app_request(allowed, &windows), "{allowed}");
+        }
+        for refused in [
+            "http://127.0.0.1:64912/nav-href?leak=1",
+            "https://attacker.example/?leak=1",
+            "ws://attacker.example/socket",
+            "wss://attacker.example/socket",
+            "http://tauri.localhost.attacker.example/",
+            "http://ipc.localhost:8080/",
+            "https://tauri.localhost/viewer.html",
+            "not a uri",
+            // On Windows a hosted file: URI is a UNC path: an SMB connection to
+            // that host, which can also hand it the user's NTLM credentials.
+            "file://attacker.example/share/x",
+            "file:///C:/Windows/win.ini",
+            "ftp://attacker.example/x",
+            "chrome-extension://abcdefghijklmnop/x",
+        ] {
+            assert!(!is_app_request(refused, &windows), "{refused}");
+        }
+        assert!(is_app_request("about:blank", &windows));
+        assert_eq!(origin_for_log("http://127.0.0.1:64912/nav?leak=secret"), "http://127.0.0.1");
+        assert!(!origin_for_log("https://attacker.example/?leak=secret").contains("secret"));
+    }
+
+    /// The request pin must admit every origin the CSP lets the page connect to,
+    /// or the bridge's own IPC fetches would be refused on Windows.
+    #[test]
+    fn the_request_pin_admits_what_the_csp_connects_to() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses");
+        let connect = conf["app"]["security"]["csp"]["connect-src"].as_str().expect("connect-src");
+        let origins = app_request_origins();
+        for source in connect.split_whitespace().filter(|s| s.starts_with("http")) {
+            let origin = tauri::Url::parse(source).expect("connect-src origin parses");
+            assert!(origins.contains(&origin), "{source} is in connect-src but not admitted");
+        }
+        let source = include_str!("lib.rs");
+        let live = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        assert!(live.contains(".on_webview_ready(") && live.contains("install_request_pin(&_webview)"));
     }
 
     // -- Unsaved changes are not discarded without asking -------------------

@@ -5,7 +5,7 @@ Linux and Windows. It shares its viewer with the
 [SQLite Explorer VS Code extension](https://github.com/zknpr/SQLite-Explorer)
 and runs in a Tauri desktop shell.
 
-The current desktop version is **0.3.0**, integrating the extension's **1.8.1**
+The current desktop version is **0.3.1**, integrating the extension's **1.8.1**
 release and desktop-specific fixes. Packages for macOS, Linux and Windows are
 attached to each [release](https://github.com/zknpr/SQLite-Explorer-App/releases);
 see [Install](#install). See [release readiness](docs/release-readiness.md) for
