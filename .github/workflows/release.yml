@@ -1,0 +1,232 @@
+name: Release
+
+# Builds each package on its own OS from the committed viewer pin, and drafts a
+# GitHub release for a v* tag. Publishing the draft stays a manual maintainer
+# step. Nothing here restores a cache: every package comes from a clean runner,
+# so a poisoned cache can never reach a release. Pull requests that touch the
+# pipeline run the build jobs only.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/release/**
+      - scripts/sync-viewer.mjs
+      - src-tauri/tauri*.conf.json
+      - viewer-dist/manifest.json
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  VIEWER_REPOSITORY: https://github.com/zknpr/SQLite-Explorer
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            runner: macos-latest
+            bundles: app,dmg
+          # tjs needs glibc 2.38 and the app built here 2.39, so an older build
+          # host would not widen support much; 24.04 is the release-tested Linux.
+          - platform: linux
+            runner: ubuntu-24.04
+            bundles: deb
+          - platform: windows
+            runner: windows-latest
+            bundles: nsis
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      BUNDLES: ${{ matrix.bundles }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Check the version files agree (and match the tag)
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            node scripts/release/version.mjs --tag "$REF_NAME"
+          else
+            node scripts/release/version.mjs
+          fi
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libsm-dev libice-dev patchelf file
+
+      - name: Install Rust 1.93.0
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal
+          rustup default 1.93.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch the viewer source pin
+        run: |
+          pin=$(node -p "require('./viewer-dist/manifest.json').ref")
+          git init -q ../SQLite-Explorer
+          git -C ../SQLite-Explorer fetch -q --depth 1 "$VIEWER_REPOSITORY" "$pin"
+          echo "VIEWER_PIN=$pin" >> "$GITHUB_ENV"
+
+      - name: Sync this platform's viewer and native runtime from the pin
+        run: |
+          cp viewer-dist/manifest.json "$RUNNER_TEMP/committed-manifest.json"
+          node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref "$VIEWER_PIN"
+          node scripts/sync-viewer.mjs --verify
+
+      # The committed viewer-dist/ targets Apple Silicon macOS, so here the
+      # fresh sync must reproduce it byte for byte.
+      - name: The committed viewer-dist matches the pin
+        if: matrix.platform == 'macos'
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const files = (p) => JSON.stringify(JSON.parse(fs.readFileSync(p, "utf8")).files);
+            if (files(process.argv[1]) !== files("viewer-dist/manifest.json")) {
+              console.error("committed viewer-dist differs from a fresh sync of the pin");
+              process.exit(1);
+            }' "$RUNNER_TEMP/committed-manifest.json"
+
+      - name: Tests
+        run: |
+          npm test
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build
+        run: npm run tauri build -- --bundles "$BUNDLES"
+
+      - name: Check and stage the macOS package
+        if: matrix.platform == 'macos'
+        run: |
+          app="src-tauri/target/release/bundle/macos/SQLite Explorer.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          test -f "$app/Contents/Resources/THIRD_PARTY_NOTICES.txt"
+          test -x "$app/Contents/Resources/native/tjs"
+          dmgs=(src-tauri/target/release/bundle/dmg/*.dmg)
+          [ "${#dmgs[@]}" -eq 1 ] || { echo "expected one DMG, found ${#dmgs[@]}"; exit 1; }
+          hdiutil verify "${dmgs[0]}"
+          mkdir dist
+          cp "${dmgs[0]}" "dist/$(node scripts/release/assemble.mjs asset-name macos)"
+
+      - name: Check and stage the Linux package
+        if: matrix.platform == 'linux'
+        run: |
+          debs=(src-tauri/target/release/bundle/deb/*.deb)
+          [ "${#debs[@]}" -eq 1 ] || { echo "expected one .deb, found ${#debs[@]}"; exit 1; }
+          deb="${debs[0]}"
+          dpkg-deb --info "$deb"
+          # Listed once into a variable: `grep -q` on a live pipe exits early,
+          # and under pipefail the writer's SIGPIPE would fail a passing check.
+          contents=$(dpkg-deb --contents "$deb")
+          grep -q 'THIRD_PARTY_NOTICES.txt$' <<<"$contents"
+          grep -q '/native/tjs$' <<<"$contents"
+          # apt must refuse a system whose glibc is older than any binary in
+          # the package needs, so the declared floor has to cover them all.
+          declared=$(dpkg-deb -f "$deb" Depends | grep -oE 'libc6 \(>= [0-9.]+\)' | grep -oE '[0-9]+\.[0-9]+' || true)
+          [ -n "$declared" ] || { echo "the package declares no libc6 floor"; exit 1; }
+          root="$RUNNER_TEMP/deb-root"
+          dpkg-deb -x "$deb" "$root"
+          required=$(find "$root" -type f -exec file {} + | grep ELF | cut -d: -f1 | while read -r elf; do
+            strings -a "$elf" | grep -oE '^GLIBC_[0-9]+\.[0-9]+$' || true
+          done | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "declared libc6 >= $declared; binaries need GLIBC_$required"
+          [ "$(printf '%s\n%s\n' "$required" "$declared" | sort -V | tail -1)" = "$declared" ] \
+            || { echo "binaries need glibc $required but the package declares $declared"; exit 1; }
+          mkdir dist
+          cp "$deb" "dist/$(node scripts/release/assemble.mjs asset-name linux)"
+
+      - name: Check and stage the Windows package
+        if: matrix.platform == 'windows'
+        run: |
+          exes=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          [ "${#exes[@]}" -eq 1 ] || { echo "expected one installer, found ${#exes[@]}"; exit 1; }
+          listing=$(7z l "${exes[0]}")
+          grep -q 'THIRD_PARTY_NOTICES.txt' <<<"$listing"
+          grep -q 'tjs.exe' <<<"$listing"
+          mkdir dist
+          cp "${exes[0]}" "dist/$(node scripts/release/assemble.mjs asset-name windows)"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Draft the release
+    needs: build
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install Rust 1.93.0
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal
+          rustup default 1.93.0
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: dist
+
+      - name: Add notices and MPL sources, then write the manifest, checksums and notes
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cp THIRD_PARTY_NOTICES.txt dist/
+          node scripts/release/mpl-sources.mjs --out dist
+          node scripts/release/assemble.mjs assemble --dist dist --tag "$REF_NAME" \
+            --commit "$GITHUB_SHA" --run-url "$RUN_URL" --notes "$RUNNER_TEMP/notes.md"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "SQLite Explorer ${REF_NAME#v}" --notes-file "$RUNNER_TEMP/notes.md"

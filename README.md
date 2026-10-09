@@ -6,10 +6,10 @@ Linux and Windows. It shares its viewer with the
 and runs in a Tauri desktop shell.
 
 The current desktop version is **0.2.0**, integrating the extension's **1.8.1**
-release and desktop-specific fixes. This repository does not publish binary
-releases yet; build from a checkout as described below. See
-[release readiness](docs/release-readiness.md) for the remaining distribution
-gates.
+release and desktop-specific fixes. Packages for macOS, Linux and Windows are
+attached to each [release](https://github.com/zknpr/SQLite-Explorer-App/releases);
+see [Install](#install). See [release readiness](docs/release-readiness.md) for
+the remaining distribution gates.
 
 ## Working with databases
 
@@ -29,7 +29,7 @@ refuse; retain pending work with a separate export before reloading.
 | Platform tested | Package | Coverage |
 | --- | --- | --- |
 | macOS, Apple Silicon | `.app` | Native/WASM workflows; remaining OS checks are recorded in [macOS QA](docs/macos-release-qa.md) |
-| Ubuntu 24.04, x86-64, Xfce/X11 | Debian, AppImage | Installed-app checks; shutdown/restart checks used the Debian package |
+| Ubuntu 24.04, x86-64, Xfce/X11 | Debian package | Installed-app checks, shutdown/restart |
 | Windows 11, x86-64 | NSIS installer | Installed-app checks, shutdown/restart and post-boot saves |
 
 See [Linux and Windows QA](docs/linux-windows-release-qa.md) for tested package
@@ -37,9 +37,41 @@ hashes and limits. Other Linux desktops and Wayland remain unverified. Linux
 session-end cancellation requires a working inherited XSMP session connection.
 Forced termination or power loss cannot preserve unsaved edits.
 
-The Windows build is unsigned. The local macOS build has an ad-hoc signature,
-without Developer ID signing or notarization. Downloaded-package trust prompts
-have not been signed off.
+## Install
+
+Download the package for your system from the
+[releases page](https://github.com/zknpr/SQLite-Explorer-App/releases). The
+packages are not signed with a publisher identity yet; see the
+[code signing policy](docs/code-signing-policy.md). Verify a download before
+installing it:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify <downloaded file> --repo zknpr/SQLite-Explorer-App
+```
+
+**macOS (Apple Silicon).** Open the `.dmg` and drag SQLite Explorer to
+Applications. The app has an ad-hoc signature and is not notarized, so macOS
+blocks the first launch. Open **System Settings → Privacy & Security** and
+choose **Open Anyway** for SQLite Explorer. To uninstall, move the app to the
+Trash; settings live in `~/Library/Application Support/xyz.zknpr.sqlite-explorer`.
+
+**Windows (x86-64).** Run the `-setup.exe` installer. It is unsigned, so
+SmartScreen shows "Windows protected your PC"; choose **More info → Run
+anyway**. If **Smart App Control** is on, Windows blocks unsigned programs and
+offers no override, so the installer cannot run there. To uninstall, use
+**Settings → Apps → Installed apps → SQLite Explorer → Uninstall**.
+
+**Linux (x86-64, Debian/Ubuntu).** The package needs glibc 2.39 or newer
+(Ubuntu 24.04+, Debian 13+):
+
+```sh
+sudo apt install ./SQLite-Explorer-<version>-linux-amd64.deb
+```
+
+To uninstall, run `sudo apt remove sq-lite-explorer` (the package name Tauri
+derives from the product name). AppImage packages are not
+provided.
 
 ## Build from a checkout
 
@@ -74,29 +106,22 @@ npm test
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-On Linux and Windows, create the platform's packages:
+Create the platform's packages:
 
 ```sh
 npm run tauri build
 ```
 
-On macOS without a configured signing identity, build and seal a local `.app`:
+Packages appear under `src-tauri/target/release/bundle/`: `.app` and DMG on
+macOS, Debian on Linux and NSIS on Windows. `src-tauri/tauri.macos.conf.json`
+signs the macOS app ad-hoc with the hardened runtime, which seals its resources
+so `codesign --verify --deep --strict` passes; it is not Developer ID signing or
+notarization. Selecting another native target in the sync script stages its
+resources; it does not cross-compile the app.
 
-```sh
-npm run tauri build -- --bundles app
-codesign --force --sign - 'src-tauri/target/release/bundle/macos/SQLite Explorer.app'
-codesign --verify --deep --strict 'src-tauri/target/release/bundle/macos/SQLite Explorer.app'
-```
-
-The explicit ad-hoc signing step seals the app's resources. The linker's default
-signature alone fails strict bundle verification. This local signature does not
-provide Developer ID signing or notarization. Distribution packages need their
-own [signing and packaging setup](https://v2.tauri.app/distribute/).
-
-Packages appear under `src-tauri/target/release/bundle/`: `.app` for the local
-macOS command above, Debian/AppImage on Linux and NSIS on Windows. A configured
-macOS distribution build can also produce a DMG. Selecting another native target
-in the sync script stages its resources; it does not cross-compile the app.
+Release packages are built by the [release workflow](.github/workflows/release.yml),
+which runs these steps on each OS from the pinned viewer source and drafts a
+release for a `v*` tag.
 
 For development, run `npm run tauri dev`. Packaged-app checks are still required
 for native dialogs, OS integration and the custom asset protocol.

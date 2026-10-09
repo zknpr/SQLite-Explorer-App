@@ -1,0 +1,4 @@
+# Check out every text file with LF on every platform. Shell tests scan their
+# own source for "\n"-delimited markers, and viewer-dist/ is sha256-manifested,
+# so a CRLF checkout on Windows would fail both.
+* text=auto eol=lf
