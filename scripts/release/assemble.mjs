@@ -53,12 +53,14 @@ export function buildManifest({ version, tag, commit, runUrl, viewerRef, assets 
     product: 'SQLite Explorer',
     version,
     tag,
+    // A semver prerelease (0.3.0-beta.1) must never be published as Latest.
+    prerelease: version.includes('-'),
     repository: REPOSITORY,
     commit,
     buildRun: runUrl,
     viewerSource: { repository: VIEWER_REPOSITORY, ref: viewerRef },
     signing: {
-      macos: 'ad-hoc signature; not Developer ID signed or notarized',
+      macos: 'the app has an ad-hoc signature with the hardened runtime; the disk image is unsigned; not Developer ID signed or notarized',
       windows: 'unsigned',
       linux: 'unsigned package; verify SHA256SUMS and the build attestation'
     },
@@ -70,6 +72,17 @@ export function buildManifest({ version, tag, commit, runUrl, viewerRef, assets 
 export function checksumsText(entries) {
   return [...entries].sort((a, b) => a.name.localeCompare(b.name))
     .map(({ name, sha256 }) => `${sha256}  ${name}`).join('\n') + '\n';
+}
+
+/**
+ * The PowerShell check the notes publish for Windows, which has no sha256sum.
+ * Exported so the Windows build job runs this exact string against its own
+ * installer: the documented command is the tested one. Get-FileHash defaults to
+ * SHA256 and -eq compares strings case-insensitively, so its upper-case hex
+ * matches the lower-case SHA256SUMS line.
+ */
+export function windowsChecksumCommand(asset) {
+  return `(Get-FileHash .\\${asset}).Hash -eq ((Select-String -Path SHA256SUMS -SimpleMatch '${asset}').Line -split ' ')[0]`;
 }
 
 export function releaseNotes({ version, commit, runUrl, viewerRef }) {
@@ -92,10 +105,13 @@ See the [installation notes](https://github.com/${REPOSITORY}#install) for unins
 
 ## Verify the download
 
-\`\`\`sh
-sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify ${PLATFORMS.linux.asset(version)} --repo ${REPOSITORY}
-\`\`\`
+Download \`SHA256SUMS\` next to the package, then check it:
+
+- **macOS:** \`shasum -a 256 --check --ignore-missing SHA256SUMS\`
+- **Linux:** \`sha256sum --check --ignore-missing SHA256SUMS\`
+- **Windows (PowerShell):** \`${windowsChecksumCommand(PLATFORMS.windows.asset(version))}\` prints \`True\` when the file matches.
+
+With the GitHub CLI on any platform, \`gh attestation verify <file> --repo ${REPOSITORY}\` confirms the file was built by this repository's release workflow.
 
 ## Licenses
 
@@ -111,6 +127,12 @@ function arg(argv, flag) {
 
 function main(argv) {
   const [command, ...rest] = argv;
+  if (command === 'windows-checksum-command') {
+    const version = resolveVersion(readVersions());
+    if (version instanceof Error) throw version;
+    console.log(windowsChecksumCommand(PLATFORMS.windows.asset(version)));
+    return;
+  }
   if (command === 'asset-name') {
     const platform = PLATFORMS[rest[0]];
     if (!platform) throw new Error(`asset-name needs one of ${Object.keys(PLATFORMS).join(', ')}`);

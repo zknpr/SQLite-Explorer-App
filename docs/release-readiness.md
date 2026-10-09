@@ -1,6 +1,6 @@
 # Release readiness
 
-Status checked October 8, 2026, for desktop 0.2.0 and the extension 1.8.1
+Status checked October 8, 2026, for desktop 0.3.0 and the extension 1.8.1
 integration. The source is public under MIT. Release packages are built by the
 [release workflow](../.github/workflows/release.yml); the gates below separate
 source publication from binary distribution.
@@ -38,7 +38,7 @@ downloaded package or close the macOS interaction gates.
 | Security policy | [SECURITY.md](../SECURITY.md), private vulnerability reporting |
 | Continuous integration | Apple Silicon macOS: manifest verification, script tests, shell unit tests, clippy. No Linux or Windows lane |
 | Navigation pin and CSP `base-uri`/`form-action`/`frame-ancestors` | Live-verified in an Apple Silicon macOS QA build against a pre-change control build. Linux and Windows runtime behaviour unverified |
-| Release pipeline | Builds macOS, Linux and Windows packages on their own OS from the viewer pin, with no cache, and drafts a release for a `v*` tag. Each asset gets SHA256SUMS and a build-provenance attestation. Publishing is manual |
+| Release pipeline | Builds macOS, Linux and Windows packages on their own OS from the viewer pin, with no cache, and drafts a release for a `v*` tag; a prerelease version drafts a prerelease. Each asset gets SHA256SUMS and a build-provenance attestation. Publishing is manual |
 | Third-party notices | Bundled inside every package; the release also attaches them with the MPL Cargo sources, which are checksum-verified against Cargo.lock |
 | AppImage distribution | Not distributed: its extra bundled Linux system libraries have no notice/source inventory. Linux ships as `.deb` |
 | Linux glibc floor | The native engine needs glibc 2.38 and the app built on Ubuntu 24.04 needs 2.39; the `.deb` declares `libc6 (>= 2.39)` and the workflow fails if any packaged binary needs more |
@@ -46,7 +46,7 @@ downloaded package or close the macOS interaction gates.
 | Linux/Windows installed-package checks | Passed for the packages and environments in [Linux/Windows QA](linux-windows-release-qa.md), including real shutdown/restart. Those packages predate the navigation pin and CSP change; rerun the affected checks on new packages |
 | Other Linux desktops, Wayland and physical keyboards | Unverified; limit platform claims to observed coverage |
 | Windows distribution | Unsigned. SignPath Foundation signing requires a prior public release, so the first release ships unsigned, then apply. Signing will cover the app and installer, not the upstream `tjs.exe`. Smart App Control blocks the unsigned installer; whether it blocks `tjs.exe` under a signed app (the app would fall back to WASM) is untested. SmartScreen on a clean machine unverified |
-| macOS distribution | Ad-hoc signature with the hardened runtime, built by the workflow; no Developer ID signing or notarization by choice. Gatekeeper's Open Anyway flow on a downloaded package unverified |
+| macOS distribution | The app has an ad-hoc signature with the hardened runtime, built by the workflow; the DMG is unsigned. No Developer ID signing or notarization, by choice. Gatekeeper's Open Anyway flow on a downloaded package unverified |
 
 The source MIT license does not replace third-party licenses. The
 [notice inventory](../third-party/inventory.json) records identities, source

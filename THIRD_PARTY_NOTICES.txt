@@ -1,4 +1,4 @@
-SQLite Explorer desktop 0.2.0 private beta — third-party notices
+SQLite Explorer desktop — third-party notices
 
 The application source is licensed under MIT (see LICENSE.md). Components
 listed here retain their own licenses. Inclusion in this inventory does not
@@ -19,14 +19,15 @@ bytes are unchanged. Supporting Codicons code is MIT. Both texts follow.
 
 MPL 2.0 source availability: unmodified source packages for cssparser 0.36.0,
 cssparser-macros 0.6.1, dtoa-short 0.3.5, option-ext 0.2.0 and selectors 0.36.1
-are supplied alongside the installers in mpl-dependency-sources.tar.gz at
-https://github.com/zknpr/SQLite-Explorer-App/releases/tag/v0.2.0-beta.1.
+are attached to every binary release as mpl-dependency-sources.tar.gz, on the
+release page that carries the installer:
+https://github.com/zknpr/SQLite-Explorer-App/releases
 Each package is also available from the versioned crates.io URL in the
 inventory. These covered source files remain under MPL 2.0.
 
 third-party/inventory.json records package identities, source URLs and notice
-hashes. This beta's AppImage is not distributed: the additional bundled Linux
-system libraries still require their own distribution inventory.
+hashes. No AppImage is distributed: the additional bundled Linux system
+libraries still require their own distribution inventory.
 
 
 ==============================================================================

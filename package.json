@@ -1,6 +1,6 @@
 {
   "name": "sqlite-explorer-desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "SQLite Explorer desktop shell (Tauri v2) around the extension's desktop viewer artifacts",
   "type": "module",
   "scripts": {

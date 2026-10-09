@@ -119,6 +119,11 @@ jobs:
           npm test
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
+      # Every package bundles THIRD_PARTY_NOTICES.txt, so no release may ship
+      # notices that miss a dependency or describe another viewer pin.
+      - name: Third-party notices match the release dependency graph
+        run: node scripts/release/notices.mjs
+
       - name: Build
         run: npm run tauri build -- --bundles "$BUNDLES"
 
@@ -171,7 +176,16 @@ jobs:
           grep -q 'THIRD_PARTY_NOTICES.txt' <<<"$listing"
           grep -q 'tjs.exe' <<<"$listing"
           mkdir dist
-          cp "${exes[0]}" "dist/$(node scripts/release/assemble.mjs asset-name windows)"
+          name=$(node scripts/release/assemble.mjs asset-name windows)
+          cp "${exes[0]}" "dist/$name"
+          # Run the exact checksum command the release notes publish for
+          # Windows, once against the real hash and once against a wrong one.
+          check="$RUNNER_TEMP/checksum-check"
+          mkdir "$check"
+          cp "dist/$name" "$check/"
+          command=$(node scripts/release/assemble.mjs windows-checksum-command)
+          (cd "$check" && sha256sum "$name" > SHA256SUMS && [ "$(pwsh -NoProfile -Command "$command" | tr -d '\r')" = True ])
+          (cd "$check" && printf '%064d  %s\n' 0 "$name" > SHA256SUMS && [ "$(pwsh -NoProfile -Command "$command" | tr -d '\r')" = False ])
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -228,5 +242,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          gh release create "$REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+          flags=(--draft --verify-tag)
+          # A prerelease version must not become Latest when the draft is published.
+          if [ "$(node -p "require('./dist/release-manifest.json').prerelease")" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" "${flags[@]}" \
             --title "SQLite Explorer ${REF_NAME#v}" --notes-file "$RUNNER_TEMP/notes.md"

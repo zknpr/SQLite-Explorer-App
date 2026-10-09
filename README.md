@@ -5,7 +5,7 @@ Linux and Windows. It shares its viewer with the
 [SQLite Explorer VS Code extension](https://github.com/zknpr/SQLite-Explorer)
 and runs in a Tauri desktop shell.
 
-The current desktop version is **0.2.0**, integrating the extension's **1.8.1**
+The current desktop version is **0.3.0**, integrating the extension's **1.8.1**
 release and desktop-specific fixes. Packages for macOS, Linux and Windows are
 attached to each [release](https://github.com/zknpr/SQLite-Explorer-App/releases);
 see [Install](#install). See [release readiness](docs/release-readiness.md) for
@@ -45,13 +45,22 @@ packages are not signed with a publisher identity yet; see the
 [code signing policy](docs/code-signing-policy.md). Verify a download before
 installing it:
 
+Download `SHA256SUMS` next to the package and check it with the tool your
+system has:
+
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify <downloaded file> --repo zknpr/SQLite-Explorer-App
+shasum -a 256 --check --ignore-missing SHA256SUMS   # macOS
+sha256sum --check --ignore-missing SHA256SUMS       # Linux
 ```
 
+On Windows, the release notes give a PowerShell `Get-FileHash` command that
+prints `True` for a matching installer. With the GitHub CLI on any platform,
+`gh attestation verify <downloaded file> --repo zknpr/SQLite-Explorer-App`
+confirms the file was built by this repository's release workflow.
+
 **macOS (Apple Silicon).** Open the `.dmg` and drag SQLite Explorer to
-Applications. The app has an ad-hoc signature and is not notarized, so macOS
+Applications. The disk image is unsigned; the app inside has an ad-hoc
+signature and is not notarized, so macOS
 blocks the first launch. Open **System Settings → Privacy & Security** and
 choose **Open Anyway** for SQLite Explorer. To uninstall, move the app to the
 Trash; settings live in `~/Library/Application Support/xyz.zknpr.sqlite-explorer`.
