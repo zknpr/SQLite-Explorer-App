@@ -172,10 +172,14 @@ fn app_request_origins() -> Vec<tauri::Url> {
     ]
 }
 
-/// SECURITY: whether a webview request may reach the network. Only the web
-/// schemes leave the machine, and those must target an app origin; `data:`,
-/// `blob:` and the app's own custom schemes are local and pass. A URI that does
-/// not parse is refused.
+/// SECURITY: whether a webview request may proceed. Web schemes must target an
+/// app origin. Only schemes whose bytes come from the page itself (`data:`,
+/// `blob:`, `about:`) pass. Every other scheme is refused, because "not a web
+/// scheme" does not mean local: on Windows a `file://host/…` URI is a UNC path,
+/// an SMB connection to that host that can also hand it the user's NTLM
+/// credentials. On Windows the app's own custom protocols arrive as
+/// `http://<name>.localhost`, so nothing legitimate is lost. A URI that does not
+/// parse is refused.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_app_request(target: &str, allowed: &[tauri::Url]) -> bool {
     let Ok(url) = tauri::Url::parse(target) else {
@@ -183,7 +187,8 @@ fn is_app_request(target: &str, allowed: &[tauri::Url]) -> bool {
     };
     match url.scheme() {
         "http" | "https" | "ws" | "wss" => is_app_navigation(&url, allowed),
-        _ => true,
+        "data" | "blob" | "about" => true,
+        _ => false,
     }
 }
 
@@ -4409,9 +4414,16 @@ mod tests {
             "http://ipc.localhost:8080/",
             "https://tauri.localhost/viewer.html",
             "not a uri",
+            // On Windows a hosted file: URI is a UNC path: an SMB connection to
+            // that host, which can also hand it the user's NTLM credentials.
+            "file://attacker.example/share/x",
+            "file:///C:/Windows/win.ini",
+            "ftp://attacker.example/x",
+            "chrome-extension://abcdefghijklmnop/x",
         ] {
             assert!(!is_app_request(refused, &windows), "{refused}");
         }
+        assert!(is_app_request("about:blank", &windows));
         assert_eq!(origin_for_log("http://127.0.0.1:64912/nav?leak=secret"), "http://127.0.0.1");
         assert!(!origin_for_log("https://attacker.example/?leak=secret").contains("secret"));
     }

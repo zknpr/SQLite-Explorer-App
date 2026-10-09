@@ -88,7 +88,8 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   server (measured on WebView2 154; WKWebView and WebKitGTK sent nothing). So the same
   plugin's `on_webview_ready` installs a `*` `WebResourceRequested` filter that answers
   every web request (http/https/ws/wss) off `app_request_origins` with a local 403.
-  `data:`/`blob:`/custom schemes pass. wry's custom-protocol handler ignores foreign URIs,
+  Only `data:`/`blob:`/`about:` pass; every other scheme is refused, `file:` included,
+  because a `file://host/` URI is a UNC/SMB connection that can leak NTLM credentials. wry's custom-protocol handler ignores foreign URIs,
   so the two coexist. `the_request_pin_admits_what_the_csp_connects_to` keeps IPC admitted.
   Verify Windows navigation claims by counting hits on a foreign listener, never by
   checking whether the page moved.
