@@ -102,7 +102,7 @@ other target, first sync from a checkout containing the exact source commit:
 
 ```sh
 git clone --branch desktop-dev-port https://github.com/zknpr/SQLite-Explorer ../SQLite-Explorer
-node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref e597c1d5c8fe32aa91603b9040eb590e773284d3
+node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref b4a33419988b017cb8dd576a83b30967038b65db
 node scripts/sync-viewer.mjs --verify
 ```
 

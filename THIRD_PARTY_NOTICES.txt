@@ -75965,9 +75965,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-sql.js 7245c26ebdd0905b11a2a16d1f7a555abd768eec
+sql.js 35ac205b7f9470d9aa7696ceb9cdab5dec4b6ed3
 ==============================================================================
-Source: https://github.com/zknpr/sql.js/tree/7245c26ebdd0905b11a2a16d1f7a555abd768eec
+Source: https://github.com/zknpr/sql.js/tree/35ac205b7f9470d9aa7696ceb9cdab5dec4b6ed3
 
 --- LICENSE ---
 MIT license

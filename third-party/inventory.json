@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "viewerSource": "e597c1d5c8fe32aa91603b9040eb590e773284d3",
+  "viewerSource": "b4a33419988b017cb8dd576a83b30967038b65db",
   "components": [
     {
       "component": "@vscode/codicons 0.0.45",
@@ -7634,8 +7634,8 @@
       ]
     },
     {
-      "component": "sql.js 7245c26ebdd0905b11a2a16d1f7a555abd768eec",
-      "source": "https://github.com/zknpr/sql.js/tree/7245c26ebdd0905b11a2a16d1f7a555abd768eec",
+      "component": "sql.js 35ac205b7f9470d9aa7696ceb9cdab5dec4b6ed3",
+      "source": "https://github.com/zknpr/sql.js/tree/35ac205b7f9470d9aa7696ceb9cdab5dec4b6ed3",
       "notices": [
         {
           "file": "LICENSE",
