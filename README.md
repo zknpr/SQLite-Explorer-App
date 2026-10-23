@@ -100,12 +100,12 @@ On that target, the checked-in viewer is enough to build the shell. For any
 other target, first sync from a checkout containing the exact source commit:
 
 ```sh
-git clone --branch desktop-v1.8.1-port https://github.com/zknpr/SQLite-Explorer ../SQLite-Explorer
-node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref d503473a7dd6a3ed3d77aad1b506b45379d1da2a
+git clone --branch desktop-dev-port https://github.com/zknpr/SQLite-Explorer ../SQLite-Explorer
+node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref e597c1d5c8fe32aa91603b9040eb590e773284d3
 node scripts/sync-viewer.mjs --verify
 ```
 
-The pin is on the extension repository's `desktop-v1.8.1-port` branch.
+The pin is on the extension repository's `desktop-dev-port` branch.
 Substituting the extension's `v1.8.1` tag omits the desktop fixes validated here.
 
 Build on the destination OS and CPU:

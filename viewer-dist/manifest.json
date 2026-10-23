@@ -1,18 +1,18 @@
 {
   "source": "SQLite-Explorer desktop/ build target",
-  "ref": "d503473a7dd6a3ed3d77aad1b506b45379d1da2a",
+  "ref": "e597c1d5c8fe32aa91603b9040eb590e773284d3",
   "target": "aarch64-macos",
-  "syncedAt": "2026-09-22T11:27:39.793Z",
+  "syncedAt": "2026-10-23T21:12:09.379Z",
   "files": {
     "viewer.html": "0a94f34a9565b29e6830463387dfc0747acece8bc5b0e98848007c5b7d4e0699",
-    "worker.js": "218b81bddc56b8dbf8b9ed1ffb64f3277f92f9bdda824661e33dca85678464cb",
-    "sql-wasm.js": "8d044434bd1ed032816b7fe3559fa77421033b175c080bd9f6190df166bd846a",
-    "sql-wasm.wasm": "10013ab296e8adfa5df66c86e3fc5b10726078185646c7f31d11b527bbbca063",
+    "worker.js": "468533c20b15fa95a28f0480581cb68ec9670be7716ca8f71874193aaf62868f",
+    "sql-wasm.js": "989bc91af3221aa85ba53d5ae5c8f72da42c6a5a769c0f31f74337223f2ae73c",
+    "sql-wasm.wasm": "ea94cafe49733bd55b8b2481d5cf0f07c5e006728c94b04999be04582b19a1e7",
     "dev-harness.html": "baf76f7b3494a2e76ff156aed1297d28e8cedd44f0ca383fa9f917ce8a869c2f",
     "codicons/codicon.css": "04fca10892d8f2be5104c920b640d9a58ddcf87f4902ea300fcf08de6634f3f6",
     "codicons/codicon.ttf": "2bb558cb693451e73c28c33fe64aa89bc19b1a4b70f95948322c243f93476920",
-    "native/native-worker-desktop.js": "cb9e0869ac442e56b5f33fee3b8d6b030d5091908092ba6ce689b6c55431ad87",
+    "native/native-worker-desktop.js": "93c1bb05145bcaad8e1a0fdd4506eb726db3d929748c6a37cfa9b9c35fd16fb1",
     "native/query-plan.dylib": "3a51dcd0ebc627e63d664e9b9c317667cb356f197e0d5645262bc3b5ef7b8c3c",
-    "native/tjs": "2927d5dfe7d240310d53d1ad583497ac9fc5f17c84354d43ee020d42e8ba6dfa"
+    "native/tjs": "833325341cd47a1887fadc69cf637a26c0b120fcaa1b52ce486537bab2bc3325"
   }
 }
