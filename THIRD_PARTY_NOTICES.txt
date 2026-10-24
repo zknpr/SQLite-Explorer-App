@@ -75681,9 +75681,9 @@ library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
 
 ==============================================================================
-txiki.js 9875455640b8ae62f52200a9fa7fa2a66d079dc7
+txiki.js b45ac83ec0d7809c413afcf4091d7ecf12a46452
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452
 
 --- LICENSE ---
 The MIT License (MIT)
@@ -75711,7 +75711,7 @@ SOFTWARE.
 ==============================================================================
 txiki embedded src/js/core/path.js
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/core/path.js
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/core/path.js
 
 --- src/js/core/path.js ---
 // Copyright Joyent, Inc. and other Node contributors.
@@ -75742,7 +75742,7 @@ Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66
 ==============================================================================
 txiki embedded src/js/stdlib/utils.js
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/stdlib/utils.js
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/stdlib/utils.js
 
 --- src/js/stdlib/utils.js ---
 // Code from https://github.com/browserify/node-util
@@ -75773,7 +75773,7 @@ Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66
 ==============================================================================
 txiki embedded src/js/run-repl/repl.js
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/run-repl/repl.js
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/run-repl/repl.js
 
 --- src/js/run-repl/repl.js ---
 /* global tjs */
@@ -75810,7 +75810,7 @@ Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66
 ==============================================================================
 txiki embedded src/js/polyfills/text-encode-transform.js
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/polyfills/text-encode-transform.js
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/polyfills/text-encode-transform.js
 
 --- src/js/polyfills/text-encode-transform.js ---
 // Adapted from:
@@ -75834,7 +75834,7 @@ Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66
 ==============================================================================
 deps/miniz/miniz.c
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/deps/miniz/miniz.c
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/deps/miniz/miniz.c
 
 --- deps/miniz/miniz.c ---
 /**************************************************************************
@@ -75866,7 +75866,7 @@ Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66
 ==============================================================================
 deps/sqlite3/sqlite3.c
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/deps/sqlite3/sqlite3.c
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/deps/sqlite3/sqlite3.c
 
 --- deps/sqlite3/sqlite3.c ---
 /******************************************************************************
@@ -75897,7 +75897,7 @@ Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66
 ==============================================================================
 miniz header public-domain attribution
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/deps/miniz/miniz.h
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/deps/miniz/miniz.h
 
 --- deps/miniz/miniz.h header ---
 #ifndef MINIZ_EXPORT
@@ -75911,7 +75911,7 @@ Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66
 ==============================================================================
 formdata-polyfill adapted in txiki.js
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/polyfills/form-data.js
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/polyfills/form-data.js
 
 --- LICENSE (https://github.com/jimmywarting/FormData/blob/master/LICENSE) ---
 MIT License
@@ -75939,7 +75939,7 @@ SOFTWARE.
 ==============================================================================
 event-target-shim adapted in txiki.js
 ==============================================================================
-Source: https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/polyfills/event-target.js
+Source: https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/polyfills/event-target.js
 
 --- LICENSE (https://github.com/mysticatea/event-target-shim/blob/master/LICENSE) ---
 The MIT License (MIT)

@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "viewerSource": "b4a33419988b017cb8dd576a83b30967038b65db",
+  "viewerSource": "b7cf55aece690860c2c1be7e498b0503e7ff18de",
   "components": [
     {
       "component": "@vscode/codicons 0.0.45",
@@ -7532,8 +7532,8 @@
       ]
     },
     {
-      "component": "txiki.js 9875455640b8ae62f52200a9fa7fa2a66d079dc7",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7",
+      "component": "txiki.js b45ac83ec0d7809c413afcf4091d7ecf12a46452",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452",
       "notices": [
         {
           "file": "LICENSE",
@@ -7543,7 +7543,7 @@
     },
     {
       "component": "txiki embedded src/js/core/path.js",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/core/path.js",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/core/path.js",
       "notices": [
         {
           "file": "src/js/core/path.js",
@@ -7553,7 +7553,7 @@
     },
     {
       "component": "txiki embedded src/js/stdlib/utils.js",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/stdlib/utils.js",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/stdlib/utils.js",
       "notices": [
         {
           "file": "src/js/stdlib/utils.js",
@@ -7563,7 +7563,7 @@
     },
     {
       "component": "txiki embedded src/js/run-repl/repl.js",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/run-repl/repl.js",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/run-repl/repl.js",
       "notices": [
         {
           "file": "src/js/run-repl/repl.js",
@@ -7573,7 +7573,7 @@
     },
     {
       "component": "txiki embedded src/js/polyfills/text-encode-transform.js",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/polyfills/text-encode-transform.js",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/polyfills/text-encode-transform.js",
       "notices": [
         {
           "file": "src/js/polyfills/text-encode-transform.js",
@@ -7583,7 +7583,7 @@
     },
     {
       "component": "deps/miniz/miniz.c",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/deps/miniz/miniz.c",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/deps/miniz/miniz.c",
       "notices": [
         {
           "file": "deps/miniz/miniz.c",
@@ -7593,7 +7593,7 @@
     },
     {
       "component": "deps/sqlite3/sqlite3.c",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/deps/sqlite3/sqlite3.c",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/deps/sqlite3/sqlite3.c",
       "notices": [
         {
           "file": "deps/sqlite3/sqlite3.c",
@@ -7603,7 +7603,7 @@
     },
     {
       "component": "miniz header public-domain attribution",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/deps/miniz/miniz.h",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/deps/miniz/miniz.h",
       "notices": [
         {
           "file": "deps/miniz/miniz.h header",
@@ -7613,7 +7613,7 @@
     },
     {
       "component": "formdata-polyfill adapted in txiki.js",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/polyfills/form-data.js",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/polyfills/form-data.js",
       "notices": [
         {
           "file": "LICENSE",
@@ -7624,7 +7624,7 @@
     },
     {
       "component": "event-target-shim adapted in txiki.js",
-      "source": "https://github.com/zknpr/txiki.js/tree/9875455640b8ae62f52200a9fa7fa2a66d079dc7/src/js/polyfills/event-target.js",
+      "source": "https://github.com/zknpr/txiki.js/tree/b45ac83ec0d7809c413afcf4091d7ecf12a46452/src/js/polyfills/event-target.js",
       "notices": [
         {
           "file": "LICENSE",
