@@ -5,9 +5,8 @@ Linux and Windows. It shares its viewer with the
 [SQLite Explorer VS Code extension](https://github.com/zknpr/SQLite-Explorer)
 and runs in a Tauri desktop shell.
 
-The current desktop version is **0.3.2**, integrating the extension's **1.8.2**
-release, its unreleased native-runtime and NUL-text fixes, and desktop-specific
-fixes. Packages for macOS, Linux and Windows are
+The current desktop version is **0.3.2**, integrating the extension's **1.8.3**
+release and desktop-specific fixes. Packages for macOS, Linux and Windows are
 attached to each [release](https://github.com/zknpr/SQLite-Explorer-App/releases);
 see [Install](#install). See [release readiness](docs/release-readiness.md) for
 the remaining distribution gates.
@@ -102,12 +101,12 @@ other target, first sync from a checkout containing the exact source commit:
 
 ```sh
 git clone --branch desktop-dev-port https://github.com/zknpr/SQLite-Explorer ../SQLite-Explorer
-node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref b4a33419988b017cb8dd576a83b30967038b65db
+node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref b7cf55aece690860c2c1be7e498b0503e7ff18de
 node scripts/sync-viewer.mjs --verify
 ```
 
 The pin is on the extension repository's `desktop-dev-port` branch.
-Substituting the extension's `v1.8.2` tag omits the desktop fixes validated here.
+Substituting the extension's `v1.8.3` tag omits the desktop fixes validated here.
 
 Build on the destination OS and CPU:
 

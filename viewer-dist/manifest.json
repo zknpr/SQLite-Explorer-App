@@ -1,18 +1,18 @@
 {
   "source": "SQLite-Explorer desktop/ build target",
-  "ref": "b4a33419988b017cb8dd576a83b30967038b65db",
+  "ref": "b7cf55aece690860c2c1be7e498b0503e7ff18de",
   "target": "aarch64-macos",
-  "syncedAt": "2026-10-23T22:35:53.418Z",
+  "syncedAt": "2026-10-24T14:09:14.788Z",
   "files": {
     "viewer.html": "0a94f34a9565b29e6830463387dfc0747acece8bc5b0e98848007c5b7d4e0699",
-    "worker.js": "615ed08cd58a406c527e355bbba8e946ebdf6195da6c381619fa4721a1f1ac3d",
+    "worker.js": "699e993b4ce9503753a734cd8e6d6d85bc5d0e00db02c09e305834a6d80e73c3",
     "sql-wasm.js": "5e68997539968392caf70207e26b78486ef2e9b1a50c04cdefa966030b782106",
     "sql-wasm.wasm": "ea94cafe49733bd55b8b2481d5cf0f07c5e006728c94b04999be04582b19a1e7",
     "dev-harness.html": "baf76f7b3494a2e76ff156aed1297d28e8cedd44f0ca383fa9f917ce8a869c2f",
     "codicons/codicon.css": "04fca10892d8f2be5104c920b640d9a58ddcf87f4902ea300fcf08de6634f3f6",
     "codicons/codicon.ttf": "2bb558cb693451e73c28c33fe64aa89bc19b1a4b70f95948322c243f93476920",
-    "native/native-worker-desktop.js": "e0526538dfe3b01fb911a607d8be742e89aa521aea555803f9f540b1b4606e30",
+    "native/native-worker-desktop.js": "cf1b0ddff3300fd8c6eca21cf22a67554a1b86694bc4fe4bcc9d4e6092bae311",
     "native/query-plan.dylib": "3a51dcd0ebc627e63d664e9b9c317667cb356f197e0d5645262bc3b5ef7b8c3c",
-    "native/tjs": "833325341cd47a1887fadc69cf637a26c0b120fcaa1b52ce486537bab2bc3325"
+    "native/tjs": "eabb77e38e127d0cd6276f12195524981ac0a8362ce58b56757ce74d660175c8"
   }
 }
