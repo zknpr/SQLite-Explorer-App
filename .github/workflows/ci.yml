@@ -7,7 +7,7 @@ name: CI
 # file-identity and session code differs per system. The native lane (the
 # real tjs engine through the shipped sidecar bundle) runs on macOS. The
 # --ignored live-sidecar tests are not run here. Installed-app checks remain
-# manual (docs/*-release-qa.md).
+# manual (docs/qa/).
 on:
   pull_request:
   push:
