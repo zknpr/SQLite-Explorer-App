@@ -18,8 +18,8 @@ since; nothing syncs from the extension). `npm run build:viewer` builds them int
   resources and never served) and a sha256 `manifest.json`, written by
   `scripts/build-viewer.mjs`, never by hand. Committed as built for `aarch64-macos`; CI
   requires `npm run check:viewer` to reproduce it byte for byte.
-- `src-tauri/` — the shell (Rust, Tauri v2). Owns the window, the native menus (app menu: About / Hide /
-  Quit; File: Open in New Window / Open / Open Recent / Save / Export / Import CSV/JSON /
+- `src-tauri/` — the shell (Rust, Tauri v2). Owns the window, the native menus (app menu: About / Check for
+  Updates… / Check for Updates Automatically / Hide / Quit; File: Open in New Window / Open / Open Recent / Save / Export / Import CSV/JSON /
   Refresh From Disk; Edit: native items; View: Theme submenu, SQL Console, Zoom ⌘+/⌘−/⌘0,
   Toggle Developer Tools in debug builds only; Window: predefined items),
   dialog-mediated file access behind a **session allowlist**, atomic saves, the settings
@@ -251,6 +251,20 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   the VS Code host refuses before choosing an engine for the same reason). The desktop's
   default is the setting's ceiling, 4000 MiB, not the extension's 200: the primary engine
   maps the file, so a 400 MiB database is the flagship case (smoke 37). 0 = unlimited.
+- **Updates are the shell's alone** (`updater.rs`, tauri-plugin-updater). No capability
+  grants an updater permission and no app command reaches it; its setting lives in the
+  shell-written `updater.json`, never `settings.json`, and stays off until the user
+  agrees at first launch (the code signing policy's privacy statement depends on it).
+  The trusted key is `plugins.updater.pubkey`, pinned by
+  `the_updater_trusts_the_release_key_not_the_qa_key`; its private half is offline and
+  `scripts/release/sign-update.mjs` signs a draft before it is published. An install
+  asks Quit's unsaved-changes question first. Windows stops every sidecar in the
+  plugin's `on_before_exit` (it exits the process with no `RunEvent::Exit`); macOS
+  installs only from inside an `.app` (the plugin swaps the directory three levels above
+  the executable, which for a bare binary is the checkout); Linux runs `pkexec dpkg -i`
+  itself, only for a copy dpkg installed (never the plugin's .deb path, which on a failed
+  pkexec asks for the password itself and pipes it to sudo). Development builds never
+  check.
 - Viewer artifacts are sha256-manifested — run `node scripts/build-viewer.mjs --verify` and
   `npm run check:viewer` before building a release.
 

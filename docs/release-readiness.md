@@ -46,6 +46,7 @@ downloaded package or close the macOS interaction gates.
 | Continuous integration | Apple Silicon macOS: `viewer-dist/` manifest and rebuild checks, viewer type check, script and viewer tests, native lane, notices check, shell unit tests, clippy. Linux and Windows: rebuild check, script and viewer tests, shell unit tests, clippy. Not in CI: the `--ignored` live-sidecar tests and installed-app checks. All of it, and the release builds, passed on the 0.4.0 release pull request |
 | Navigation pin and CSP `base-uri`/`form-action`/`frame-ancestors` | Verified against a foreign listener on installed packages. macOS: QA build against a pre-change control. Linux 0.3.0 `.deb`: no request left. Windows 0.3.0: the page stayed, but WebView2 still sent every refused navigation's request, so 0.3.0 was never published. Windows 0.3.1 adds the request pin: zero foreign requests for `location.href`/`assign`, link click and meta refresh, and `window.open` sends nothing |
 | Release pipeline | Builds macOS, Linux and Windows packages on their own OS, viewer included, with no cache, and drafts a release for a `v*` tag; a prerelease version drafts a prerelease. Each asset gets SHA256SUMS and a build-provenance attestation. Publishing is manual |
+| In-app updates | Shell-only (`src-tauri/src/updater.rs`); off until the user agrees at first launch. The 0.4.0 public key is pinned in `tauri.conf.json` and its test; the private key is offline and must stay backed up. End-to-end updates per platform: see the updater's pull request |
 | Third-party notices | Bundled inside every package; the release also attaches them with the MPL Cargo sources, which are checksum-verified against Cargo.lock |
 | AppImage distribution | Not distributed: its extra bundled Linux system libraries have no notice/source inventory. Linux ships as `.deb` |
 | Linux glibc floor | The native engine needs glibc 2.38 and the app built on Ubuntu 24.04 needs 2.39; the `.deb` declares `libc6 (>= 2.39)` and the workflow fails if any packaged binary needs more |
@@ -70,8 +71,14 @@ code is MIT. Recheck the inventory when dependencies or packaging change.
 2. Merge the bump through a reviewed pull request.
 3. A maintainer pushes the `v<version>` tag on that commit. The workflow builds,
    verifies and attaches every asset to a draft release.
-4. Run the candidate checks below on the drafted packages, then publish the
-   draft.
+4. Run the candidate checks below on the drafted packages.
+5. On the maintainer's machine, from that commit's checkout, run
+   `node scripts/release/sign-update.mjs v<version>`. It signs the draft's three
+   update packages with the offline update key
+   (`~/.tauri/sqlite-explorer-updater.key`, password in the Keychain item
+   `sqlite-explorer-updater`/`release`), checks every signature itself and
+   uploads them with `latest.json`. Without it, installed copies see no update.
+6. Publish the draft.
 
 ## Candidate checks
 

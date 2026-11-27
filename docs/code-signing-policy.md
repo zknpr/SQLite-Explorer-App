@@ -15,6 +15,7 @@ by SHA-256. Releases are drafted automatically and published by a maintainer.
 | macOS `.dmg` | The disk image is unsigned. The app inside has an ad-hoc signature with the hardened runtime. Neither is signed with an Apple Developer ID, and nothing is notarized. |
 | Windows installer | Unsigned. Signing through the SignPath Foundation is planned. |
 | Linux `.deb` | Unsigned, as is usual for packages installed directly rather than from an apt repository. |
+| In-app updates | Signed with the project's update key (minisign, through Tauri's signer). The private key is kept offline by the maintainer, who signs each release's three update packages before publishing it (`scripts/release/sign-update.mjs`); the app installs an update only when its signature verifies against the public key the app carries, for the announced version. |
 
 Unsigned and ad-hoc packages are still verifiable. Each release lists
 `SHA256SUMS`, and every asset carries a GitHub build-provenance attestation that
@@ -61,7 +62,13 @@ Build scripts and workflow files count as source and get the same review.
 
 This program will not transfer any information to other networked systems
 unless specifically requested by the user or the person installing or operating
-it. It has no telemetry, update checks or crash reporting. The bundled
+it. It has no telemetry or crash reporting. It checks for updates only when the
+user chooses Check for Updates…, or once a day if the user agreed when the
+first launch asked; a check requests the release manifest from github.com and,
+when there is a newer version, downloads its package from there. GitHub
+receives the request, with the user's IP address and the updater's name and
+version, under [GitHub's privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement);
+nothing about the user's files or settings is sent. The bundled
 components (the viewer, the sql.js WASM engine and the txiki.js native engine)
 make no network connections in this application. One exception is outside the
 app itself: on a Windows system without the Microsoft Edge WebView2 Runtime,

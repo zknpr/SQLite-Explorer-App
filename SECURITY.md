@@ -66,6 +66,12 @@ Out of scope:
   before it leaves the machine.
 - The native engine refuses `ATTACH`/`DETACH`, and the shell re-checks the
   bound file's identity around every native call.
+- Updates (`src-tauri/src/updater.rs`) install only a package whose signature
+  verifies against the public key built into the app, for the version the
+  release's manifest announces, and never a lower version. The private key is
+  kept offline by the maintainer, so control of the GitHub repository alone
+  cannot ship an update. The page can neither start an update nor change the
+  setting: no capability or app command reaches the updater.
 
 ## Known limitations
 
@@ -85,3 +91,12 @@ design otherwise keeps away from files:
   each database's engine process a request close to the transfer limit, or with
   SQL alone. The shell bounds its own buffering (about 1 GiB per window), not
   the engine processes' memory. No file is read or written this way.
+
+About updates:
+
+- The manifest a check reads (`latest.json`) is not signed. Whoever controls
+  the GitHub repository can withhold an update, or announce one that then fails
+  its signature check; they cannot install anything the update key did not sign.
+- The update key cannot be replaced without a manual reinstall. If it leaked,
+  installed copies would accept packages signed with it until their users
+  installed a release with a new key by hand.
