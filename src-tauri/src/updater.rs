@@ -532,14 +532,18 @@ mod tests {
         );
     }
 
-    /// The public key every installed copy trusts. A QA build signs with its own
-    /// key through a --config override, never through this file.
+    /// The public key every installed copy trusts (minisign key id
+    /// C79712E825E62926; its private half is offline with the maintainer). Pinned
+    /// here so that changing it takes two edits, and a QA build's key, given
+    /// through a --config override, never lands in this file.
     #[test]
     fn the_updater_trusts_the_release_key_not_the_qa_key() {
         let pubkey = updater_config()["pubkey"].as_str().expect("a pubkey").to_string();
-        assert!(!pubkey.is_empty());
-        assert_ne!(pubkey, QA_ONLY_PUBKEY, "tauri.conf.json still carries the QA-only updater key");
+        assert_ne!(pubkey, QA_ONLY_PUBKEY, "tauri.conf.json carries the QA-only updater key");
+        assert_eq!(pubkey, RELEASE_PUBKEY, "tauri.conf.json's updater key is not the release key");
     }
+
+    const RELEASE_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI2MjlFNjI1RTgxMjk3QzcKUldUSGx4TG9KZVlwSm5PeE9nSFpnU1RjWllMQWxDUDhwMEUxaUtHUys5MU5VcXJsaEpoYmR3eloK";
 
     /// scripts/qa/updater: the key the end-to-end QA builds sign with.
     const QA_ONLY_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMxMjNBRjY4ODE5NkI5M0MKUldROHVaYUJhSzhqTVRiaUs4d1ZzUmJwTVBKaWp1cmxTa0I2K29NdTFrTENXU3oxd0xZNGJjKzYK";
