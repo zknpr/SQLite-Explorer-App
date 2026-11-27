@@ -16,10 +16,14 @@ tauri-build = { version = "2.7.6", features = [] }
 [features]
 # Explicitly opted into by the macOS app test runner; never part of a release.
 qa-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
+# End-to-end update runs on test machines (src/updater.rs `qa_mode`); never part of
+# a release, which a test holds against the workflows.
+qa-updater = []
 
 [dependencies]
 tauri = { version = "2.12.7", features = [] }
 tauri-plugin-dialog = "2.8.4"
+tauri-plugin-updater = "=2.14.1"
 tauri-plugin-wdio-webdriver = { version = "=1.5.1", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,6 +52,10 @@ objc2 = "0.6.4"
 gtk = "0.18"
 
 [target.'cfg(unix)'.dependencies]
+# A private (0700) folder for the verified update package that `pkexec dpkg -i`
+# installs (src/updater.rs). Already in the lock at 3.27.0 underneath
+# tauri-plugin-updater; unix rather than Linux only, so its test runs everywhere.
+tempfile = "3"
 # O_NONBLOCK for the allowlisted-path read: opening a FIFO or a device without
 # it blocks forever with nothing able to interrupt it (see read_regular_file).
 libc = "0.2"

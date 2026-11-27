@@ -8,7 +8,9 @@ list of everything linked into each platform binary.
 inventory.json records the original notice-text hashes before aggregation
 whitespace normalization, package versions and retrieval URLs. Files absent
 from Cargo packages were retrieved from their recorded VCS revision where
-available. The winapi target import-library packages use the same project's
+available: from the crate's own path, else the repository root at that
+revision, and a license file that is a symlink there is recorded as the file it
+points to. The winapi target import-library packages use the same project's
 MIT/Apache notices; selectors uses the official MPL 2.0 text.
 
 RUST-STDLIB-NOTICES.html and rust-licenses/ preserve the Rust 1.93.0 standard

@@ -58,5 +58,17 @@
         "role": "Editor"
       }
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI2MjlFNjI1RTgxMjk3QzcKUldUSGx4TG9KZVlwSm5PeE9nSFpnU1RjWllMQWxDUDhwMEUxaUtHUys5MU5VcXJsaEpoYmR3eloK",
+      "endpoints": [
+        "https://github.com/zknpr/SQLite-Explorer-App/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

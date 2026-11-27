@@ -15,6 +15,17 @@
   parameters bind as SQLite reads the same number in SQL; a save retries
   briefly while another program reads the database.
 
+### Updates
+
+- The app can update itself: SQLite Explorer → Check for Updates…, and, if
+  you agree when the first launch asks, a check when the app starts, at most
+  once a day. A newer version is downloaded from the project's releases, then
+  the app asks before installing it, and again when a window has unsaved
+  changes. Updates are signed
+  with the project's update key, kept offline; the app installs nothing else.
+  macOS replaces the app, Windows runs the new installer, and Linux installs
+  the new `.deb` through the administrator prompt.
+
 ### Unsaved work
 
 - Refresh From Disk asks before it discards unsaved edits, from the menu, its
