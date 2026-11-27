@@ -60,8 +60,9 @@ pub(crate) struct UpdaterState {
 
 /// The first-launch question.
 const CONSENT_QUESTION: &str = "Check for updates automatically?\n\n\
-SQLite Explorer can check github.com for a new version once a day, and asks before it installs one. \
-A check sends GitHub your IP address and the updater's name, nothing about you or your files. \
+When it starts, at most once a day, SQLite Explorer can check github.com for a new version. \
+If there is one, it downloads it from the project's releases there and asks before installing it. \
+GitHub sees your IP address and the updater's name, nothing about you or your files. \
 You can change this later in the SQLite Explorer menu.";
 
 /// The "Check for Updates Automatically" item on screen. Replaced with the
@@ -137,6 +138,26 @@ pub(crate) fn auto_check_due(state: &UpdaterState, now: u64) -> bool {
         && (state.last_check > now || now - state.last_check >= AUTO_CHECK_INTERVAL.as_secs())
 }
 
+/// The first-launch answer, saved only while the setting is still unanswered:
+/// a menu choice made while the question was open stands.
+fn record_answer(state: &mut UpdaterState, agreed: bool) {
+    if state.check_automatically.is_none() {
+        state.check_automatically = Some(agreed);
+    }
+}
+
+/// Admits an automatic check when one is due and records it as made, answered
+/// or not, so the daily limit holds when the server fails too. Decided under
+/// `STATE_LOCK` once the flight slot is held, so a manual check or an opt-out
+/// that landed in between is seen.
+fn admit_automatic(state: &mut UpdaterState, now: u64) -> bool {
+    let due = auto_check_due(state, now);
+    if due {
+        state.last_check = now;
+    }
+    due
+}
+
 /// The setting a click on the menu item asks for: unchecked (off, or not yet
 /// asked) becomes on, on becomes off. Choosing it from the menu answers the
 /// first-launch question too.
@@ -147,21 +168,32 @@ fn toggled(current: Option<bool>) -> Option<bool> {
 /// The menu's "Check for Updates Automatically": flips the saved setting, then
 /// puts the mark where the file says, also when the write failed.
 pub(crate) fn toggle_automatic_checks(app: &AppHandle) {
-    let saved = update_state(app, |state| state.check_automatically = toggled(state.check_automatically));
-    match saved {
-        Ok(state) => show_mark(app, state.check_automatically == Some(true)),
-        Err(e) => {
-            eprintln!("updater: could not save the setting: {e}");
-            show_mark(app, checks_automatically(app));
-        }
+    if let Err(e) = update_state(app, |state| state.check_automatically = toggled(state.check_automatically)) {
+        eprintln!("updater: could not save the setting: {e}");
     }
+    refresh_mark(app);
 }
 
-fn show_mark(app: &AppHandle, enabled: bool) {
-    if let Some(item) = app.state::<UpdaterMenu>().0.lock().unwrap().as_ref() {
-        if let Err(e) = item.set_checked(enabled) {
-            eprintln!("updater: could not update the menu mark: {e}");
+/// Puts the menu mark where the saved setting says, on the main thread and
+/// without waiting for it. Off the main thread, `set_checked` blocks until the
+/// main thread runs it, and `rebuild_menu` takes the `UpdaterMenu` lock there:
+/// a worker holding that lock across the call could deadlock with it. Reading
+/// the setting when the refresh runs, not passing a value in, also keeps a
+/// newer choice from being painted over by an older one.
+fn refresh_mark(app: &AppHandle) {
+    let handle = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        let app = handle;
+        let enabled = checks_automatically(&app);
+        let item = app.state::<UpdaterMenu>().0.lock().unwrap().clone();
+        if let Some(item) = item {
+            if let Err(e) = item.set_checked(enabled) {
+                eprintln!("updater: could not update the menu mark: {e}");
+            }
         }
+    });
+    if let Err(e) = queued {
+        eprintln!("updater: could not schedule the menu mark: {e}");
     }
 }
 
@@ -234,9 +266,9 @@ pub(crate) fn schedule_automatic_check(app: &AppHandle) {
             let agreed = ask(&app, TITLE, CONSENT_QUESTION, false, ("Check Automatically", "Don't Check"));
             // Unsaved, the answer is asked again at the next launch rather than
             // acted on now.
-            match update_state(&app, |state| state.check_automatically = Some(agreed)) {
+            match update_state(&app, |state| record_answer(state, agreed)) {
                 Ok(saved) => {
-                    show_mark(&app, saved.check_automatically == Some(true));
+                    refresh_mark(&app);
                     saved
                 }
                 Err(e) => {
@@ -275,6 +307,16 @@ fn run(app: &AppHandle, trigger: Trigger) {
         }
         return;
     };
+    if trigger == Trigger::Automatic {
+        let mut admitted = false;
+        if let Err(e) = update_state(app, |state| admitted = admit_automatic(state, now_secs())) {
+            eprintln!("updater: could not record the automatic check ({e}); not checking");
+            return;
+        }
+        if !admitted {
+            return;
+        }
+    }
     let current = app.package_info().version.to_string();
     let found = updater(app).and_then(|updater| {
         tauri::async_runtime::block_on(updater.check()).map_err(|e| match e {
@@ -284,7 +326,9 @@ fn run(app: &AppHandle, trigger: Trigger) {
             other => Unanswered::Failed(other.to_string()),
         })
     });
-    if !matches!(found, Err(Unanswered::Failed(_))) {
+    // A manual check that got an answer postpones the next automatic one; an
+    // automatic one was recorded when it was admitted.
+    if manual && !matches!(found, Err(Unanswered::Failed(_))) {
         if let Err(e) = update_state(app, |state| state.last_check = now_secs()) {
             eprintln!("updater: could not record the check: {e}");
         }
@@ -315,6 +359,15 @@ fn run(app: &AppHandle, trigger: Trigger) {
             return;
         }
     };
+    let endpoint = configured_endpoint(app);
+    if !endpoint.as_deref().is_some_and(|endpoint| allowed_download(endpoint, update.download_url.as_str())) {
+        complain(
+            app,
+            manual,
+            &format!("Did not download SQLite Explorer {}: the release names a package outside this project's releases ({}).", update.version, update.download_url),
+        );
+        return;
+    }
     let bytes = match tauri::async_runtime::block_on(update.download(|_, _| {}, || {})) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -333,21 +386,81 @@ fn run(app: &AppHandle, trigger: Trigger) {
         return;
     }
     if let Err(e) = install(&update, &bytes, route) {
-        say(app, &format!("SQLite Explorer {} was not installed: {e}", update.version), MessageDialogKind::Warning);
+        if ENGINES_CLOSED.load(Ordering::Acquire) {
+            // Windows: the hook closed every engine, then the installer did not
+            // start. The registries now refuse every new native open until the
+            // app restarts, and the user has already agreed to close their work.
+            let text = format!(
+                "SQLite Explorer {} was not installed: {e}\n\nThe app has to restart to open databases again.",
+                update.version
+            );
+            if ask(app, TITLE, &text, true, ("Restart", "Quit")) {
+                app.request_restart();
+            } else {
+                app.exit(0);
+            }
+        } else {
+            say(app, &format!("SQLite Explorer {} was not installed: {e}", update.version), MessageDialogKind::Warning);
+        }
         return;
     }
     // Asked again: on Linux the install waited on pkexec and dpkg, and on macOS
     // perhaps on an administrator prompt, while the windows stayed editable.
     // Windows does not get here; the plugin has ended the process.
-    if unsaved_work_may_close(app, "The update is installed; restarting closes them without saving. Restart now?", "Restart Now") {
-        app.request_restart();
+    finish_after_install(
+        || unsaved_work_may_close(app, "The update is installed; restarting closes them without saving. Restart now?", "Restart Now"),
+        || app.request_restart(),
+        || {
+            say(
+                app,
+                &format!("SQLite Explorer {} is installed and starts the next time you open the app.", update.version),
+                MessageDialogKind::Info,
+            )
+        },
+    );
+}
+
+/// After a successful install: restart only when the unsaved-work question
+/// allows it; otherwise the installed version waits for the next launch.
+fn finish_after_install(may_close: impl FnOnce() -> bool, restart: impl FnOnce(), later: impl FnOnce()) {
+    if may_close() {
+        restart();
     } else {
-        say(
-            app,
-            &format!("SQLite Explorer {} is installed and starts the next time you open the app.", update.version),
-            MessageDialogKind::Info,
-        );
+        later();
     }
+}
+
+/// The endpoint tauri.conf.json (or a QA build's override) gives the updater.
+fn configured_endpoint(app: &AppHandle) -> Option<String> {
+    app.config().plugins.0.get("updater")?.get("endpoints")?.get(0)?.as_str().map(str::to_string)
+}
+
+/// Whether a package URL from the manifest may be fetched. The manifest is not
+/// signed, so whoever controls it could name any host, and that host would get
+/// the request (the user's address) before the signature is checked. Held to
+/// the endpoint's origin (scheme, host and port) and, for a GitHub releases
+/// endpoint, to that repository's releases path. URL parsing has already
+/// resolved any `..`.
+fn allowed_download(endpoint: &str, download: &str) -> bool {
+    let (Ok(endpoint), Ok(download)) = (tauri::Url::parse(endpoint), tauri::Url::parse(download)) else {
+        return false;
+    };
+    let path = endpoint.path();
+    let prefix = path.find("/releases/").map_or("/", |at| &path[..at + "/releases/".len()]);
+    endpoint.origin() == download.origin() && download.path().starts_with(prefix)
+}
+
+/// The private folder the verified .deb is written to before dpkg reads it.
+/// tempfile creates folders 0777 minus the umask unless told otherwise; 0700
+/// keeps every other user from replacing the package before dpkg reads it.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn staging_dir() -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new()
+        .prefix("sqlite-explorer-update")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
 }
 
 enum Unanswered {
@@ -363,14 +476,26 @@ const ELSEWHERE: &str = "This copy of SQLite Explorer does not update itself. Up
 /// launching it, with no `RunEvent::Exit`, and a running `tjs.exe` would stop the
 /// installer from replacing it.
 fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Unanswered> {
-    let builder = app.updater_builder();
+    let builder = app.updater_builder().timeout(UPDATE_REQUEST_TIMEOUT);
     #[cfg(windows)]
     let builder = {
         let app = app.clone();
-        builder.on_before_exit(move || crate::close_all_sidecars(&app))
+        builder.on_before_exit(move || {
+            crate::close_all_sidecars(&app);
+            ENGINES_CLOSED.store(true, Ordering::Release);
+        })
     };
     builder.build().map_err(|e| Unanswered::Failed(e.to_string()))
 }
+
+/// A bound on the manifest request and on the package download, each: without
+/// one a stalled connection kept the flight slot, and every later Check for
+/// Updates… said a check was in progress, until the app restarted. Long enough
+/// for a package of about 25 MB on a slow link.
+const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Set by the Windows hook once every engine process is closed (see `run`).
+static ENGINES_CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// How this copy installs an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,13 +585,11 @@ fn install(update: &Update, bytes: &[u8], route: Route) -> Result<(), String> {
 /// for the password in a zenity or kdialog box of its own and pipes it to sudo.
 /// The app would then hold the user's password, and Cancel would not cancel.
 /// pkexec leaves the password with polkit. The package is written to a private
-/// (0700) temporary folder, so only this user can replace it before dpkg reads it.
+/// (0700) temporary folder (`staging_dir`), so only this user can replace it
+/// before dpkg reads it.
 #[cfg(target_os = "linux")]
 fn install_with_dpkg(bytes: &[u8]) -> Result<(), String> {
-    let dir = tempfile::Builder::new()
-        .prefix("sqlite-explorer-update")
-        .tempdir()
-        .map_err(|e| format!("could not create a temporary folder: {e}"))?;
+    let dir = staging_dir().map_err(|e| format!("could not create a temporary folder: {e}"))?;
     let package = dir.path().join("sqlite-explorer.deb");
     std::fs::write(&package, bytes).map_err(|e| format!("could not write the package: {e}"))?;
     match std::process::Command::new("pkexec").arg("/usr/bin/dpkg").arg("-i").arg(&package).status() {
@@ -594,12 +717,101 @@ mod tests {
         let run = &source[source.find("fn run(app: &AppHandle").expect("fn run")..];
         let run = &run[..run.find("\nenum Unanswered").expect("the end of fn run")];
         let install = run.find("install(&update").expect("run installs");
-        let restart = run.find("request_restart()").expect("run restarts");
-        assert!(install < restart);
-        assert!(
-            run[install..restart].contains("unsaved_work_may_close("),
-            "no unsaved-changes question between the install and the restart"
-        );
+        let finish = run[install..].find("finish_after_install(").expect("run finishes through finish_after_install") + install;
+        let call = &run[finish..finish + run[finish..].find("\n    );").expect("the end of the call")];
+        let may_close = call.find("unsaved_work_may_close(").expect("may_close asks about unsaved work");
+        let restart = call.find("request_restart()").expect("restart requests the restart");
+        assert!(may_close < restart, "the question is finish_after_install's may_close, the restart its restart");
+    }
+
+    /// CodeRabbit review, #9: a menu choice made while the first-launch question
+    /// is open must not be overwritten by the answer.
+    #[test]
+    fn the_first_launch_answer_never_replaces_a_choice_already_made() {
+        let mut state = UpdaterState { check_automatically: Some(false), last_check: 0 };
+        record_answer(&mut state, true);
+        assert_eq!(state.check_automatically, Some(false));
+        let mut state = UpdaterState::default();
+        record_answer(&mut state, true);
+        assert_eq!(state.check_automatically, Some(true));
+    }
+
+    /// CodeRabbit review, #9: an automatic attempt counts toward the daily limit
+    /// whether or not it gets an answer, so a failing server is not asked again
+    /// at every launch, and the admission is decided once, under the lock.
+    #[test]
+    fn an_automatic_attempt_is_recorded_when_it_is_admitted() {
+        let day = AUTO_CHECK_INTERVAL.as_secs();
+        let mut state = UpdaterState { check_automatically: Some(true), last_check: 0 };
+        assert!(admit_automatic(&mut state, 10 * day));
+        assert_eq!(state.last_check, 10 * day);
+        assert!(!admit_automatic(&mut state, 10 * day + 60), "a second launch the same day sends nothing");
+        let mut off = UpdaterState { check_automatically: Some(false), last_check: 0 };
+        assert!(!admit_automatic(&mut off, 10 * day));
+        assert_eq!(off.last_check, 0);
+    }
+
+    /// CodeRabbit review, #9: the decision itself, both ways.
+    #[test]
+    fn declining_the_second_question_leaves_the_update_for_the_next_launch() {
+        let (mut restarted, mut later) = (false, false);
+        finish_after_install(|| false, || restarted = true, || later = true);
+        assert!(!restarted && later);
+        let (mut restarted, mut later) = (false, false);
+        finish_after_install(|| true, || restarted = true, || later = true);
+        assert!(restarted && !later);
+    }
+
+    /// CodeRabbit review, #9: the manifest is not signed, so the package URL it
+    /// names is held to the endpoint's origin and its releases path; whoever
+    /// controls the manifest cannot send the request elsewhere.
+    #[test]
+    fn a_package_is_fetched_only_from_the_endpoints_releases() {
+        let endpoint = "https://github.com/zknpr/SQLite-Explorer-App/releases/latest/download/latest.json";
+        let ok = "https://github.com/zknpr/SQLite-Explorer-App/releases/download/v0.4.1/SQLite-Explorer-0.4.1-linux-amd64.deb";
+        assert!(allowed_download(endpoint, ok));
+        for refused in [
+            "https://attacker.example/SQLite-Explorer-0.4.1-linux-amd64.deb",
+            "http://github.com/zknpr/SQLite-Explorer-App/releases/download/v0.4.1/x.deb",
+            "https://github.com/someone-else/SQLite-Explorer-App/releases/download/v0.4.1/x.deb",
+            "https://github.com.attacker.example/zknpr/SQLite-Explorer-App/releases/download/v0.4.1/x.deb",
+            "https://github.com:8443/zknpr/SQLite-Explorer-App/releases/download/v0.4.1/x.deb",
+            "https://github.com/zknpr/SQLite-Explorer-App/releases/download/../../../evil",
+        ] {
+            assert!(!allowed_download(endpoint, refused), "{refused}");
+        }
+        // A QA build's local endpoint: the same origin, any path.
+        assert!(allowed_download("http://127.0.0.1:8765/latest.json", "http://127.0.0.1:8765/B.app.tar.gz"));
+        assert!(!allowed_download("http://127.0.0.1:8765/latest.json", "http://127.0.0.1:9999/B.app.tar.gz"));
+    }
+
+    /// CodeRabbit review, #9: tempfile creates folders 0777 minus the umask, so a
+    /// shared-group user could have swapped the verified .deb before dpkg read it.
+    #[cfg(unix)]
+    #[test]
+    fn the_update_staging_folder_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = staging_dir().expect("a staging folder");
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "staging folder mode {mode:o}");
+    }
+
+    /// CodeRabbit review, #9: requests time out, and the menu mark is refreshed on
+    /// the main thread from the saved setting, never by a worker holding the
+    /// menu lock while set_checked waits for the main thread.
+    #[test]
+    fn updater_requests_are_bounded_and_the_mark_is_refreshed_on_the_main_thread() {
+        let source = include_str!("updater.rs");
+        let builder = &source[source.find("fn updater(app: &AppHandle").expect("fn updater")..];
+        let builder = &builder[..builder.find("\n}\n").expect("its end")];
+        assert!(builder.contains(".timeout(UPDATE_REQUEST_TIMEOUT)"), "no request deadline");
+        let refresh = &source[source.find("fn refresh_mark(app: &AppHandle").expect("fn refresh_mark")..];
+        let refresh = &refresh[..refresh.find("\n}\n").expect("its end")];
+        assert!(refresh.contains("run_on_main_thread"));
+        assert!(refresh.contains("checks_automatically(&app)"), "the mark reads the saved setting");
+        let worker = &source[source.find("pub(crate) fn schedule_automatic_check").expect("the worker")..];
+        let worker = &worker[..worker.find("\n}\n").expect("its end")];
+        assert!(!worker.contains("show_mark("), "the worker sets the mark itself");
     }
 
     #[test]
