@@ -46,20 +46,23 @@ const AUTO_CHECK_DELAY: Duration = Duration::from_secs(10);
 const TITLE: &str = "Software Update";
 
 /// What `updater.json` holds. Shell-written only, like `recents.json`: the page
-/// must not be able to turn the checks off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// must not be able to turn the checks on or off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub(crate) struct UpdaterState {
-    pub(crate) check_automatically: bool,
+    /// `None` until the user answers the first-launch question: nothing is
+    /// checked automatically before they agree, so the app sends nothing to a
+    /// network the user did not ask for (docs/code-signing-policy.md, Privacy).
+    pub(crate) check_automatically: Option<bool>,
     /// Seconds since the Unix epoch of the last check that got an answer.
     pub(crate) last_check: u64,
 }
 
-impl Default for UpdaterState {
-    fn default() -> Self {
-        Self { check_automatically: true, last_check: 0 }
-    }
-}
+/// The first-launch question.
+const CONSENT_QUESTION: &str = "Check for updates automatically?\n\n\
+SQLite Explorer can check github.com for a new version once a day, and asks before it installs one. \
+A check sends GitHub your IP address and the updater's name, nothing about you or your files. \
+You can change this later in the SQLite Explorer menu.";
 
 /// The "Check for Updates Automatically" item on screen. Replaced with the
 /// menu, after `set_menu` succeeds, for the reason `rebuild_menu` gives for the
@@ -76,8 +79,8 @@ pub(crate) fn state_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("updater.json"))
 }
 
-/// The saved state, or the defaults (checks on) when there is none or it cannot
-/// be read; the reason is reported on stderr.
+/// The saved state, or the defaults (not asked yet) when there is none or it
+/// cannot be read; the reason is reported on stderr.
 pub(crate) fn load_state_from(path: &Path) -> UpdaterState {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
@@ -115,10 +118,10 @@ fn update_state(app: &AppHandle, change: impl FnOnce(&mut UpdaterState)) -> Resu
 pub(crate) fn checks_automatically(app: &AppHandle) -> bool {
     let _serialized = STATE_LOCK.lock().unwrap();
     match state_path(app) {
-        Ok(path) => load_state_from(&path).check_automatically,
+        Ok(path) => load_state_from(&path).check_automatically == Some(true),
         Err(e) => {
-            eprintln!("updater: no state path ({e}); automatic checks stay on");
-            true
+            eprintln!("updater: no state path ({e}); no automatic checks");
+            false
         }
     }
 }
@@ -130,21 +133,31 @@ fn now_secs() -> u64 {
 /// Whether an automatic check is due at `now`. A last check in the future (the
 /// clock was set back) counts as due rather than postponing checks until then.
 pub(crate) fn auto_check_due(state: &UpdaterState, now: u64) -> bool {
-    state.check_automatically
+    state.check_automatically == Some(true)
         && (state.last_check > now || now - state.last_check >= AUTO_CHECK_INTERVAL.as_secs())
+}
+
+/// The setting a click on the menu item asks for: unchecked (off, or not yet
+/// asked) becomes on, on becomes off. Choosing it from the menu answers the
+/// first-launch question too.
+fn toggled(current: Option<bool>) -> Option<bool> {
+    Some(current != Some(true))
 }
 
 /// The menu's "Check for Updates Automatically": flips the saved setting, then
 /// puts the mark where the file says, also when the write failed.
 pub(crate) fn toggle_automatic_checks(app: &AppHandle) {
-    let saved = update_state(app, |state| state.check_automatically = !state.check_automatically);
-    let enabled = match saved {
-        Ok(state) => state.check_automatically,
+    let saved = update_state(app, |state| state.check_automatically = toggled(state.check_automatically));
+    match saved {
+        Ok(state) => show_mark(app, state.check_automatically == Some(true)),
         Err(e) => {
             eprintln!("updater: could not save the setting: {e}");
-            checks_automatically(app)
+            show_mark(app, checks_automatically(app));
         }
-    };
+    }
+}
+
+fn show_mark(app: &AppHandle, enabled: bool) {
     if let Some(item) = app.state::<UpdaterMenu>().0.lock().unwrap().as_ref() {
         if let Err(e) = item.set_checked(enabled) {
             eprintln!("updater: could not update the menu mark: {e}");
@@ -175,10 +188,10 @@ enum Trigger {
     Menu,
 }
 
-/// The automatic check, a little after launch, when the setting is on and the
-/// last one is a day old. Never in a development build: those are not
-/// installed, and a check there would offer to replace whatever surrounds the
-/// binary.
+/// A little after launch: the first-launch question while it is unanswered,
+/// then the automatic check when the setting is on and the last check is a day
+/// old. Never in a development build: those are not installed, and a check
+/// there would offer to replace whatever surrounds the binary.
 pub(crate) fn schedule_automatic_check(app: &AppHandle) {
     if cfg!(debug_assertions) {
         return;
@@ -186,17 +199,34 @@ pub(crate) fn schedule_automatic_check(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(AUTO_CHECK_DELAY);
-        let due = {
+        let state = {
             let _serialized = STATE_LOCK.lock().unwrap();
             match state_path(&app) {
-                Ok(path) => auto_check_due(&load_state_from(&path), now_secs()),
+                Ok(path) => load_state_from(&path),
                 Err(e) => {
                     eprintln!("updater: no state path ({e}); not checking");
-                    false
+                    return;
                 }
             }
         };
-        if due {
+        let state = if state.check_automatically.is_none() {
+            let agreed = ask(&app, TITLE, CONSENT_QUESTION, false, ("Check Automatically", "Don't Check"));
+            // Unsaved, the answer is asked again at the next launch rather than
+            // acted on now.
+            match update_state(&app, |state| state.check_automatically = Some(agreed)) {
+                Ok(saved) => {
+                    show_mark(&app, saved.check_automatically == Some(true));
+                    saved
+                }
+                Err(e) => {
+                    eprintln!("updater: could not save the answer: {e}");
+                    return;
+                }
+            }
+        } else {
+            state
+        };
+        if auto_check_due(&state, now_secs()) {
             run(&app, Trigger::Automatic);
         }
     });
@@ -515,32 +545,43 @@ mod tests {
     const QA_ONLY_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMxMjNBRjY4ODE5NkI5M0MKUldROHVaYUJhSzhqTVRiaUs4d1ZzUmJwTVBKaWp1cmxTa0I2K29NdTFrTENXU3oxd0xZNGJjKzYK";
 
     #[test]
-    fn the_state_defaults_to_daily_checks_and_survives_a_bad_file() {
+    fn nothing_is_checked_until_asked_and_the_state_survives_a_bad_file() {
         let dir = std::env::temp_dir().join(format!("updater-state-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("updater.json");
         let _ = std::fs::remove_file(&path);
         assert_eq!(load_state_from(&path), UpdaterState::default());
-        assert!(UpdaterState::default().check_automatically);
+        assert_eq!(UpdaterState::default().check_automatically, None, "not asked yet");
         std::fs::write(&path, b"{not json").unwrap();
         assert_eq!(load_state_from(&path), UpdaterState::default());
-        let state = UpdaterState { check_automatically: false, last_check: 42 };
+        let state = UpdaterState { check_automatically: Some(false), last_check: 42 };
         save_state_to(&path, &state).unwrap();
         assert_eq!(load_state_from(&path), state);
-        std::fs::write(&path, br#"{"checkAutomatically":false}"#).unwrap();
-        assert_eq!(load_state_from(&path), UpdaterState { check_automatically: false, last_check: 0 });
+        std::fs::write(&path, br#"{"checkAutomatically":true}"#).unwrap();
+        assert_eq!(load_state_from(&path), UpdaterState { check_automatically: Some(true), last_check: 0 });
+        std::fs::write(&path, br#"{"checkAutomatically":null,"lastCheck":7}"#).unwrap();
+        assert_eq!(load_state_from(&path), UpdaterState { check_automatically: None, last_check: 7 });
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn an_automatic_check_is_due_once_a_day_and_after_the_clock_goes_back() {
+    fn an_automatic_check_is_due_once_a_day_only_after_the_user_agreed() {
         let day = AUTO_CHECK_INTERVAL.as_secs();
-        let on = |last_check| UpdaterState { check_automatically: true, last_check };
+        let on = |last_check| UpdaterState { check_automatically: Some(true), last_check };
         assert!(auto_check_due(&on(0), 10 * day));
         assert!(!auto_check_due(&on(10 * day), 10 * day + day - 1));
         assert!(auto_check_due(&on(10 * day), 11 * day));
         assert!(auto_check_due(&on(12 * day), 11 * day), "a last check in the future");
-        assert!(!auto_check_due(&UpdaterState { check_automatically: false, last_check: 0 }, 10 * day));
+        for answer in [None, Some(false)] {
+            assert!(!auto_check_due(&UpdaterState { check_automatically: answer, last_check: 0 }, 10 * day));
+        }
+    }
+
+    #[test]
+    fn the_menu_item_turns_checks_on_from_unasked_or_off_and_off_from_on() {
+        assert_eq!(toggled(None), Some(true));
+        assert_eq!(toggled(Some(false)), Some(true));
+        assert_eq!(toggled(Some(true)), Some(false));
     }
 
     #[test]
