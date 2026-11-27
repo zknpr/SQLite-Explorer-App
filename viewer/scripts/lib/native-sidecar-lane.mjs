@@ -2831,6 +2831,45 @@ async function runWalWatchdogCase(binary, scratch, note) {
 }
 
 /**
+ * The wall time of one 600 ms busy wait (native-host.js LOCK_WAIT_MS) on this
+ * machine, measured with node:sqlite against an exclusive lock: the same SQLite
+ * busy handler and sleep schedule the sidecar's connection uses. The handler
+ * counts the sleeps it asks for, not the time they take, so where the OS
+ * oversleeps, one wait lasts well past 600 ms of wall time. The single-wait
+ * ceilings in runLockWaitCase scale with this, so they still tell one wait from
+ * two on such a machine. Median of three.
+ *
+ * @returns {number} milliseconds
+ */
+function measureOneBusyWait(scratch) {
+    const file = path.join(scratch, 'busy-wait-control.sqlite');
+    fs.rmSync(file, { force: true });
+    const holder = new DatabaseSync(file);
+    holder.exec('CREATE TABLE t (x)');
+    holder.exec('BEGIN EXCLUSIVE');
+    const walls = [];
+    try {
+        for (let i = 0; i < 3; i += 1) {
+            const waiter = new DatabaseSync(file, { timeout: 600 });
+            const started = Date.now();
+            try {
+                waiter.prepare('SELECT count(*) FROM t').get();
+                throw new Error('busy-wait control: a read under an exclusive lock was not refused');
+            } catch (error) {
+                if (!/database is locked/.test(error?.message ?? '')) throw error;
+            } finally {
+                waiter.close();
+            }
+            walls.push(Date.now() - started);
+        }
+    } finally {
+        holder.exec('ROLLBACK');
+        holder.close();
+    }
+    return walls.sort((a, b) => a - b)[1];
+}
+
+/**
  * busy_timeout against a second connection on the same file. In
  * rollback-journal mode a SHARED lock elsewhere blocks this session's COMMIT
  * and an EXCLUSIVE one blocks its reads. The second connection is node:sqlite
@@ -2849,6 +2888,11 @@ async function runLockWaitCase(binary, scratch, note) {
     seed.exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, payload BLOB);
         INSERT INTO t VALUES (1, 'one', X'00010203'), (2, 'two', NULL);`);
     seed.close();
+    // At least 1100 ms (well below two waits on an idle machine), more where one
+    // wait takes longer here; two waits still exceed it.
+    const oneWaitMs = measureOneBusyWait(scratch);
+    const singleWaitCeilingMs = Math.max(1100, Math.round(1.5 * oneWaitMs));
+    const waitNote = `(one wait here: ${oneWaitMs} ms; ceiling ${singleWaitCeilingMs} ms)`;
     const lockers = [];
     const timedReleases = [];
     /**
@@ -2918,9 +2962,9 @@ async function runLockWaitCase(binary, scratch, note) {
         await s.invoke('runQuery', ["INSERT INTO t (v) VALUES ('four')"]);
         const releaseShared = takeLock('shared');
         const refused = await timed('runQuery', ['COMMIT']);
-        check(locked(refused.reply) && refused.ms >= 450 && refused.ms < 1100,
+        check(locked(refused.reply) && refused.ms >= 450 && refused.ms < singleWaitCeilingMs,
             'sidecar/lock-wait/commit-is-refused-after-about-600-ms-under-a-held-shared-lock',
-            `${refused.ms} ms ${show(refused.reply)}`);
+            `${refused.ms} ms ${waitNote} ${show(refused.reply)}`);
         releaseShared();
         const retried = await s.invoke('runQuery', ['COMMIT']);
         check(retried.content?.success === true, 'sidecar/lock-wait/a-refused-commit-can-be-repeated-after-release',
@@ -2965,8 +3009,8 @@ async function runLockWaitCase(binary, scratch, note) {
         ]) {
             const answer = await timed(method, payload);
             answers[label] = answer.reply;
-            check((!readsTheFile || answer.ms >= 450) && answer.ms < 1100,
-                `sidecar/lock-wait/bounded-by-a-single-wait/${label}`, `${answer.ms} ms ${show(answer.reply)}`);
+            check((!readsTheFile || answer.ms >= 450) && answer.ms < singleWaitCeilingMs,
+                `sidecar/lock-wait/bounded-by-a-single-wait/${label}`, `${answer.ms} ms ${waitNote} ${show(answer.reply)}`);
         }
         // The column probe used to swallow the refusal, and the grid then
         // failed on "Cell containment requires a positive column count".
