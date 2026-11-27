@@ -65,10 +65,12 @@ unless specifically requested by the user or the person installing or operating
 it. It has no telemetry or crash reporting. It checks for updates only when the
 user chooses Check for Updates…, or, if the user agreed when the first launch
 asked, when the app starts and a day has passed since the last check. A check
-requests the release manifest from github.com and, when there is a newer
-version, downloads its package (several megabytes) from this project's releases
-there before asking to install it; the app downloads from nowhere else. GitHub
-receives the request, with the user's IP address and the updater's name and
+requests the release manifest from github.com, which redirects it to GitHub's
+download server (release-assets.githubusercontent.com), and, when there is a
+newer version, downloads its package (several megabytes) from this project's
+releases the same way before asking to install it; the app requests packages
+from nowhere else. GitHub receives the requests, with the user's IP address
+and the updater's name and
 version, under [GitHub's privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement);
 nothing about the user's files or settings is sent. The bundled
 components (the viewer, the sql.js WASM engine and the txiki.js native engine)

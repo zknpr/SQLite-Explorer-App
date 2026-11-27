@@ -98,10 +98,12 @@ key, checked against the public key built into the app.
   prompt. A copy installed another way, such as from the AUR, is told about the
   new version and updates through its package manager.
 
-A check is one request to github.com. When there is a newer version, its
-package (several megabytes) is downloaded from this project's releases there
-before the app asks to install it; the app downloads from nowhere else. GitHub
-sees your IP address. Nothing about your files or settings is sent.
+A check is one request to github.com, which GitHub answers from its download
+server (release-assets.githubusercontent.com). When there is a newer version,
+its package (several megabytes) is downloaded from this project's releases the
+same way before the app asks to install it; the app requests packages from
+nowhere else. GitHub sees your IP address. Nothing about your files or settings
+is sent.
 
 ## Build from a checkout
 
