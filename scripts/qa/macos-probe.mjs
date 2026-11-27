@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Read-only diagnostics from the real WKWebView after a Computer Use/manual run.
+// Read-only diagnostics from the real WKWebView after a manual run.
 // This does not replace the OS interaction checklist or mock the desktop bridge.
 import assert from 'node:assert/strict';
 

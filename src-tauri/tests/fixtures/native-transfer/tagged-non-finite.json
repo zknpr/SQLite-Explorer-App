@@ -1,0 +1,1 @@
+{"channel":"rpc","content":{"kind":"invoke","messageId":"rpc_fixture_3","targetMethod":"nativeTransfer","payload":["push","req_1_fixture",0,2,128,"~sqlite-explorer-non-finite:NaN"]}}

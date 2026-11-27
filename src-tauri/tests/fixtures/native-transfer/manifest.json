@@ -1,0 +1,46 @@
+{
+  "generator": "scripts/gen-native-transfer-fixtures.mjs",
+  "source": {
+    "sha256": {
+      "core/native/frame-codec.js": "ffc5ee0379a277aeba90a0ef94ac77e76941e098303109310d5e79ab811b51b2",
+      "core/native/native-transfer.js": "817506b712dd96f121b4595dc44a0977ca7fdb2b04db7d187e28b156185320b8",
+      "src/core/json-safe-numbers.ts": "0d49647078bf73d3d3aa1cc405bd0682f9659003a90083a12333692d539e7077"
+    }
+  },
+  "testPieceUnits": 64,
+  "transferPieceUnits": 5591040,
+  "cases": [
+    {
+      "file": "tilde-wire-one-short.json",
+      "gate": "admit",
+      "wireUnits": 63,
+      "decodedType": "string",
+      "decodedUnits": 62,
+      "sidecarAccepts": true
+    },
+    {
+      "file": "tilde-wire-at-bound.json",
+      "gate": "admit",
+      "wireUnits": 64,
+      "decodedType": "string",
+      "decodedUnits": 63,
+      "sidecarAccepts": true
+    },
+    {
+      "file": "tilde-wire-one-over.json",
+      "gate": "refuse",
+      "wireUnits": 65,
+      "decodedType": "string",
+      "decodedUnits": 64,
+      "sidecarAccepts": false
+    },
+    {
+      "file": "tagged-non-finite.json",
+      "gate": "refuse",
+      "wireUnits": 31,
+      "decodedType": "number",
+      "decodedUnits": null,
+      "sidecarAccepts": false
+    }
+  ]
+}

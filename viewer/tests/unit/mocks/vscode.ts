@@ -1,0 +1,203 @@
+
+import { EventEmitter } from 'events';
+// The shape this mock hands around; this repository does not install the
+// VS Code API types.
+type Uri = { scheme: string; path: string; fsPath: string };
+
+class classEventEmitter {
+    private _listeners: Function[] = [];
+    event = (listener: Function) => {
+        this._listeners.push(listener);
+        return { dispose: () => { this._listeners = this._listeners.filter(l => l !== listener); } };
+    }
+    fire(data: any) {
+        this._listeners.forEach(l => l(data));
+    }
+    dispose() {
+        this._listeners = [];
+    }
+}
+
+const closeTextDocumentEmitter = new classEventEmitter();
+const changeTabsEmitter = new classEventEmitter();
+
+export const mockVscode = {
+    Uri: {
+        parse: (path: string) => {
+            // Simple mock: assumes path starts with scheme or is just a path string
+            // For this test, we mostly care about the 'path' property
+            const uri = {
+                scheme: 'vscode-sqlite',
+                authority: '',
+                path: path.startsWith('vscode-sqlite://') ? path.substring(16) : path,
+                query: '',
+                fragment: '',
+                fsPath: path,
+                with: () => uri,
+                toString: () => path,
+                toJSON: () => path
+            };
+            return uri;
+        },
+        from: (components: { scheme: string, path: string, query?: string }) => ({
+            scheme: components.scheme,
+            path: components.path,
+            query: components.query || '',
+            toString: () => `${components.scheme}://${components.path}${components.query ? '?' + components.query : ''}`
+        }),
+        file: (path: string) => ({
+            scheme: 'file',
+            authority: '',
+            path,
+            query: '',
+            fragment: '',
+            fsPath: path,
+            with: () => ({}),
+            toString: () => `file://${path}`
+        }),
+        joinPath: (baseUri: any, ...pathSegments: string[]) => {
+            const separator = baseUri.fsPath.endsWith('/') ? '' : '/';
+            const joinedPath = baseUri.fsPath + separator + pathSegments.join('/');
+            return {
+                scheme: baseUri.scheme,
+                authority: baseUri.authority,
+                path: joinedPath,
+                query: baseUri.query,
+                fragment: baseUri.fragment,
+                fsPath: joinedPath,
+                with: () => ({}),
+                toString: () => `${baseUri.scheme}://${joinedPath}`
+            };
+        }
+    },
+    FileSystemError: {
+        FileNotFound: (uri: any) => {
+            const err = new Error(`FileNotFound: ${uri?.path || uri}`);
+            (err as any).code = 'FileNotFound';
+            return err;
+        },
+        FileExists: (uri: any) => new Error(`FileExists: ${uri?.path || uri}`),
+        FileNotADirectory: (uri: any) => new Error(`FileNotADirectory: ${uri?.path || uri}`),
+        FileIsADirectory: (uri: any) => new Error(`FileIsADirectory: ${uri?.path || uri}`),
+        NoPermissions: (msg?: string) => new Error(msg || 'NoPermissions'),
+        Unavailable: (msg: string) => new Error(msg || 'Unavailable')
+    },
+    CancellationError: class CancellationError extends Error {
+        constructor() {
+            super('Canceled');
+            this.name = 'Canceled';
+        }
+    },
+    FileChangeType: {
+        Changed: 1,
+        Created: 2,
+        Deleted: 3
+    },
+    FileType: {
+        Unknown: 0,
+        File: 1,
+        Directory: 2,
+        SymbolicLink: 64
+    },
+    FilePermission: {
+        Readonly: 1
+    },
+    EventEmitter: classEventEmitter,
+    Disposable: class {
+        constructor(callBack: () => void) {}
+        dispose() {}
+    },
+    commands: {
+        executeCommand: (command: string, ...args: any[]) => Promise.resolve()
+    },
+    window: {
+        createWebviewPanel: (..._args: unknown[]) => {
+            const dispose = new classEventEmitter();
+            return {
+                webview: {
+                    html: '',
+                    postMessage: async (_message: unknown) => true,
+                    onDidReceiveMessage: new classEventEmitter().event
+                },
+                onDidDispose: dispose.event,
+                dispose: () => dispose.fire(undefined)
+            };
+        },
+        tabGroups: {
+            onDidChangeTabs: changeTabsEmitter.event,
+            __fireDidChangeTabs: (event: any) => changeTabsEmitter.fire(event)
+        },
+        showInformationMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
+        showWarningMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
+        showErrorMessage: (_message: string, ..._items: any[]) => Promise.resolve(),
+        showSaveDialog: (_options?: any) => Promise.resolve(),
+        showOpenDialog: (_options?: any) => Promise.resolve(),
+        withProgress: (_options: unknown, task: Function) => task(
+            { report: () => {} },
+            {
+                isCancellationRequested: false,
+                onCancellationRequested: () => ({ dispose: () => {} })
+            }
+        ),
+    },
+    workspace: {
+        save: (uri: Uri): Promise<Uri | undefined> => Promise.resolve(uri),
+        _config: new Map<string, unknown>(),
+        getConfiguration: function() {
+            const store = (this as any)._config as Map<string, unknown>;
+            return {
+                get: (key: string, defaultValue?: unknown) => {
+                    return store.has(key) ? store.get(key) : defaultValue;
+                },
+                update: () => Promise.resolve()
+            };
+        },
+        getWorkspaceFolder: () => undefined,
+        onDidCloseTextDocument: closeTextDocumentEmitter.event,
+        __fireDidCloseTextDocument: (document: any) => closeTextDocumentEmitter.fire(document),
+        fs: {
+            stat: (_uri: any) => Promise.resolve({
+                type: 1,
+                ctime: 0,
+                mtime: 0,
+                size: 0
+            }),
+            readFile: (_uri: any) => Promise.resolve(new Uint8Array()),
+            writeFile: (_uri: any, _bytes: Uint8Array) => Promise.resolve(),
+            rename: (_from: any, _to: any, _options?: any) => Promise.resolve(),
+            delete: (_uri: any, _options?: any) => Promise.resolve()
+        }
+    },
+    ProgressLocation: {
+        Notification: 15
+    },
+    ConfigurationTarget: {
+        Global: 1
+    },
+    ViewColumn: {
+        Two: 2
+    },
+    l10n: {
+        t: (key: string, ...args: any[]) => key
+    },
+    env: {
+        uriScheme: 'vscode',
+        appName: 'VS Code',
+        language: 'en',
+        remoteName: undefined as string | undefined,
+        uiKind: 2 // Desktop
+    },
+    extensions: {
+        getExtension: () => ({ packageJSON: { version: '1.0.0' }, extensionKind: 2 })
+    },
+    UIKind: {
+        Desktop: 2,
+        Web: 1
+    },
+    ColorThemeKind: {
+        Light: 1,
+        Dark: 2,
+        HighContrast: 3,
+        HighContrastLight: 4
+    }
+};

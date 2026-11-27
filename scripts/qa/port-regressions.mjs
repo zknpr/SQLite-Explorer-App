@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, writeFile, stat } from 'node:fs/promises';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
 
@@ -17,7 +17,7 @@ const args = process.argv.slice(2);
 if (args.length && (args.length !== 2 || args[0] !== '--viewer-dir')) {
     throw new Error('Usage: port-regressions.mjs [--viewer-dir PATH]');
 }
-const viewerDir = resolve(args[1] ?? join(appRoot, 'viewer-dist'));
+const viewerDir = resolve(args[1] ?? join(appRoot, 'viewer-dist', 'web'));
 const evidence = await mkdtemp('/tmp/sqlite-explorer-port-');
 const primaryDb = join(evidence, 'primary.sqlite');
 const secondaryDb = join(evidence, 'secondary.sqlite');
@@ -247,7 +247,7 @@ try {
         await page.locator('.list-item[data-name="created_ui"][data-type="table"]').click();
         await page.locator('.header-cell[data-column="key"]').waitFor();
         await page.locator('#btnAddRow').click();
-        await page.locator('#addRowForm input[data-column="key"]').fill('one');
+        await page.locator('#addRowForm [data-column="key"]').fill('one');
         await page.locator('#btnSubmitAddRow').click();
         await page.locator('#addRowModal').waitFor({ state: 'hidden' });
         await saveDb();
@@ -293,7 +293,9 @@ try {
         await page.locator('.tab-btn[data-tab="hex"]').click();
         assert.match((await page.locator('.hex-dump').innerText()).slice(0, 80), /^00000000\s+71 67 ac 4e 3d d8 00 de\s+0a 00/i);
         await page.locator('#blob-save-full-btn').click();
-        await page.waitForFunction(() => document.querySelector('#statusText')?.textContent.includes('Saved full cell content'));
+        // The desktop host names the file its dialog wrote, as Download does.
+        await page.waitForFunction(() => /^Saved (?!full cell content)/.test(document.querySelector('#statusText')?.textContent ?? ''));
+        assert.equal(await page.locator('#statusText').textContent(), `Saved ${basename(saves.at(-1).path)}`);
         const exported = await readFile(saves.at(-1).path);
         assert.deepEqual(exported, Buffer.from(longText, 'utf16le'));
         assert.equal(exported.toString('hex').toUpperCase(), sqlite(primaryDb, 'SELECT hex(body) FROM cells WHERE id=1;'));

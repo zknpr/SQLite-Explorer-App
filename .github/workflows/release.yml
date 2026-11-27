@@ -1,11 +1,12 @@
 name: Release
 
-# Builds each package on its own OS from the committed viewer pin, and drafts a
+# Builds each package on its own OS, viewer included (built from viewer/), and drafts a
 # GitHub release for a v* tag. Publishing the draft stays a manual maintainer
 # step. Nothing here restores a cache: every package comes from a clean runner,
 # so a poisoned cache can never reach a release. Pull requests that touch the
-# pipeline or the shell run the build jobs only; ci.yml builds on macOS alone,
-# so this is where Windows- and Linux-only shell code first compiles.
+# pipeline or the shell run the build jobs only. ci.yml runs the shell's unit
+# tests and clippy on all three systems; this is where the Windows and Linux
+# apps are built and their packages checked.
 on:
   push:
     tags: ['v*']
@@ -14,8 +15,11 @@ on:
     paths:
       - .github/workflows/release.yml
       - scripts/release/**
-      - scripts/sync-viewer.mjs
+      - scripts/build-viewer.mjs
+      - package.json
+      - package-lock.json
       - src-tauri/**
+      - viewer/**
       - viewer-dist/**
 
 concurrency:
@@ -24,9 +28,6 @@ concurrency:
 
 permissions:
   contents: read
-
-env:
-  VIEWER_REPOSITORY: https://github.com/zknpr/SQLite-Explorer
 
 jobs:
   build:
@@ -89,31 +90,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Fetch the viewer source pin
-        run: |
-          pin=$(node -p "require('./viewer-dist/manifest.json').ref")
-          git init -q ../SQLite-Explorer
-          git -C ../SQLite-Explorer fetch -q --depth 1 "$VIEWER_REPOSITORY" "$pin"
-          echo "VIEWER_PIN=$pin" >> "$GITHUB_ENV"
+      # viewer-dist/ is committed for Apple Silicon macOS. On every runner, a
+      # fresh build of viewer/ must reproduce those files byte for byte, which
+      # also shows the build is the same from a Linux or Windows checkout.
+      - name: The committed viewer-dist is what viewer/ builds
+        run: node scripts/build-viewer.mjs --check --target aarch64-macos
 
-      - name: Sync this platform's viewer and native runtime from the pin
+      - name: Build this platform's viewer and native runtime
         run: |
-          cp viewer-dist/manifest.json "$RUNNER_TEMP/committed-manifest.json"
-          node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref "$VIEWER_PIN"
-          node scripts/sync-viewer.mjs --verify
-
-      # The committed viewer-dist/ targets Apple Silicon macOS, so here the
-      # fresh sync must reproduce it byte for byte.
-      - name: The committed viewer-dist matches the pin
-        if: matrix.platform == 'macos'
-        run: |
-          node -e '
-            const fs = require("node:fs");
-            const files = (p) => JSON.stringify(JSON.parse(fs.readFileSync(p, "utf8")).files);
-            if (files(process.argv[1]) !== files("viewer-dist/manifest.json")) {
-              console.error("committed viewer-dist differs from a fresh sync of the pin");
-              process.exit(1);
-            }' "$RUNNER_TEMP/committed-manifest.json"
+          node scripts/build-viewer.mjs
+          node scripts/build-viewer.mjs --verify
 
       - name: Tests
         run: |
@@ -121,7 +107,7 @@ jobs:
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
       # Every package bundles THIRD_PARTY_NOTICES.txt, so no release may ship
-      # notices that miss a dependency or describe another viewer pin.
+      # notices that miss a dependency, the viewer's included.
       - name: Third-party notices match the release dependency graph
         run: node scripts/release/notices.mjs
 
@@ -147,6 +133,13 @@ jobs:
           debs=(src-tauri/target/release/bundle/deb/*.deb)
           [ "${#debs[@]}" -eq 1 ] || { echo "expected one .deb, found ${#debs[@]}"; exit 1; }
           deb="${debs[0]}"
+          # Tauri names the package after the product ("sq-lite-explorer") and
+          # has no setting for it: rename it before anything checks or ships it.
+          rename="$RUNNER_TEMP/deb-rename"
+          dpkg-deb -R "$deb" "$rename"
+          node scripts/release/deb-control.mjs "$rename/DEBIAN/control"
+          dpkg-deb --root-owner-group -Zxz --build "$rename" "$deb"
+          [ "$(dpkg-deb -f "$deb" Package)" = sqlite-explorer ] || { echo "the package is not named sqlite-explorer"; exit 1; }
           dpkg-deb --info "$deb"
           # Listed once into a variable: `grep -q` on a live pipe exits early,
           # and under pipefail the writer's SIGPIPE would fail a passing check.

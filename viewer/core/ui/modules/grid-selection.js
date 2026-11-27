@@ -1,0 +1,138 @@
+import { state } from './state.js';
+import { getRowId } from './data-utils.js';
+import { updateToolbarButtons } from './ui.js';
+import { updateBatchSidebar } from './sidebar.js';
+
+let lastSelectedCellIds = new Set();
+let lastSelectedRowIds = new Set();
+
+export function syncSelectionDOM() {
+    lastSelectedCellIds.clear();
+    if (state.selectedCells.length > 0) {
+        state.selectedCells.forEach(cell => {
+            lastSelectedCellIds.add(`cell-${cell.rowIdx}-${cell.colIdx}`);
+        });
+    }
+    syncSelectedRowsDOM();
+}
+
+/**
+ * The ids of the cells the DOM marks selected: the cell selection as of the
+ * last sync, which updateSelectionStates diffs against. A virtual window move
+ * builds its new cells from it, so the move costs nothing per selected cell
+ * and leaves it as it is. Read only.
+ */
+export function getMarkedCellIds() {
+    return lastSelectedCellIds;
+}
+
+/**
+ * Re-read the selected rows from the DOM. The row baseline holds only built
+ * rows after a render, so a window move that builds rows must call this.
+ */
+export function syncSelectedRowsDOM() {
+    lastSelectedRowIds.clear();
+    if (state.selectedRowIds.size > 0) {
+        const rows = document.querySelectorAll('.data-row.selected');
+        rows.forEach(row => {
+            if (row.id) lastSelectedRowIds.add(row.id);
+        });
+    }
+}
+
+export function updateSelectionStates() {
+    // --- Cells Diffing ---
+    const newCellIds = new Set();
+    for (const cell of state.selectedCells) {
+        newCellIds.add(`cell-${cell.rowIdx}-${cell.colIdx}`);
+    }
+
+    // Remove from Deselected
+    for (const id of lastSelectedCellIds) {
+        if (!newCellIds.has(id)) {
+            const el = document.getElementById(id);
+            if (el) el.classList.remove('cell-selected');
+        }
+    }
+
+    // Add to Newly Selected
+    for (const id of newCellIds) {
+        if (!lastSelectedCellIds.has(id)) {
+            const el = document.getElementById(id);
+            if (el) el.classList.add('cell-selected');
+        }
+    }
+    lastSelectedCellIds = newCellIds;
+
+    // --- Rows Diffing ---
+    const newRowDomIds = new Set();
+    // Efficiently calculate which DOM rows should be selected based on gridData
+    // This avoids querying the DOM to find rows
+    for (let i = 0; i < state.gridData.length; i++) {
+        const rowId = getRowId(state.gridData[i], i);
+        // Check fuzzy match (string/number) to align with dataset behavior
+        const isSelected = state.selectedRowIds.has(rowId) ||
+                          (typeof rowId !== 'string' && state.selectedRowIds.has(String(rowId)));
+
+        if (isSelected) {
+            newRowDomIds.add(`row-${i}`);
+        }
+    }
+
+    // Remove from Deselected
+    for (const id of lastSelectedRowIds) {
+        if (!newRowDomIds.has(id)) {
+            const el = document.getElementById(id);
+            if (el) el.classList.remove('selected');
+        }
+    }
+
+    // Add to Newly Selected
+    for (const id of newRowDomIds) {
+        if (!lastSelectedRowIds.has(id)) {
+            const el = document.getElementById(id);
+            if (el) el.classList.add('selected');
+        }
+    }
+    lastSelectedRowIds = newRowDomIds;
+
+    // --- Columns (Small number, simple update is fine) ---
+    document.querySelectorAll('.header-cell.column-selected').forEach(el => el.classList.remove('column-selected'));
+    if (state.selectedColumns.size > 0) {
+        state.selectedColumns.forEach(colName => {
+            const safeColName = CSS.escape(colName);
+            const header = document.querySelector(`.header-cell[data-column="${safeColName}"]`);
+            if (header) header.classList.add('column-selected');
+        });
+    }
+}
+
+export function clearSelection() {
+    state.selectedCells = [];
+    state.selectedRowIds.clear();
+    state.selectedColumns.clear();
+    state.lastSelectedCell = null;
+    state.lastSelectedColumnIndex = null;
+    state.lastSelectedRowIndex = null;
+
+    updateSelectionStates();
+    updateToolbarButtons();
+    updateBatchSidebar();
+}
+
+/**
+ * Drop only the staged cell selection. Each entry's rowIdx/colIdx index the
+ * grid rendered at selection time, so the selection must not survive a commit
+ * that replaces the rendered rows or columns: batch Apply resolves colIdx
+ * against the CURRENT column set while rowId still names a row fetched with
+ * the old one, silently writing a column the user never chose. Identity-keyed
+ * selections (selectedRowIds by row id, selectedColumns by name) stay valid
+ * across reloads and are deliberately left alone — use clearSelection() when
+ * those must go too. No-op (and DOM-free) when nothing is selected.
+ */
+export function clearCellSelection() {
+    if (state.selectedCells.length === 0) return;
+    state.selectedCells = [];
+    updateSelectionStates();
+    updateBatchSidebar();
+}

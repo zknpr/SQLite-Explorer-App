@@ -24,10 +24,10 @@ from this repository's **Security** tab. Include:
 - the OS, app revision and selected engine (native or WASM);
 - any suggested remediation.
 
-The viewer, workers and native engine are shared with the
-[SQLite Explorer extension](https://github.com/zknpr/SQLite-Explorer). Report
-an issue in that shared code in either repository; fixes are coordinated
-across both.
+The viewer began as the one in the
+[SQLite Explorer extension](https://github.com/zknpr/SQLite-Explorer) and is
+developed in this repository now. Report an issue in it here, even if the
+extension may share it.
 
 ## Disclosure
 
@@ -40,8 +40,9 @@ In scope:
 
 - the Tauri shell in `src-tauri/`: commands, the path allowlists, file writes,
   capabilities, CSP and navigation handling;
-- the bundled viewer, workers and native sidecar as shipped in `viewer-dist/`;
-- the build and sync scripts in this repository.
+- the viewer, its workers and the native sidecar, from their sources in
+  `viewer/` to what `viewer-dist/` ships;
+- the build and release scripts in this repository.
 
 Out of scope:
 
@@ -68,10 +69,19 @@ Out of scope:
 
 ## Known limitations
 
-These assume a local attacker who already controls the database's directory:
+With a local attacker who already controls the database's directory:
 
 - The allowlisted-path read and the save's final rename match the path exactly;
   they do not refuse a symlink swapped in at that path or pin the file by
   device and inode.
+
+With a compromised page (attacker code running in the viewer), which the
+design otherwise keeps away from files:
+
 - Cross-window ownership of a WASM-engine database depends on what each page
-  reports, so a compromised page can under-report its own open files.
+  reports, so a compromised page can under-report its own open files and let
+  another window open one of them.
+- It can exhaust the machine's memory through the native engine, by sending
+  each database's engine process a request close to the transfer limit, or with
+  SQL alone. The shell bounds its own buffering (about 1 GiB per window), not
+  the engine processes' memory. No file is read or written this way.

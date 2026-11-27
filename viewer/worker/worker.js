@@ -1,0 +1,7178 @@
+/**
+ * SQLite Web Worker for Browser-based Database Operations
+ *
+ * This worker runs sql.js (SQLite compiled to WebAssembly) in a separate
+ * thread to keep the UI responsive. It communicates with the main thread
+ * using the same RPC protocol as the VS Code extension.
+ *
+ * Architecture:
+ * - Loads the repository-pinned sql.js fork from self-hosted public assets
+ * - Handles RPC messages for database operations
+ * - All SQL execution happens in this worker
+ */
+
+import { createCellTextDecoder } from '../src/core/cell-text-decoder.ts';
+import {
+  assertViewDefinitionSnapshotCurrent,
+  assertViewDefinitionStateCurrent,
+  assertViewDefinitionIntent,
+  assertViewTriggerSnapshotIsMutationSafe,
+  assertViewTriggersCompatibleWithColumns,
+  buildStoredTriggerValidationSql,
+  buildCreateViewTriggerSql,
+  buildCreateViewSql,
+  extractViewColumnListSql,
+  extractViewSelectSql,
+  escapeMainViewIdentifier,
+  explainIncludesTriggerProgram,
+  mapViewTriggerRows,
+  VIEW_TRIGGER_SCHEMA_QUERIES,
+  normalizeViewSelectSql,
+  qualifyMainTriggerTargetSql
+} from '../src/core/view-utils.ts';
+import {
+  assertNoNewBrokenSchemaDependencies,
+  captureSchemaDependencySnapshot
+} from '../src/core/schema-dependency.ts';
+import {
+  buildCreateTableSql,
+  buildIndexDependencyProbeIndexSql,
+  buildIndexDependencyProbeTableSql,
+  resolveIndexDependencyColumns
+} from '../src/core/schema-ddl.ts';
+import {
+  assertUsableSqlIdentifier,
+  escapeIdentifier,
+  escapeMainIdentifier,
+  validateRowId
+} from '../src/core/sql-utils.ts';
+import {
+  encodeCsvExportCell,
+  encodeJsonExportCell,
+  encodeSqlExportCell
+} from '../src/core/export-encoding.ts';
+import {
+  decodeQueryPlan,
+  queryPlanRequest,
+  prepareReadQuery,
+  parseQueryParameters,
+  buildReadTransport,
+  decodeReadTransport,
+  SQL_RESULT_ROWS,
+  SQL_MAX_COLUMNS
+} from '../src/core/sql-workspace.ts';
+import {
+  COLUMN_DROP_DEPENDENT_OBJECT_SQL,
+  executeSchemaPreservingColumnDrop,
+  schemaObjectSqlMentionsColumn
+} from '../src/core/column-drop.ts';
+import { getActiveFilterValue } from '../src/core/filter-utils.ts';
+import {
+  applyMergePatch,
+  planJsonPatchHistoryReplay,
+  parseJsonValueForPatching,
+  prepareCellUpdateForStorage
+} from '../src/core/json-utils.ts';
+import {
+  assertStoredCellState,
+  buildStoredCellStateProjection,
+  buildStoredCellPredicate,
+  buildStoredCellWrite,
+  parseStoredCellState,
+  storedCellStatesEqual,
+  CellHistoryConflictError,
+  LegacyCellHistoryError
+} from '../src/core/cell-history.ts';
+import {
+  buildRowHistoryPredicate,
+  buildRowHistoryWrites,
+  rowHistoryStates,
+  LegacyRowHistoryError,
+  RowHistoryConflictError
+} from '../src/core/row-history.ts';
+import {
+  assertDeleteSnapshotFitsUndoBudget,
+  buildDeleteSnapshotSizeQuery,
+  deleteSnapshotValueColumns,
+  parseDeleteSnapshotSizeRow,
+  projectDeletedRowEntryBytes
+} from '../src/core/delete-history.ts';
+import {
+  assertBatchHistoryFitsUndoBudget,
+  buildBatchHistorySizePreflight,
+  projectBatchHistoryBytes
+} from '../src/core/batch-update.ts';
+import {
+  assertMutableRecordId,
+  assertNoApplicableUpdateTriggerTargetWrites,
+  assertNoUntrackedMutationPrograms,
+  assertOneRowPerIdentity,
+  buildInsertTriggerProbeSql,
+  buildRecordIdentityPredicateChunks,
+  buildRecordIdentityPredicate,
+  buildTableIdentityMap,
+  buildUpdateTriggerProbeSql,
+  classifyTableIdentity,
+  decodePrimaryKeyRecordId,
+  encodePrimaryKeyRecordId,
+  isPrimaryKeyRecordId,
+  MAIN_TABLE_ROOT_PAGE_SQL,
+  parseMainTableRootPage,
+  primaryKeyColumnsFromTableInfo,
+  replacePrimaryKeyRecordIdValues,
+  TABLE_IDENTITY_METADATA_SQL,
+  unresolvableTriggeredRowIdUpdateError
+} from '../src/core/row-identity.ts';
+import {
+  bindableIntegerValue,
+  buildExactNumericTextQuery,
+  buildRowIdExactRealTextQueries,
+  collectRowIdExactRealTexts,
+  foldSqliteIdentifier,
+  hasUnsafeBigIntAtColumn,
+  normalizeIntegerRowsForTransport,
+  parseRowIdAliasColumn,
+  ROWID_ALIAS_COLUMN_SQL,
+  sqliteIdentifiersEqual,
+  TABLE_XINFO_WITH_ROWID_ALIAS_SQL,
+  ROWID_TABLE_AUTHORITY_SQL
+} from '../src/core/integer-utils.ts';
+import {
+  buildByteFaithfulPrimaryKeyProjection,
+  buildCellContainmentQuery,
+  containUnrepresentableTextCells,
+  decodeRawTextColumns,
+  decodeCellContainment,
+  DEFAULT_MAX_INLINE_CELL_BYTES,
+  DEFAULT_MAX_PAGE_RESPONSE_BYTES,
+  encodeByteFaithfulPrimaryKeyRecordId,
+  findUnrepresentableTextRows,
+  mergeCellContainmentMetadataRows,
+  prependCellContainmentColumn,
+  remapPrimaryKeyContainment,
+  remapShadowedRowIdContainment,
+  WEBVIEW_CELL_WIRE,
+  WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES
+} from '../src/core/cell-containment.ts';
+import {
+  assembleKeysetSelect,
+  buildRowIdLookupSelect,
+  computeKeysetKey,
+  computeKeysetQueryTag,
+  keyColumnOrderSql,
+  keysetFallbackOrder,
+  mintKeysetAnchors,
+  ordersBySyntheticRowId,
+  primaryKeyCollations,
+  resolveKeysetPlan,
+  ROW_ID_LOOKUP_ROW,
+  rowIdLookupApplies
+} from '../src/core/keyset-pagination.ts';
+import { buildFilterConditions } from '../src/core/query-builder.ts';
+import { isReadStatement } from '../src/core/read-statement.ts';
+import { normalizeTablePageOptions } from '../src/core/table-pagination.ts';
+import {
+  decodeCellMetadata,
+  DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS,
+  DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS,
+  normalizeCellReadTimeout,
+  normalizeCellTextEncoding,
+  validateCellReadTarget,
+  validateCellReadWindow
+} from '../src/core/cell-read.ts';
+import {
+  assertCellValueWithinEditLimit,
+  assertCellValuesWithinEditLimit,
+  assertOversizedCellReplacementExpectation,
+  OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE,
+  OversizedCellReplacementRequiredError,
+  toCellEditRpcErrorData
+} from '../src/core/cell-edit-policy.ts';
+import {
+  BUFFER_OPEN_CEILING_BYTES,
+  decideOpenPlan,
+  isWalMarkedHeader,
+  SQLITE_HEADER_PROBE_BYTES
+} from '../src/core/paged-open.ts';
+import {
+  MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES,
+  MAX_WEBVIEW_BINARY_VALUE_BYTES
+} from '../src/core/webview-transport.ts';
+import {
+  buildCappedCountProbeSql,
+  buildCountUpperBoundSql,
+  PAGED_COUNT_PROBE_MAX_ROWS,
+  resolveCappedCount,
+  resolvePagedExactCountMaxFileBytes,
+  resolveCountUpperBound,
+  resolveFileSizeRowUpperBound,
+  WITHOUT_ROWID_TABLE_SQL,
+  shouldAnswerCountWithUpperBound
+} from '../src/core/paged-count.ts';
+import { createChunkedReadCache } from '../src/core/chunked-read-cache.ts';
+// The bulk-import contract shared with the page (parse/map limits) and the
+// exact memory estimate the host's ModificationTracker charges an entry — so
+// importRows refuses an undo image the tracker could not hold BEFORE the rows
+// are released, instead of the tracker evicting history after the fact.
+import {
+  IMPORT_MAX_CELLS,
+  IMPORT_MAX_COLUMNS,
+  IMPORT_MAX_ROWS
+} from '../src/core/bulk-import.ts';
+import { estimateUndoMemoryBytes } from '../src/core/undo-history.ts';
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const SQL_JS_GLUE_URL = './sql-wasm.js';
+const SQL_JS_WASM_URL = './sql-wasm.wasm';
+const DEFAULT_QUERY_TIMEOUT_MS = 30000;
+const MAX_WORKER_ERROR_MESSAGE_LENGTH = 8192;
+const PROGRESS_HANDLER_INTERVAL = 1000;
+const WEB_DEMO_EXPORT_MAX_BYTES = 16 * 1024 * 1024;
+const WEB_DEMO_EXPORT_CHUNK_CHARS = 64 * 1024;
+const WEB_DEMO_EXPORT_LIMIT_DESCRIPTION = '16 MiB (16,777,216 bytes)';
+// The 16 MiB cap above is policy for the web demo's non-streaming download
+// path, not a physical limit -- hosts that move whole DB images another way
+// (e.g. the desktop's saveToDisk) may raise it via exportOptions.maxExportBytes.
+// This ceiling still bounds every caller: it's a sanity backstop against a
+// pathological or malicious request, not a target for any real caller today.
+const EXPORT_MAX_BYTES_HARD_CEILING = 1024 * 1024 * 1024;
+const SQLITE_MAX_RESULT_COLUMNS = 2000;
+// RPC payloads cannot forge this Symbol; only in-worker history restoration
+// may bypass the new-value policy for a value that already existed.
+const HISTORY_REPLAY_EDIT_TOKEN = Symbol('history-replay-edit');
+/**
+ * Passed by a caller inside this worker whose own answer is not the result it
+ * gets back (updateCell keeps only the row identity), so the result never
+ * crosses the transport. A Symbol cannot arrive in an RPC payload.
+ */
+const ANSWER_STAYS_IN_WORKER = Symbol('answer-stays-in-worker');
+
+// ============================================================================
+// State
+// ============================================================================
+
+/**
+ * The active sql.js database instance.
+ * @type {Object|null}
+ */
+let db = null;
+
+/**
+ * The sql.js module (SQL object).
+ * @type {Object|null}
+ */
+let SQL = null;
+/**
+ * True once the bounded EXPLAIN QUERY PLAN reader compiled into the vendored
+ * sql.js (src/runtime/query-plan.c, exported as
+ * `_sqlite_explorer_register_query_plan`) has been armed on this module. Set
+ * only by the WASM branch of the engine seam in initializeDatabase; the native
+ * sidecar's engine never has the reader (its fork disables loadable
+ * extensions), so there the console's EXPLAIN runs SQLite's own statement
+ * instead -- see readQueryPlan.
+ */
+let queryPlanReaderActive = false;
+/**
+ * The engine's measure of one reply, or null when its transport carries an
+ * answer of any size (WebAssembly's structured clone). The native sidecar's
+ * frame is capped; its measure returns null when `data` fits that frame and
+ * `{ bytes, limitBytes }` when it does not. Set by initializeDatabase.
+ */
+let measureEngineReply = null;
+/**
+ * The native engine's reply frame as a CellWireModel (src/core/cell-containment.ts),
+ * null on WebAssembly: what a page's cells cost in one JSON frame, where a
+ * control character is six bytes. Pages are contained as the WebAssembly
+ * worker contains them, and again against this only when that answer does
+ * not fit the frame (offerFrameContainment). Set by initializeDatabase.
+ */
+let frameCellWire = null;
+let queryTimeout = DEFAULT_QUERY_TIMEOUT_MS;
+let readOnlyMode = false;
+/** User-facing explanation when safety policy forces a read-only open. */
+let readOnlyReason = null;
+/**
+ * How the active database is backed: 'memory' (bytes in the WASM-side
+ * filesystem — today's buffer path) or 'paged' (page-on-demand reads
+ * through host callbacks, optionally with the fork's copy-on-write
+ * overlay). Count queries consult this to keep full-table scans bounded
+ * on paged storage.
+ * @type {'memory' | 'paged'}
+ */
+let storageMode = 'memory';
+/** File size behind the current paged open; 0 for buffer opens. */
+let pagedFileSizeBytes = 0;
+/**
+ * A writable paged export materializes the complete merged database in
+ * browser memory. Keep the hard ceiling at the browser buffer-path limit;
+ * the page warns before every paged download because the transient peak is
+ * still materially larger than the on-disk image.
+ */
+let pagedExportMaxBytes = BUFFER_OPEN_CEILING_BYTES;
+/**
+ * Exact-count gate for paged opens; policy and default live in the shared
+ * src/core/paged-count.ts module (also consumed by the desktop engine).
+ */
+let pagedExactCountMaxFileBytes = resolvePagedExactCountMaxFileBytes(undefined);
+let cellReadSessionIdleTimeoutMs = DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS;
+let cellReadSessionAbsoluteTimeoutMs = DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS;
+let activeCellReadSession = null;
+const closedCellReadSessionIds = new Set();
+
+// ============================================================================
+// sql.js Loading
+// ============================================================================
+
+/**
+ * Load the self-hosted sql.js glue using importScripts.
+ * This populates the global `initSqlJs` function.
+ */
+async function loadSqlJs() {
+  if (SQL) return SQL;
+
+  // Import the sql.js script
+  importScripts(SQL_JS_GLUE_URL);
+
+  // Initialize sql.js with WASM binary
+  // The WASM file will be provided via initializeDatabase call
+  return null;
+}
+
+// ============================================================================
+// SQL Validation Utilities
+// ============================================================================
+
+/**
+ * Validate a SQL type definition to ensure it is safe.
+ * Allows standard SQLite types and common variants.
+ *
+ * @param {string} type - The type string to validate (e.g. "INTEGER", "VARCHAR(255)")
+ * @throws Error if the type is potentially unsafe
+ */
+function validateSqlType(type) {
+  if (!type || typeof type !== 'string') {
+    throw new Error('Invalid SQL type: Type must be a non-empty string');
+  }
+
+  // Check for dangerous characters that could be used for injection
+  // Disallow: quotes, semicolons, dashes (comments), slashes, asterisks
+  if (/['";\-\/\*]/.test(type)) {
+     throw new Error(`Invalid SQL type: "${type}" contains potentially unsafe characters`);
+  }
+
+  // Strict validation pattern
+  // Matches:
+  // 1. Start with alphanumeric words/spaces (e.g. "INTEGER", "UNSIGNED INT")
+  // 2. Optional: Parentheses with numbers/commas (e.g. "(255)", "(10, 2)")
+  // 3. Optional: Trailing alphanumeric words/spaces (e.g. "UNSIGNED")
+  const validPattern = /^[a-zA-Z0-9_\s]+(?:\([0-9\s,]+\)[a-zA-Z0-9_\s]*)?$/;
+
+  if (!validPattern.test(type.trim())) {
+     throw new Error(`Invalid SQL type: "${type}" does not match allowed format`);
+  }
+}
+
+/**
+ * Format a default value for SQL inclusion, ensuring it is properly escaped.
+ *
+ * @param {string|number} defaultValue - The default value to format
+ * @returns {string} The safely formatted default value expression
+ */
+function formatDefaultValue(defaultValue) {
+  const strValue = String(defaultValue);
+
+  if (strValue.toLowerCase() === 'null') {
+    return 'NULL';
+  } else if (/^-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(strValue)) {
+    // Strict numeric pattern: optional sign, digits with optional decimal, optional exponent
+    // This prevents hex (0x), special values, and other edge cases
+    return strValue;
+  } else {
+    // Standard string literal - escape internal single quotes and wrap in single quotes
+    return `'${strValue.replace(/'/g, "''")}'`;
+  }
+}
+
+let viewSavepointCounter = 0;
+
+function createViewSavepointName(prefix) {
+  viewSavepointCounter++;
+  return escapeIdentifier(`${prefix}_${viewSavepointCounter}`);
+}
+
+function prepareSingleStatement(sql) {
+  const boundary = `/*sqlite_explorer_boundary_${crypto.randomUUID().replace(/-/g, '')}*/`;
+  const statement = db.prepare(`${sql}\n${boundary}`);
+  if (!statement.getSQL().trimEnd().endsWith(boundary)) {
+    statement.free();
+    throw new Error('Exactly one SQL statement is required');
+  }
+  return statement;
+}
+
+function runSingleStatement(sql) {
+  const checkedStatement = prepareSingleStatement(sql);
+  checkedStatement.free();
+  const statement = db.prepare(sql);
+  try {
+    statement.run();
+  } finally {
+    statement.free();
+  }
+}
+
+/**
+ * The bound form of every parameter. Paired with `bindPlaceholder()` -- see
+ * there: an unsafe BigInt crosses as its decimal text under `CAST(? AS
+ * INTEGER)`, and a NUL-bearing string crosses as database-encoded bytes under
+ * `CAST(? AS TEXT)`. Applied HERE, on every bind, rather than at each value
+ * site, so the shared history builders (src/core/cell-history.ts,
+ * row-history.ts), which already wrap TEXT writes and predicates in
+ * `CAST(? AS TEXT)` and hand back the raw string, replay a NUL-bearing value
+ * exactly as well as a fresh edit stores it.
+ */
+function normalizeBindParams(params) {
+  return params?.map(value => {
+    if (requiresTextBlobBinding(value)) return encodeTextForDatabase(value);
+    if (typeof value !== 'bigint') return value;
+    const numericValue = Number(value);
+    return Number.isSafeInteger(numericValue) ? numericValue : value.toString();
+  });
+}
+
+/**
+ * TEXT that cannot survive being bound as a string.
+ *
+ * sql.js binds every string with `sqlite3_bind_text(..., -1, ...)` -- a
+ * NUL-TERMINATED length -- so a value containing a NUL is stored truncated at
+ * the first one, with no error: `updateCell(t, 1, c, 'a\0b')` left `'a'` on
+ * disk. The native engine binds the same value faithfully, so the two engines
+ * disagreed about what the user's data even is. SQLite itself has no problem
+ * with the value (its strings carry an explicit length), only the bind path
+ * does, so the fix is to route it around that path rather than refuse it.
+ *
+ * @param {*} value
+ * @returns {boolean}
+ */
+function requiresTextBlobBinding(value) {
+  return typeof value === 'string' && value.includes('\0');
+}
+
+/**
+ * The SQL fragment for a bound VALUE. Paired with `normalizeBindParams()`:
+ * both test the same predicates against the same value, and a value position
+ * must apply BOTH or neither. (Row-identity predicates deliberately do not:
+ * their placeholders come from `buildRecordIdentityPredicate`.)
+ *
+ * A bigint past int32 binds as a double when safe (normalizeBindParams) and
+ * as decimal text when not; the CAST keeps it INTEGER in any column.
+ */
+function bindPlaceholder(value) {
+  if (typeof value === 'bigint' && (value < -2147483648n || value > 2147483647n)) {
+    return 'CAST(? AS INTEGER)';
+  }
+  // `normalizeBindParams` hands a NUL-bearing string over as a BLOB of the
+  // database's own text encoding -- the blob bind carries an explicit byte
+  // count, so nothing is lost. This CAST is what puts the TEXT storage class
+  // back.
+  if (requiresTextBlobBinding(value)) return 'CAST(? AS TEXT)';
+  return '?';
+}
+
+/**
+ * Encode `text` into the database's own text encoding, so that
+ * `CAST(<blob> AS TEXT)` reproduces it byte for byte. `CAST` reads a blob as
+ * text in the DATABASE encoding, not UTF-8, so a UTF-16 database needs UTF-16
+ * bytes or the value comes back as mojibake.
+ *
+ * @param {string} text
+ * @returns {Uint8Array}
+ */
+function encodeTextForDatabase(text) {
+  const encoding = normalizeCellTextEncoding(
+    db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]
+  );
+  if (encoding === 'utf-8') return new TextEncoder().encode(text);
+  // JavaScript strings ARE UTF-16 code units, so this is a direct byte
+  // serialisation -- lone surrogates included, which matches what SQLite
+  // stores for them.
+  const littleEndian = encoding === 'utf-16le';
+  const bytes = new Uint8Array(text.length * 2);
+  for (let index = 0; index < text.length; index += 1) {
+    const unit = text.charCodeAt(index);
+    bytes[index * 2] = littleEndian ? unit & 0xff : unit >>> 8;
+    bytes[index * 2 + 1] = littleEndian ? unit >>> 8 : unit & 0xff;
+  }
+  return bytes;
+}
+
+function compileSingleStatement(sql) {
+  const statement = prepareSingleStatement(sql);
+  statement.free();
+}
+
+function executeWithProgressHandler(operation, cancellationFlag) {
+  if (cancellationFlag !== undefined) {
+    const hasSharedBuffer = typeof SharedArrayBuffer === 'function' &&
+      cancellationFlag instanceof Int32Array &&
+      cancellationFlag.length > 0 &&
+      cancellationFlag.buffer instanceof SharedArrayBuffer;
+    if (!hasSharedBuffer) throw new Error('Invalid query cancellation flag');
+  }
+  const isCancelled = () => cancellationFlag !== undefined &&
+    Atomics.load(cancellationFlag, 0) !== 0;
+  const throwCancellation = () => {
+    const error = new Error('Query execution cancelled');
+    error.name = 'AbortError';
+    throw error;
+  };
+  if (isCancelled()) throwCancellation();
+
+  const deadline = Date.now() + queryTimeout;
+  let termination;
+  db.progress_handler(PROGRESS_HANDLER_INTERVAL, () => {
+    if (isCancelled()) {
+      termination = 'cancelled';
+      return true;
+    }
+    if (Date.now() < deadline) return false;
+    termination = 'timeout';
+    return true;
+  });
+
+  try {
+    return operation();
+  } catch (error) {
+    // The native engine enforces the same deadline in C (native-host.js) and
+    // answers SQLite's interrupt, which no JavaScript callback saw.
+    const interruptedAtDeadline = error?.errno === 9 && Date.now() >= deadline;
+    if (termination === 'timeout' || interruptedAtDeadline) {
+      throw new Error(`Query execution timed out after ${queryTimeout}ms`);
+    }
+    if (termination === 'cancelled' || isCancelled()) throwCancellation();
+    throw error;
+  } finally {
+    db.progress_handler(null);
+  }
+}
+
+/**
+ * Step a read while SQLite refuses every write on the connection. `read` is
+ * synchronous, so no other request sees the flag, and callers put the
+ * deadline handler inside it so the flag is restored after a timeout.
+ */
+function readRefusingWrites(read) {
+  // The native engine's sql.js shim holds the flag itself: its column-name
+  // probe writes a TEMP VIEW, and it lifts query_only for that DDL only when
+  // it armed the flag (core/native/sqljs-shim.js). sql.js has no such probe.
+  if (typeof db.readRefusingWrites === 'function') return db.readRefusingWrites(read);
+  const queryOnly = Number(db.exec('PRAGMA query_only')[0]?.values[0]?.[0]) === 1;
+  if (!queryOnly) db.exec('PRAGMA query_only = ON');
+  try {
+    return read();
+  } finally {
+    if (!queryOnly) db.exec('PRAGMA query_only = OFF');
+  }
+}
+
+function querySingleStatement(sql, cancellationFlag) {
+  return readRefusingWrites(() => executeWithProgressHandler(() => {
+    const sourceStatement = prepareSingleStatement(sql);
+    const headers = sourceStatement.getColumnNames();
+    sourceStatement.free();
+    const transportQuery = buildExactNumericTextQuery(sql, headers.length);
+    const statement = prepareSingleStatement(transportQuery.sql);
+    const sourceRows = [];
+    try {
+      while (statement.step()) {
+        sourceRows.push(statement.get(null, { useBigInt: true }));
+      }
+      const { rows, exactIntegerTexts } = normalizeIntegerRowsForTransport(
+        sourceRows,
+        transportQuery.valueColumnCount
+      );
+      return { headers, rows, exactIntegerTexts };
+    } finally {
+      statement.free();
+    }
+  }, cancellationFlag));
+}
+
+function resolveGlobalFilterColumns(columns, globalFilterColumns) {
+  if (globalFilterColumns != null) return globalFilterColumns;
+
+  const fallbackColumns = columns ?? [];
+  // Only the leading rowid that this worker prepends for table identity is
+  // synthetic. An explicitly supplied list may legitimately name a declared
+  // column "rowid" and must be trusted verbatim.
+  return fallbackColumns[0] === 'rowid' ? fallbackColumns.slice(1) : fallbackColumns;
+}
+
+function safeRollbackSavepoint(savepointName, context) {
+  try {
+    runSingleStatement(`ROLLBACK TO ${savepointName}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (rollbackError) {
+    console.warn(
+      `Failed to rollback savepoint (${context}):`,
+      getErrorMessage(rollbackError)
+    );
+  }
+}
+
+function rememberClosedCellReadSession(sessionId) {
+  closedCellReadSessionIds.add(sessionId);
+  while (closedCellReadSessionIds.size > 64) {
+    closedCellReadSessionIds.delete(closedCellReadSessionIds.values().next().value);
+  }
+}
+
+function rollbackAndReleaseCellReadSavepoint(savepointName) {
+  runSingleStatement(`ROLLBACK TO ${savepointName}`);
+  runSingleStatement(`RELEASE ${savepointName}`);
+}
+
+function closeActiveCellReadSession(expectedSessionId) {
+  const session = activeCellReadSession;
+  if (!session) return false;
+  if (expectedSessionId !== undefined && session.sessionId !== expectedSessionId) return false;
+
+  activeCellReadSession = null;
+  rememberClosedCellReadSession(session.sessionId);
+  if (session.expiryTimer !== undefined) clearTimeout(session.expiryTimer);
+  try {
+    runSingleStatement(`RELEASE ${session.savepointName}`);
+  } catch (releaseError) {
+    try {
+      rollbackAndReleaseCellReadSavepoint(session.savepointName);
+    } catch (rollbackError) {
+      // Closing the only connection is the final fail-closed release mechanism:
+      // a damaged bracket must never retain a snapshot indefinitely.
+      const cleanupErrors = [releaseError, rollbackError];
+      try {
+        db?.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      } finally {
+        db = null;
+      }
+      throw new AggregateError(
+        cleanupErrors,
+        'Cell read snapshot cleanup failed; the owning web database was closed'
+      );
+    }
+  }
+  return true;
+}
+
+function scheduleCellReadSessionExpiry(session) {
+  if (session.expiryTimer !== undefined) clearTimeout(session.expiryTimer);
+  session.expiresAt = Math.min(
+    session.absoluteExpiresAt,
+    session.lastAccessAt + cellReadSessionIdleTimeoutMs
+  );
+  session.expiryTimer = setTimeout(() => {
+    try {
+      closeActiveCellReadSession(session.sessionId);
+    } catch (error) {
+      console.error('[Worker] Failed to expire cell read session:', getErrorMessage(error));
+    }
+  }, Math.max(1, session.expiresAt - Date.now()));
+}
+
+async function resolveCellReadSqlTarget(target) {
+  validateCellReadTarget(target);
+  const identity = await resolveTableIdentity(target.table);
+  const predicate = buildRecordIdentityPredicate(target.rowId, identity);
+  return {
+    table: target.table,
+    column: target.column,
+    predicateSql: predicate.sql,
+    predicateParams: predicate.params
+  };
+}
+
+function buildMainCellMetadataQuery(target) {
+  const column = escapeIdentifier(target.column);
+  return {
+    sql:
+      `SELECT typeof(${column}), ` +
+      `CASE WHEN ${column} IS NULL THEN 0 ELSE length(CAST(${column} AS BLOB)) END ` +
+      `FROM ${escapeMainIdentifier(target.table)} ` +
+      `WHERE ${target.predicateSql} LIMIT 2`,
+    params: target.predicateParams
+  };
+}
+
+function buildMainCellChunkQuery(target) {
+  const column = escapeIdentifier(target.column);
+  return {
+    // Offsets are bytes in SQLite's database encoding, so cast before substr.
+    sql:
+      `SELECT substr(CAST(${column} AS BLOB), ? + 1, ?) ` +
+      `FROM ${escapeMainIdentifier(target.table)} ` +
+      `WHERE ${target.predicateSql} LIMIT 2`,
+    params: target.predicateParams
+  };
+}
+
+function getCellTextEncoding() {
+  return normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]);
+}
+
+/** Per open database: whether the runtime's cell helpers are callable. */
+const cellHelperDatabases = new WeakMap();
+/** Per open database: whether the runtime has sqlite_explorer_like_any. */
+const likeAnyDatabases = new WeakMap();
+
+/** Whether a global filter can call sqlite_explorer_like_any: the cell helpers' UTF-8 rule, then a probe. */
+function likeAnyApplies() {
+  if (!cellHelpersApply()) return false;
+  let available = likeAnyDatabases.get(db);
+  if (available === undefined) {
+    try {
+      db.exec("SELECT sqlite_explorer_like_any('a', 'A')");
+      available = true;
+    } catch (error) {
+      available = false;
+      console.warn("[Worker] The runtime's filter function is unavailable; filters use one LIKE per column:", getErrorMessage(error));
+    }
+    likeAnyDatabases.set(db, available);
+  }
+  return available;
+}
+
+/** Filters for a page or count, as the extension's engines build them. */
+function buildDemoFilterConditions(filters, globalFilter, columns, globalFilterColumns) {
+  const globalFilterActive = getActiveFilterValue(globalFilter) !== undefined;
+  return buildFilterConditions(
+    // An entry without a column name has never filtered anything.
+    (filters ?? []).filter(filter => filter.column),
+    globalFilter,
+    globalFilterActive ? resolveGlobalFilterColumns(columns, globalFilterColumns) : [],
+    { likeAny: globalFilterActive && likeAnyApplies() }
+  );
+}
+const cellHelperEncodingLogged = new WeakSet();
+
+/**
+ * The cell helpers read TEXT as stored, which is UTF-8 only in a UTF-8
+ * database. Missing helpers and another encoding are logged once per database.
+ */
+function cellHelpersApply(textEncoding) {
+  let available = cellHelperDatabases.get(db);
+  if (available === undefined) {
+    try {
+      db.exec('SELECT sqlite_explorer_cell_preview(NULL, 0, 0)');
+      available = true;
+    } catch (error) {
+      available = false;
+      console.warn('[Worker] Grid cell helpers are unavailable; table pages use SQL containment:', getErrorMessage(error));
+    }
+    cellHelperDatabases.set(db, available);
+  }
+  if (!available) return false;
+  const encoding = textEncoding ?? getCellTextEncoding();
+  if (encoding === 'utf-8') return true;
+  if (!cellHelperEncodingLogged.has(db)) {
+    cellHelperEncodingLogged.add(db);
+    console.warn(`[Worker] Grid cell helpers read UTF-8 only; this ${encoding} database's table pages use SQL containment`);
+  }
+  return false;
+}
+
+function queryCellMetadata(target, sqlTarget) {
+  const query = buildMainCellMetadataQuery(sqlTarget);
+  const result = db.exec(
+    query.sql,
+    normalizeBindParams(query.params),
+    { useBigInt: true }
+  );
+  return decodeCellMetadata(result[0]?.values ?? [], getCellTextEncoding(), target);
+}
+
+async function getCellMetadata(target) {
+  if (!db) throw new Error('No database initialized');
+  const sqlTarget = await resolveCellReadSqlTarget(target);
+  return queryCellMetadata(target, sqlTarget);
+}
+
+async function openCellReadSession(target) {
+  if (!db) throw new Error('No database initialized');
+  if (activeCellReadSession) {
+    throw new Error('At most one web cell read session may be open');
+  }
+  const sqlTarget = await resolveCellReadSqlTarget(target);
+  const savepointName = createViewSavepointName('sp_cell_read');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    // This first read fixes sql.js's connection snapshot before returning.
+    const metadata = queryCellMetadata(target, sqlTarget);
+    const now = Date.now();
+    const session = {
+      sessionId: crypto.randomUUID(),
+      target,
+      sqlTarget,
+      metadata,
+      savepointName,
+      lastAccessAt: now,
+      absoluteExpiresAt: now + cellReadSessionAbsoluteTimeoutMs,
+      expiresAt: now + cellReadSessionIdleTimeoutMs,
+      expiryTimer: undefined
+    };
+    activeCellReadSession = session;
+    scheduleCellReadSessionExpiry(session);
+    return {
+      sessionId: session.sessionId,
+      metadata,
+      expiresAt: session.expiresAt
+    };
+  } catch (error) {
+    try {
+      rollbackAndReleaseCellReadSavepoint(savepointName);
+    } catch (cleanupError) {
+      const cleanupErrors = [error, cleanupError];
+      try {
+        db?.close();
+      } catch (closeError) {
+        cleanupErrors.push(closeError);
+      } finally {
+        db = null;
+      }
+      throw new AggregateError(
+        cleanupErrors,
+        'Cell read session open failed; the owning web database was closed'
+      );
+    }
+    throw error;
+  }
+}
+
+async function readCellChunk(sessionId, byteOffset, maxBytes) {
+  validateCellReadWindow(byteOffset, maxBytes);
+  const session = activeCellReadSession;
+  if (!session || session.sessionId !== sessionId) {
+    throw new Error(
+      closedCellReadSessionIds.has(sessionId)
+        ? `Cell read session ${sessionId} is closed or expired`
+        : `Unknown cell read session: ${String(sessionId)}`
+    );
+  }
+  if (Date.now() >= session.expiresAt) {
+    closeActiveCellReadSession(sessionId);
+    throw new Error(`Cell read session ${sessionId} is closed or expired`);
+  }
+  const query = buildMainCellChunkQuery(session.sqlTarget);
+  const result = db.exec(
+    query.sql,
+    normalizeBindParams([byteOffset, maxBytes, ...query.params])
+  );
+  const rows = result[0]?.values ?? [];
+  if (rows.length !== 1) {
+    throw new Error(
+      rows.length === 0
+        ? `Cell ${session.target.table}.${session.target.column} no longer exists in its snapshot`
+        : `Cell ${session.target.table}.${session.target.column} matched more than one row`
+    );
+  }
+  const value = rows[0][0];
+  const bytes = value === null ? new Uint8Array(0) : value;
+  if (!(bytes instanceof Uint8Array)) {
+    throw new Error(
+      `SQLite returned a non-BLOB chunk for ${session.target.table}.${session.target.column}`
+    );
+  }
+  session.lastAccessAt = Date.now();
+  scheduleCellReadSessionExpiry(session);
+  return {
+    byteOffset,
+    bytes: bytes.slice(),
+    done: byteOffset + bytes.byteLength >= session.metadata.byteLength
+  };
+}
+
+async function closeCellReadSession(sessionId) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) {
+    throw new Error('Cell read session id is required');
+  }
+  if (!closeActiveCellReadSession(sessionId) && !closedCellReadSessionIds.has(sessionId)) {
+    throw new Error(`Unknown cell read session: ${sessionId}`);
+  }
+}
+
+function assertCellReadSessionAllowsMethod(targetMethod) {
+  if (
+    activeCellReadSession &&
+    !['readCellChunk', 'closeCellReadSession', 'initializeDatabase'].includes(targetMethod)
+  ) {
+    throw new Error('A cell read snapshot is active; close it before another database operation');
+  }
+}
+
+// ============================================================================
+// Database Operations
+// ============================================================================
+
+/**
+ * True for File-like handles posted by the demo page. Duck-typed rather
+ * than `instanceof File` so the unit harness can drive this path with a
+ * stub File class from outside the worker realm.
+ *
+ * @param {unknown} candidate
+ * @returns {candidate is File}
+ */
+function isFileLike(candidate) {
+  return !!candidate
+    && typeof candidate === 'object'
+    && typeof (/** @type {File} */ (candidate).slice) === 'function'
+    && typeof (/** @type {File} */ (candidate).size) === 'number';
+}
+
+/**
+ * Host I/O adapter shared by both paged database variants: serves absolute-
+ * offset reads of the File through FileReaderSync. Blob.slice clamps overhangs,
+ * so reads at EOF come back short — the paged VFS zero-fills and reports
+ * the short read to SQLite per the VFS contract. The size is pinned at
+ * open time: Chromium invalidates a File snapshot whose backing file
+ * changes on disk, making later reads throw, which the VFS surfaces as
+ * an I/O error rather than serving torn pages.
+ *
+ * Reads go through the shared chunked read cache
+ * (src/core/chunked-read-cache.ts): the flat FileReaderSync per-call cost
+ * dominates per-4KB-page reads, so SQLite's page requests are coalesced
+ * into 64KiB host reads. The cache is created per open (this function is
+ * called once per initializeDatabase) and dropped with the handle.
+ *
+ * @param {File} file
+ * @param {FileReaderSync} reader
+ */
+function createFileHostIo(file, reader) {
+  const size = file.size;
+  const read = createChunkedReadCache((offset, length) => new Uint8Array(
+    reader.readAsArrayBuffer(file.slice(offset, offset + length))
+  ));
+  return {
+    size: () => size,
+    read
+  };
+}
+
+/**
+ * Resolve optional open-routing limit overrides from the init config.
+ * Bounds tuning is compile-time (src/core/paged-open.ts); these exist so
+ * tests can exercise the ladder without multi-GB fixtures.
+ *
+ * @param {Object} config
+ * @returns {{pagedThresholdBytes?: number, bufferCeilingBytes?: number}}
+ */
+function resolveOpenLimits(config) {
+  const limits = {};
+  if (config.pagedOpenThresholdBytes !== undefined) {
+    limits.pagedThresholdBytes = config.pagedOpenThresholdBytes;
+  }
+  if (config.bufferOpenCeilingBytes !== undefined) {
+    limits.bufferCeilingBytes = config.bufferOpenCeilingBytes;
+  }
+  return limits;
+}
+
+/**
+ * Resolve the hard merged-image download ceiling. The override is internal
+ * test plumbing; production stays pinned to the measured browser ArrayBuffer
+ * ceiling and callers cannot raise it beyond that bound.
+ *
+ * @param {unknown} value
+ * @returns {number}
+ */
+function resolvePagedExportMaxBytes(value) {
+  if (value === undefined) return BUFFER_OPEN_CEILING_BYTES;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error('pagedExportMaxBytes must be a positive safe integer');
+  }
+  if (value > BUFFER_OPEN_CEILING_BYTES) {
+    throw new Error(
+      `pagedExportMaxBytes must not exceed ${BUFFER_OPEN_CEILING_BYTES} bytes`
+    );
+  }
+  return value;
+}
+
+/** Preserve and bound messages from worker, VM, browser, and SQLite realms. */
+function getErrorMessage(error) {
+  let message = 'Unknown error';
+  try {
+    message = error
+      && typeof error === 'object'
+      && typeof error.message === 'string'
+      && error.message
+      ? error.message
+      : String(error);
+  } catch {
+    // A response still needs a safe scalar when coercion itself is hostile.
+  }
+  if (!message) message = 'Unknown error';
+  if (message.length <= MAX_WORKER_ERROR_MESSAGE_LENGTH) return message;
+  return message.slice(0, MAX_WORKER_ERROR_MESSAGE_LENGTH)
+    + `... [truncated from ${message.length} characters]`;
+}
+
+/**
+ * Initialize a new database from binary content or a File handle.
+ *
+ * @param {string} filename - Display name for the database
+ * @param {Object} config - Configuration object
+ * @param {Uint8Array} [config.content] - SQLite database binary content
+ * @param {File} [config.file] - Database file handle; opens page-on-demand
+ *   with a copy-on-write overlay when large and the runtime supports it,
+ *   otherwise degrades through read-only paging to the buffer path
+ * @param {Uint8Array} [config.wasmBinary] - Optional WASM binary
+ * @returns {Promise<Object>} Database handle info
+ */
+async function initializeDatabase(filename, config) {
+  // Close existing database
+  closeActiveCellReadSession();
+  if (db) {
+    db.close();
+    db = null;
+  }
+
+  queryTimeout = Number.isFinite(config.queryTimeout) && config.queryTimeout > 0
+    ? config.queryTimeout
+    : DEFAULT_QUERY_TIMEOUT_MS;
+  readOnlyMode = config.readOnlyMode === true;
+  readOnlyReason = null;
+  storageMode = 'memory';
+  pagedFileSizeBytes = 0;
+  pagedExportMaxBytes = resolvePagedExportMaxBytes(config.pagedExportMaxBytes);
+  pagedExactCountMaxFileBytes = resolvePagedExactCountMaxFileBytes(
+    config.pagedExactCountMaxFileBytes
+  );
+  cellReadSessionIdleTimeoutMs = normalizeCellReadTimeout(
+    config.cellReadSessionIdleTimeoutMs,
+    DEFAULT_CELL_READ_SESSION_IDLE_TIMEOUT_MS
+  );
+  cellReadSessionAbsoluteTimeoutMs = normalizeCellReadTimeout(
+    config.cellReadSessionAbsoluteTimeoutMs,
+    DEFAULT_CELL_READ_SESSION_ABSOLUTE_TIMEOUT_MS
+  );
+  closedCellReadSessionIds.clear();
+
+  // ENGINE SEAM. Exactly one of the two branches below survives into any
+  // given bundle; esbuild's define-driven dead-code elimination removes the
+  // other. Every WASM build (bundleWebDemoWorker in scripts/build.mjs and the
+  // worker unit tests' mirrored esbuild configs) defines
+  // `import.meta.env.DESKTOP_NATIVE_ENGINE` as false, which folds this whole
+  // `if` away and keeps those bundles BYTE-IDENTICAL to the pre-seam output —
+  // a build gate, enforced by web_demo_worker.test.ts's freshness hash. The
+  // desktop-native sidecar bundle (bundleDesktopNativeWorker) defines it true
+  // and `inject`s core/native/native-engine-inject.js, which binds the free
+  // identifier `__desktopNativeCreateEngine` to the sidecar's engine factory
+  // (a tjs:sqlite-backed sql.js shim bound to the argv-designated file). The
+  // rest of this file runs unchanged against whichever engine the branch
+  // produced.
+  measureEngineReply = null;
+  frameCellWire = null;
+  if (import.meta.env.DESKTOP_NATIVE_ENGINE) {
+    let measureReply;
+    let engineCellWire;
+    ({ SQL, db, measureReply, cellWire: engineCellWire } = await __desktopNativeCreateEngine(config));
+    measureEngineReply = typeof measureReply === 'function' ? measureReply : null;
+    frameCellWire = engineCellWire ?? null;
+    queryPlanReaderActive = SQL.queryPlanReaderActive === true;
+  } else {
+    // Initialize sql.js with WASM
+    if (!SQL) {
+      // Load sql.js script
+      importScripts(SQL_JS_GLUE_URL);
+
+      // Initialize with WASM binary if provided
+      const sqlConfig = {};
+      if (config.wasmBinary) {
+        sqlConfig.wasmBinary = config.wasmBinary;
+      } else {
+        sqlConfig.locateFile = () => SQL_JS_WASM_URL;
+      }
+
+      SQL = await self.initSqlJs(sqlConfig);
+      // Before the first connection: the reader installs itself as an
+      // auto-extension, which only reaches connections opened AFTER this call
+      // (the buffer open below and the paged open ladder alike).
+      queryPlanReaderActive = registerQueryPlanReader(SQL);
+    }
+
+    // Create the database. A File handle runs the open ladder (WAL sniff,
+    // then paged-vs-buffer by size — see src/core/paged-open.ts); inline
+    // bytes keep today's buffer path unchanged.
+    if (isFileLike(config.file)) {
+      storageMode = openDatabaseFromFile(config.file, resolveOpenLimits(config));
+    } else if (config.content && config.content.length > 0) {
+      db = new SQL.Database(config.content);
+    } else {
+      // Create empty database
+      db = new SQL.Database();
+    }
+  }
+  // Referential integrity must not depend on which engine happened to open the
+  // file. SQLite's own default is OFF (sql.js inherits it) while the fork the
+  // native sidecar is built on defaults it ON, so the SAME parent delete was
+  // refused on native and silently orphaned children on WASM. Pinned ON here,
+  // explicitly, on both: a refused delete is visible and recoverable, orphaned
+  // rows are neither. Users who need the permissive behaviour still have
+  // setPragma('foreign_keys', false) and the Configuration modal's control.
+  //
+  // Safe to force here because worker.js only ever drops columns through
+  // `ALTER TABLE ... DROP COLUMN`; it never runs the rename-and-rebuild plan in
+  // core/column-drop.ts (undoing a column drop is unsupported here -- see
+  // undoModification), and that plan is the one that needs foreign_keys OFF to
+  // keep SQLite from rewriting other tables' REFERENCES clauses. The extension's
+  // own engines run it and already bracket it themselves.
+  //
+  // Set BEFORE query_only: this is a connection flag, not a write, but ordering
+  // it first keeps it independent of how each engine enforces read-only.
+  db.run('PRAGMA foreign_keys = ON');
+
+  if (!readOnlyMode) {
+    // A file the process cannot write (mode 0444, a read-only mount, a
+    // read-only medium) opens FINE and only refuses at the first edit -- so the
+    // capability report said `isReadOnly: false` and the UI offered edits that
+    // were guaranteed to fail. Ask SQLite directly instead of guessing; the
+    // probe is rolled back and leaves the file byte-identical.
+    const refusal = probeWriteRefusal();
+    if (refusal) {
+      readOnlyMode = true;
+      readOnlyReason = refusal;
+    }
+  }
+
+  if (readOnlyMode) {
+    // Defense in depth for every current and future RPC path. Public mutators
+    // still fail early with operation-specific errors, while SQLite itself
+    // refuses an accidentally unguarded write on this connection. Read-only
+    // paged databases are additionally immutable at the VFS level.
+    //
+    // Through the ENGINE where the engine has read-only state of its own. The
+    // native engine's sql.js shim does: it lifts `query_only` around the
+    // shim-authored TEMP VIEW it uses to read a statement's column names
+    // without executing it, and whether it lifts is decided by its own
+    // `readOnly` flag. Arming the pragma behind its back left the two
+    // disagreeing -- the lift became a no-op, SQLite refused the probe's
+    // CREATE TEMP VIEW as a write, and the swallowed refusal came back as
+    // "no columns", so the grid rendered an internal invariant message
+    // ("positive column count, got 0") instead of rows on EVERY database this
+    // probe found unwritable. sql.js has no such state, so it keeps the pragma.
+    if (typeof db.enforceReadOnly === 'function') db.enforceReadOnly();
+    else db.run('PRAGMA query_only = ON');
+  }
+
+  return {
+    operations: {},
+    isReadOnly: readOnlyMode,
+    storage: storageMode,
+    ...(readOnlyReason ? { readOnlyReason } : {})
+  };
+}
+
+/** SQLite primary result code for "attempt to write a readonly database". */
+const SQLITE_READONLY = 8;
+
+/**
+ * Classify a failed write attempt.
+ *
+ * Only a genuine read-only refusal counts. A busy/locked database (another
+ * writer holds the lock right now) is INCONCLUSIVE, not read-only: reporting it
+ * as read-only would strand an editable file in a read-only session for the
+ * whole run. Anything else is left alone deliberately -- the connection stays
+ * writable and the real error surfaces, unmodified, at the first real write.
+ *
+ * The fork reports `sqlite3_errstr(errno)`, which for code 8 is exactly
+ * "attempt to write a readonly database"; sql.js reports `sqlite3_errmsg`,
+ * which says the same. `errno` is checked first because it is the only
+ * classifier the fork exposes that is not prose.
+ *
+ * @param {unknown} error
+ * @returns {string|null} the reason to report, or null when inconclusive
+ */
+function classifyWriteRefusal(error) {
+  const isReadOnly = error?.errno === SQLITE_READONLY
+    || /read[\s-]?only/i.test(getErrorMessage(error));
+  if (!isReadOnly) return null;
+  return 'This database cannot be written by this process, so it is open ' +
+    'read-only (SQLite: attempt to write a readonly database).';
+}
+
+/**
+ * Ask SQLite whether this connection can actually write, without changing the
+ * database.
+ *
+ * A file the process cannot write (mode 0444, a read-only mount, a read-only
+ * medium) opens perfectly happily -- SQLite falls back to a read-only
+ * connection silently -- and only refuses at the first write, so the open used
+ * to report `isReadOnly: false` and the UI offered edits that could not land.
+ *
+ * `BEGIN IMMEDIATE` is NOT enough on its own: modern SQLite defers the RESERVED
+ * lock, so it succeeds on a read-only connection (verified against the shipped
+ * binary). The probe therefore attempts a real write -- setting `user_version`
+ * to the value it already holds -- inside a transaction that is ALWAYS rolled
+ * back. A rolled-back transaction never reaches the database file: SQLite
+ * stages the page in the rollback journal and discards it, so the only trace is
+ * a journal file that exists for the duration of the probe.
+ *
+ * @returns {string|null} the reason to report, or null when writes are possible
+ */
+function probeWriteRefusal() {
+  // Read the current value OUTSIDE the transaction: writing it back unchanged
+  // is what makes this a no-op even if a rollback were ever skipped. It is
+  // SQLite's own 32-bit signed integer, never caller input, so interpolating it
+  // is not an injection site (`| 0` pins that).
+  const currentVersion = Number(db.exec('PRAGMA user_version')[0]?.values?.[0]?.[0]) | 0;
+  try {
+    db.run('BEGIN');
+  } catch (error) {
+    // A BEGIN that fails read-only is decisive too; anything else is not, and
+    // leaves no transaction to unwind.
+    return classifyWriteRefusal(error);
+  }
+  let refusal = null;
+  try {
+    db.run(`PRAGMA user_version = ${currentVersion}`);
+  } catch (error) {
+    refusal = classifyWriteRefusal(error);
+  } finally {
+    // A statement that failed INSIDE the transaction leaves it open, so this
+    // runs on both paths.
+    db.run('ROLLBACK');
+  }
+  return refusal;
+}
+
+/**
+ * Open a database from a File handle, choosing between the paged
+ * (page-on-demand, writable when supported) and buffer (in-memory) paths.
+ *
+ * Sets the module-level `db`, and widens `readOnlyMode` when the chosen
+ * path is a read-only one (read-only paged fallback, or WAL-marked above
+ * the paged threshold). Writable paging is preferred for an editable open;
+ * failure degrades to read-only openPaged, then re-enters the ladder with
+ * paging unavailable. Oversized files therefore fail with one clear message
+ * instead of an opaque reader error or a doomed multi-GB allocation.
+ *
+ * @param {File} file
+ * @param {{pagedThresholdBytes?: number, bufferCeilingBytes?: number}} limits
+ * @returns {'paged' | 'memory'} storage mode actually opened
+ */
+function openDatabaseFromFile(file, limits) {
+  const reader = new FileReaderSync();
+  const header = new Uint8Array(
+    reader.readAsArrayBuffer(file.slice(0, SQLITE_HEADER_PROBE_BYTES))
+  );
+  const canOpenPagedWritable = !readOnlyMode
+    && typeof SQL.Database.openPagedWritable === 'function';
+  const canOpenPagedReadOnly = typeof SQL.Database.openPaged === 'function';
+  const input = {
+    sizeBytes: file.size,
+    walMarked: isWalMarkedHeader(header),
+    pagedAvailable: canOpenPagedWritable || canOpenPagedReadOnly
+  };
+
+  let plan = decideOpenPlan(input, limits);
+  let pagedFailure = null;
+  if (plan.mode === 'paged') {
+    const writablePagedMaxBytes = Math.min(
+      pagedExportMaxBytes,
+      limits.bufferCeilingBytes ?? BUFFER_OPEN_CEILING_BYTES
+    );
+    const exceedsWritableSaveLimit = file.size > writablePagedMaxBytes;
+    const forcedReadOnlyReason = !readOnlyMode && exceedsWritableSaveLimit
+      ? `This database exceeds the ${writablePagedMaxBytes}-byte browser save limit ` +
+        'and is open read-only so edits cannot be stranded. Use the desktop extension ' +
+        'to edit and save it.'
+      : null;
+    // Both VFS variants use exactly the same guarded/cached reader. The
+    // writable fork layers changed pages in host memory; base reads remain
+    // pinned to the File snapshot captured above.
+    const hostIo = createFileHostIo(file, reader);
+    const failures = [];
+    if (canOpenPagedWritable && !exceedsWritableSaveLimit) {
+      try {
+        db = SQL.Database.openPagedWritable(hostIo);
+        pagedFileSizeBytes = file.size;
+        return 'paged';
+      } catch (error) {
+        const message = getErrorMessage(error);
+        failures.push(`writable paged open failed: ${message}`);
+        db = null;
+      }
+    }
+    if (canOpenPagedReadOnly) {
+      try {
+        db = SQL.Database.openPaged(hostIo);
+        readOnlyMode = true;
+        // Download is the demo's only persistence path. Publish the notice only
+        // after the read-only fallback actually wins; a safe buffer fallback may
+        // still remain available under test-configured limits.
+        readOnlyReason = forcedReadOnlyReason;
+        pagedFileSizeBytes = file.size;
+        return 'paged';
+      } catch (error) {
+        const message = getErrorMessage(error);
+        failures.push(`read-only paged open failed: ${message}`);
+        db = null;
+      }
+    }
+    // Fall back exactly as if paging were absent; keep the causes for the
+    // oversized-rejection message below.
+    pagedFailure = failures.length > 0 ? new Error(failures.join('; ')) : null;
+    plan = decideOpenPlan({ ...input, pagedAvailable: false }, limits);
+  }
+  if (plan.mode === 'reject') {
+    throw new Error(
+      pagedFailure
+        ? `${plan.message} (paged open failed: ${pagedFailure.message})`
+        : plan.message
+    );
+  }
+  db = new SQL.Database(new Uint8Array(reader.readAsArrayBuffer(file)));
+  if (plan.readOnly) readOnlyMode = true;
+  return 'memory';
+}
+
+/**
+ * Execute a SQL query and return results.
+ *
+ * @param {string} sql - SQL statement to execute
+ * @param {Array} [params] - Bound parameters
+ * @returns {Promise<Array>} Array of result sets
+ */
+async function runQuery(sql, params = [], cancellationFlag) {
+  if (!db) throw new Error('No database initialized');
+  if (readOnlyMode) {
+    // This low-level RPC hands its whole text to db.exec, which compiles and
+    // runs every statement in it, so no text-level read check can admit it:
+    // one that read a multi-statement text as a single SELECT would let a
+    // pragma in it act while being compiled. The console's reads (runConsole)
+    // and the read workspace (executeReadQuery) run on a read-only database.
+    throw new Error('Ad hoc SQL execution is unavailable because the database is read-only');
+  }
+
+  try {
+    const run = () => executeWithProgressHandler(
+      () => db.exec(sql, params),
+      cancellationFlag
+    );
+    const results = isReadStatement(sql) ? readRefusingWrites(run) : run();
+
+    // Convert to our result format
+    return results.map(result => ({
+      headers: result.columns,
+      rows: result.values
+    }));
+  } catch (error) {
+    throw error;
+  }
+}
+
+/** Browser SQL workspace: one read query, with the extension's transport limits. */
+async function executeReadQuery(sql, parameterText = '[]', cancellationFlag) {
+  if (!db) throw new Error('No database initialized');
+  if (typeof sql !== 'string' || typeof parameterText !== 'string') {
+    throw new TypeError('SQL and parameter JSON must be strings');
+  }
+  const params = parseQueryParameters(parameterText);
+  const prepared = prepareReadQuery(sql, params);
+  if (params.length !== prepared.parameterCount) {
+    throw new Error(`Expected ${prepared.parameterCount} positional parameters.`);
+  }
+  const metadataView = `query_columns_${crypto.randomUUID().replace(/-/g, '')}`;
+  const queryOnly = Number(db.exec('PRAGMA query_only')[0]?.values[0]?.[0]) === 1;
+  let createdMetadataView = false;
+  let headers;
+  try {
+    // Match the WASM engine: TEMP metadata DDL needs query_only lifted, but no
+    // user query is stepped and no await occurs before the guard is restored.
+    if (queryOnly) runSingleStatement('PRAGMA query_only = OFF');
+    headers = executeWithProgressHandler(() => {
+      runSingleStatement(`CREATE TEMP VIEW "${metadataView}" AS ${prepared.metadataSql}`);
+      createdMetadataView = true;
+      // Bound database-controlled labels before extracting them into JavaScript.
+      const names = (db.exec(
+        "SELECT substr(name, 1, 4097) FROM pragma.pragma_table_info(?, 'temp') ORDER BY cid LIMIT ?",
+        [metadataView, SQL_MAX_COLUMNS + 1]
+      )[0]?.values ?? []).map(row => String(row[0]));
+      if (!names.length || names.length > SQL_MAX_COLUMNS) throw new Error('Queries support 1 to 128 result columns.');
+      if (names.some(header => header.length > 4096)) throw new Error('Result column labels must be at most 4096 characters.');
+      return names;
+    }, cancellationFlag);
+  } finally {
+    try {
+      if (createdMetadataView) {
+        // The native shim restores query_only after its own column-name
+        // probe. Lift it again for this worker-owned TEMP view's cleanup.
+        if (queryOnly) runSingleStatement('PRAGMA query_only = OFF');
+        runSingleStatement(`DROP VIEW temp."${metadataView}"`);
+      }
+    }
+    finally {
+      if (queryOnly) {
+        try { runSingleStatement('PRAGMA query_only = ON'); }
+        catch (error) {
+          const failedDatabase = db;
+          db = null;
+          failedDatabase.close();
+          throw error;
+        }
+      }
+    }
+  }
+  // Match the WASM engine: query_only makes SQLite refuse every write, nested
+  // statements included. Hold it around the user's statement only and restore
+  // it outside the deadline.
+  if (!queryOnly) runSingleStatement('PRAGMA query_only = ON');
+  try {
+    return executeWithProgressHandler(() => {
+      const transport = buildReadTransport(prepared.sql, headers.length);
+      const statement = prepareSingleStatement(transport.sql);
+      try {
+        statement.bind(prepared.params);
+        const rows = [];
+        while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
+          rows.push(statement.get(null, { useBigInt: true }));
+        }
+        return containForEngine((valueWire) => decodeReadTransport(headers, rows, transport, valueWire), headers);
+      } finally { statement.free(); }
+    }, cancellationFlag);
+  } finally {
+    if (!queryOnly) runSingleStatement('PRAGMA query_only = OFF');
+  }
+}
+
+/**
+ * Clamp a caller-supplied console row cap into [1, 50000], defaulting to
+ * 5000 when omitted (or non-finite). Exported inline rather than as a
+ * standalone RPC method; covered indirectly by runConsole's own tests.
+ *
+ * @param {unknown} maxRows
+ * @returns {number}
+ */
+function clampConsoleMaxRows(maxRows) {
+  if (maxRows === undefined || maxRows === null) return 5000;
+  const numeric = Number(maxRows);
+  if (!Number.isFinite(numeric)) return 5000;
+  return Math.min(50000, Math.max(1, Math.trunc(numeric)));
+}
+
+/**
+ * Clamp a caller-supplied statement cap to a positive integer, defaulting to
+ * Infinity (run the whole script). A capped run executes the first N
+ * statements and reports the rest as skipped without running them (see the
+ * drain in runConsole). The console's EXPLAIN used to ride this with a cap of
+ * 1 -- `EXPLAIN QUERY PLAN <editor text>` only ever prefixes the FIRST
+ * statement -- and now has its own single-statement path (`options.explain`),
+ * so nothing in the shipped UI passes it today; it stays a supported option.
+ *
+ * @param {unknown} maxStatements
+ * @returns {number}
+ */
+function clampConsoleMaxStatements(maxStatements) {
+  if (maxStatements === undefined || maxStatements === null) return Infinity;
+  const numeric = Number(maxStatements);
+  if (!Number.isFinite(numeric)) return Infinity;
+  return Math.max(1, Math.trunc(numeric));
+}
+
+// ----------------------------------------------------------------------------
+// SQL console: positional parameters and query plans
+// ----------------------------------------------------------------------------
+
+/**
+ * Parameter-count ceiling shared with the page's parseQueryParameters
+ * (src/core/sql-workspace.ts) and the bounded reader (query-plan.c admits at
+ * most 100 values after the SQL text).
+ */
+const MAX_CONSOLE_PARAMETERS = 100;
+
+/**
+ * Validate the console's positional parameters. Untrusted RPC input: the page
+ * validates what the user typed, but the worker is the boundary that binds.
+ * Only the value classes JSON can carry and both engines bind identically --
+ * NUL-bearing text is refused for the same reason the SQL text is (sql.js
+ * binds text NUL-terminated, so the value would silently truncate), and a
+ * non-finite number has no SQLite representation.
+ *
+ * @param {unknown} value
+ * @returns {Array<null | string | number>}
+ */
+function normalizeConsoleParams(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('Console parameters must be a JSON array.');
+  if (value.length > MAX_CONSOLE_PARAMETERS) {
+    throw new Error(`Use at most ${MAX_CONSOLE_PARAMETERS} positional parameters.`);
+  }
+  // for...of visits array holes (as undefined) where every()/forEach would
+  // skip them, so a sparse list cannot slip a hole past this check.
+  for (const item of value) {
+    if (item === null) continue;
+    if (typeof item === 'string') {
+      if (item.includes('\0')) {
+        throw new Error('Console parameters must not contain NUL bytes; SQLite would bind the text truncated at the first one.');
+      }
+      continue;
+    }
+    if (typeof item === 'number' && Number.isFinite(item)) continue;
+    if (typeof item === 'bigint' && item >= CONSOLE_INT64_MIN && item <= CONSOLE_INT64_MAX) continue;
+    throw new Error('Console parameters must be null, string, finite number or 64-bit integer values.');
+  }
+  return value;
+}
+
+const CONSOLE_INT32_MIN = -2147483648n;
+const CONSOLE_INT32_MAX = 2147483647n;
+const CONSOLE_INT64_MIN = -9223372036854775808n;
+const CONSOLE_INT64_MAX = 9223372036854775807n;
+
+/**
+ * The script and bind values with each parameter typed as SQLite types the
+ * same literal: a BigInt is an INTEGER, exact over the 64-bit range, and a
+ * number a REAL, 1.0 and 1e3 included (the console's parser returns digits
+ * alone as a BigInt). sql.js binds a whole number in int32 as INTEGER, any
+ * other number as REAL and a BigInt as TEXT, so a value no bind types that way
+ * is bound as decimal text or as its number and converted in SQL, as the
+ * extension's read workspace does (typedPlaceholder in
+ * src/core/sql-workspace.ts). The unary plus drops the CAST's affinity, so the
+ * value compares as a plain ? would. A placeholder is found by SQLite's lexical
+ * rules: none inside quotes, bracketed or backquoted names, or comments. It is
+ * numbered by SQLite's rules too: a bare ? takes one more than the largest
+ * index of its statement so far, ?NNN its own, and a named parameter (:a, @a,
+ * $a; the prefix is part of the name) one more than the largest on its first
+ * use and that same index after. The count starts again after each top-level
+ * semicolon. A named placeholder keeps its name inside the CAST, so rewriting
+ * it moves no index.
+ */
+function typedConsoleScript(sql, params) {
+  if (params.length === 0) return { sql, params, renames: [] };
+  const bindable = params.map(value => typeof value !== 'bigint'
+    ? value
+    : value < CONSOLE_INT32_MIN || value > CONSOLE_INT32_MAX ? value.toString() : Number(value));
+  const wordPart = /[A-Za-z0-9_$\u0080-\uffff]/;
+  const typeFor = (value) => typeof value === 'bigint' && (value < CONSOLE_INT32_MIN || value > CONSOLE_INT32_MAX)
+    ? 'INTEGER'
+    : typeof value === 'number' && Number.isInteger(value) ? 'REAL' : null;
+  let out = '';
+  let largest = 0;
+  let named = new Map();
+  /** [rewrite, what was typed], to head result columns with the latter. */
+  const renames = [];
+  let i = 0;
+  while (i < sql.length) {
+    const start = i;
+    const ch = sql[i];
+    if (ch === "'" || ch === '"' || ch === '`' || ch === '[') {
+      const end = ch === '[' ? ']' : ch;
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i++] !== end) continue;
+        if (end !== ']' && sql[i] === end) { i += 1; continue; }
+        break;
+      }
+    } else if (sql.startsWith('--', i)) {
+      while (i < sql.length && sql[i] !== '\n') i += 1;
+    } else if (sql.startsWith('/*', i)) {
+      const close = sql.indexOf('*/', i + 2);
+      i = close < 0 ? sql.length : close + 2;
+    } else if (/[A-Za-z_\u0080-\uffff]/.test(ch)) {
+      i += 1;
+      while (i < sql.length && wordPart.test(sql[i])) i += 1;
+    } else if (ch === ';') {
+      largest = 0;
+      named = new Map();
+      i += 1;
+    } else if (ch === '?') {
+      i += 1;
+      while (i < sql.length && /\d/.test(sql[i])) i += 1;
+      const index = i > start + 1 ? Number(sql.slice(start + 1, i)) : largest + 1;
+      largest = Math.max(largest, index);
+      const type = typeFor(params[index - 1]);
+      if (type) renames.push([`(+CAST(?${index} AS ${type}))`, sql.slice(start, i)]);
+      out += type ? ` (+CAST(?${index} AS ${type}))` : sql.slice(start, i);
+      continue;
+    } else if ((ch === ':' || ch === '@' || ch === '$') && i + 1 < sql.length && wordPart.test(sql[i + 1])) {
+      // SQLite's tokenizer: identifier characters, Tcl's :: separators, and
+      // one (...) suffix with no whitespace inside, for each of the prefixes.
+      i += 1;
+      for (;;) {
+        if (i < sql.length && wordPart.test(sql[i])) { i += 1; continue; }
+        if (sql.startsWith('::', i)) { i += 2; continue; }
+        if (sql[i] === '(') {
+          let close = i + 1;
+          while (close < sql.length && sql[close] !== ')' && !/\s/.test(sql[close])) close += 1;
+          if (sql[close] === ')') i = close + 1;
+        }
+        break;
+      }
+      const name = sql.slice(start, i);
+      let index = named.get(name);
+      if (index === undefined) {
+        index = largest + 1;
+        named.set(name, index);
+        largest = index;
+      }
+      const type = typeFor(params[index - 1]);
+      if (type) renames.push([`(+CAST(${name} AS ${type}))`, name]);
+      out += type ? ` (+CAST(${name} AS ${type}))` : name;
+      continue;
+    } else {
+      i += 1;
+    }
+    out += sql.slice(start, i);
+  }
+  return { sql: out, params: bindable, renames };
+}
+
+/**
+ * A result column's name with each typed placeholder back as it was typed.
+ * SQLite names an unaliased expression by its own text, which after
+ * typedConsoleScript holds the rewrite (with the space it inserts) instead.
+ */
+function restoreConsoleHeader(header, renames) {
+  let restored = String(header);
+  for (const [rewrite, typed] of renames) {
+    restored = restored.split(` ${rewrite}`).join(typed).split(rewrite).join(typed);
+  }
+  return restored;
+}
+
+/**
+ * Bind the run's parameters to one statement, naming the count in the failure:
+ * SQLite's own wording for a value with no placeholder is "column index out of
+ * range", which reads as a result-column problem to someone who typed `[1, 2]`
+ * over a one-placeholder statement.
+ */
+function bindConsoleParams(statement, params) {
+  try {
+    statement.bind(params);
+  } catch (error) {
+    throw new Error(
+      `cannot bind ${params.length} positional parameter${params.length === 1 ? '' : 's'}: `
+      + getErrorMessage(error)
+    );
+  }
+}
+
+/**
+ * Bounds mirrored from src/runtime/query-plan.c (PLAN_MAX_SQL_BYTES,
+ * SQLITE_EXPLORER_PLAN_MAX_DETAIL_BYTES) so the built-in EXPLAIN path refuses
+ * exactly what the bounded reader refuses, on whichever engine answers.
+ */
+const QUERY_PLAN_MAX_SQL_BYTES = 4 * 65536;
+const QUERY_PLAN_MAX_DETAIL_BYTES = 65536;
+/** EXPLAIN QUERY PLAN's fixed result shape; query-plan.c asserts the same four. */
+const QUERY_PLAN_HEADERS = Object.freeze(['id', 'parent', 'notused', 'detail']);
+const QUERY_PLAN_UNSUPPORTED = 'SQLite returned an unsupported query plan.';
+/** Leading `PRAGMA`, after leading trivia is stripped. */
+const PRAGMA_PREFIX = /^pragma\b/i;
+
+/**
+ * Arm the bounded EXPLAIN QUERY PLAN reader compiled into the vendored sql.js
+ * (src/runtime/query-plan.c). The export installs `sqlite_explorer_query_plan`
+ * as an auto-extension, so it must run before the first connection opens and
+ * needs to run once per module. Absent on an older build (the console then
+ * falls back to SQLite's own EXPLAIN on this engine too); a build that HAS
+ * it and fails to register is broken rather than old, and mirrors the
+ * extension host's own refusal to open (src/core/sqlite-db.ts).
+ *
+ * @param {{ _sqlite_explorer_register_query_plan?: () => number }} module
+ * @returns {boolean} whether the reader is available on this module
+ */
+function registerQueryPlanReader(module) {
+  const register = module?._sqlite_explorer_register_query_plan;
+  if (typeof register !== 'function') {
+    // The same runtime registration also installs the grid's cell helpers, so
+    // say why every table page will take the SQL containment path.
+    console.warn('[Worker] The sql.js runtime functions did not register:', 'missing from this build');
+    return false;
+  }
+  if (register() !== 0) throw new Error('Unable to initialize the bounded query-plan reader.');
+  return true;
+}
+
+/**
+ * Skip leading whitespace, line (`--`) and block comments, so a leading
+ * keyword check sees the statement's real first token. Mirrors the native
+ * shim's stripLeadingTrivia (core/native/sqljs-shim.js) minus its
+ * empty-statement skipping: here the text is one normalised statement.
+ */
+function stripLeadingSqlTrivia(text) {
+  let index = 0;
+  for (;;) {
+    const before = index;
+    while (index < text.length && /\s/.test(text[index])) index += 1;
+    if (text.startsWith('--', index)) {
+      const lineEnd = text.indexOf('\n', index);
+      index = lineEnd < 0 ? text.length : lineEnd + 1;
+    } else if (text.startsWith('/*', index)) {
+      const blockEnd = text.indexOf('*/', index + 2);
+      index = blockEnd < 0 ? text.length : blockEnd + 2;
+    }
+    if (index === before) return text.slice(index);
+  }
+}
+
+/**
+ * Route read-shaped SQL without compiling it outside the C reader's limits.
+ * For WITH, skip each parenthesized CTE body and inspect the following
+ * statement keyword. Quoted names and comments stay opaque. Ambiguous or
+ * malformed WITH text goes to the reader, where SQLite rejects it safely.
+ */
+const QUERY_PLAN_SQL_TOKENS = /--[^\r\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_\u0080-\uffff][A-Za-z_0-9$\u0080-\uffff]*|[^\s]/g;
+
+function isQueryPlanRead(sql) {
+  const body = stripLeadingSqlTrivia(sql);
+  const first = /^[A-Za-z]+/.exec(body)?.[0]?.toUpperCase();
+  if (first !== 'WITH') return first === 'SELECT' || first === 'VALUES';
+  let depth = 0;
+  let awaitingBody = false;
+  let inBody = false;
+  let bodyEnded = false;
+  for (const match of body.matchAll(QUERY_PLAN_SQL_TOKENS)) {
+    const token = match[0];
+    if (token.startsWith('--') || token.startsWith('/*')) continue;
+    if (bodyEnded) {
+      if (token === ',') { bodyEnded = false; continue; }
+      return !/^(?:INSERT|UPDATE|DELETE|REPLACE)$/i.test(token);
+    }
+    if (token === '(') {
+      if (depth === 0 && awaitingBody) { inBody = true; awaitingBody = false; }
+      depth++;
+    } else if (token === ')') {
+      depth--;
+      if (depth < 0) return true;
+      if (depth === 0 && inBody) { bodyEnded = true; inBody = false; }
+    } else if (depth === 0 && /^AS$/i.test(token)) {
+      awaitingBody = true;
+    }
+  }
+  return true;
+}
+
+/** Shape a list of plan rows as one console result set, capped like a read query's rows. */
+function toPlanResultSet(rows) {
+  return {
+    headers: [...QUERY_PLAN_HEADERS],
+    rows: rows.slice(0, SQL_RESULT_ROWS),
+    truncated: rows.length > SQL_RESULT_ROWS
+  };
+}
+
+/**
+ * The plan through the bounded reader: ONE statement, the user's SQL crossing
+ * as a bound value (so no character of it can escape into a second
+ * statement), compiled under clamped connection limits, at most 1001 rows of
+ * at most 64 KiB detail each, returned as JSON the C side already escaped.
+ * The reader also binds the caller's parameters, so the planner sees the
+ * values a real run would (LIKE optimisation, stat4 estimates).
+ */
+function readQueryPlanBounded(sql, params) {
+  const request = queryPlanRequest(sql, params);
+  const statement = db.prepare(request.sql);
+  try {
+    statement.bind(request.params);
+    if (!statement.step()) throw new Error(QUERY_PLAN_UNSUPPORTED);
+    return toPlanResultSet(decodeQueryPlan(statement.get()[0]).rows);
+  } finally {
+    statement.free();
+  }
+}
+
+/**
+ * SQLite's own `EXPLAIN QUERY PLAN <sql>` preserves desktop support for DML
+ * plans, which the bounded read-query reader does not admit. Its display
+ * limits are checked in JavaScript; read plans use the C reader on both engines.
+ *
+ * What the reader guaranteed structurally is re-established here piece by
+ * piece: prepareSingleStatement's boundary marker refuses a second statement
+ * (only the first would ever be compiled, so nothing after a `;` runs -- but
+ * the user asked about their whole text, and an answer about half of it is
+ * wrong); rows and detail bytes are capped to the reader's limits; and a
+ * leading PRAGMA is refused BEFORE compiling, because flag pragmas take effect
+ * at sqlite3_prepare time -- `EXPLAIN QUERY PLAN PRAGMA query_only = ON` would
+ * arm the pragma while displaying nothing, on both engines (verified against
+ * the vendored WASM build; the runConsole drain guard exists for the same
+ * reason). PRAGMA is always a statement's leading token, so the leading-token
+ * check is complete.
+ *
+ * EXPLAIN itself never executes the statement it describes: SQLite runs the
+ * compiled program in listing mode, so ATTACH, VACUUM INTO and transaction
+ * control inside the text are listed, not performed (the native shim's
+ * leading-token guards for those see `EXPLAIN` here and stand aside, which is
+ * why this path must not, and does not, execute).
+ */
+function readQueryPlanBuiltin(sql, params) {
+  if (PRAGMA_PREFIX.test(stripLeadingSqlTrivia(sql))) {
+    throw new Error(
+      'PRAGMA statements have no query plan (and some pragmas take effect while being '
+      + 'compiled, so they are not even prepared here). Use Run.'
+    );
+  }
+  const statement = prepareSingleStatement(`EXPLAIN QUERY PLAN ${sql}`);
+  try {
+    if (params.length > 0) bindConsoleParams(statement, params);
+    const rows = [];
+    // One lookahead row past the display cap marks truncation, as the reader's
+    // 1001-row ceiling does. Stopping early is safe here and nowhere else in
+    // this file: a listing has no side effects to run to completion.
+    while (rows.length <= SQL_RESULT_ROWS && statement.step()) {
+      const row = statement.get();
+      if (row.length !== QUERY_PLAN_HEADERS.length || typeof row[3] !== 'string') {
+        throw new Error(QUERY_PLAN_UNSUPPORTED);
+      }
+      if (new TextEncoder().encode(row[3]).byteLength > QUERY_PLAN_MAX_DETAIL_BYTES) {
+        throw new Error('Query plan detail exceeds the 65,536-byte limit.');
+      }
+      rows.push(row);
+    }
+    return toPlanResultSet(rows);
+  } finally {
+    statement.free();
+  }
+}
+
+/**
+ * EXPLAIN QUERY PLAN for exactly one statement, by whichever mechanism this
+ * engine offers:
+ *
+ *   - Read query on either engine: the bounded reader (readQueryPlanBounded).
+ *   - Other statements: SQLite's own EXPLAIN QUERY PLAN statement
+ *     (readQueryPlanBuiltin), with display limits checked in JavaScript.
+ *
+ * Both answer the same four columns, so the console cannot tell them apart --
+ * which is the point: query plans work on both desktop engines.
+ *
+ * A single trailing `;` is stripped first (normalizeViewSelectSql's exact
+ * job): it is conventional in a console and fatal to both mechanisms, which
+ * would otherwise refuse `SELECT 1;` as a syntax error inside the reader's
+ * subquery or as "two statements" at the boundary marker.
+ *
+ * @param {string} sql
+ * @param {Array<null | string | number>} params
+ * @returns {{ headers: string[], rows: unknown[][], truncated: boolean }}
+ */
+function readQueryPlan(sql, params) {
+  if (typeof sql !== 'string' || sql.trim() === '') {
+    throw new Error('Enter one SQL statement to explain.');
+  }
+  if (new TextEncoder().encode(sql).byteLength > QUERY_PLAN_MAX_SQL_BYTES) {
+    throw new Error('Query plan SQL exceeds 262,144 UTF-8 bytes.');
+  }
+  const body = normalizeViewSelectSql(sql);
+  for (const token of body.matchAll(QUERY_PLAN_SQL_TOKENS)) {
+    if (token[0] === ';') throw new Error('Exactly one SQL statement is required');
+  }
+  if (queryPlanReaderActive && isQueryPlanRead(body)) return readQueryPlanBounded(body, params);
+  return readQueryPlanBuiltin(body, params);
+}
+
+/** The leading keywords of a statement SQLite compiles as a SELECT (see isReadStatement). */
+const READ_STATEMENT_KEYWORDS = new Set(['SELECT', 'VALUES', 'WITH']);
+
+/**
+ * Where the next statement in `sql` starts, read as SQLite's next prepare
+ * reads it: past whitespace (SQLite's own set: tab, newline, form feed,
+ * carriage return and space), `--` and block comments, and the empty
+ * statements `;` makes. `sql.length` when nothing else is left, which
+ * compiles to no statement.
+ */
+function statementStart(sql) {
+  let index = 0;
+  while (index < sql.length) {
+    const code = sql.charCodeAt(index);
+    if (code === 32 || code === 9 || code === 10 || code === 12 || code === 13 || code === 59) {
+      index += 1;
+    } else if (sql.startsWith('--', index)) {
+      const lineEnd = sql.indexOf('\n', index + 2);
+      index = lineEnd < 0 ? sql.length : lineEnd + 1;
+    } else if (sql.startsWith('/*', index)) {
+      // Unterminated, it runs to the end, as SQLite reads it.
+      const blockEnd = sql.indexOf('*/', index + 2);
+      index = blockEnd < 0 ? sql.length : blockEnd + 2;
+    } else {
+      return index;
+    }
+  }
+  return index;
+}
+
+/**
+ * The first word of the next statement in `sql` (see statementStart): '' when
+ * no statement is left, null when its first token is not a word.
+ */
+function nextStatementKeyword(sql) {
+  const start = statementStart(sql);
+  if (start === sql.length) return '';
+  // SQLite's identifier characters, as QUERY_PLAN_SQL_TOKENS spells them.
+  const word = /^[A-Za-z_\u0080-\uffff][A-Za-z_0-9$\u0080-\uffff]*/.exec(sql.slice(start, start + 64));
+  return word ? word[0] : null;
+}
+
+/**
+ * The console's refusal, on a read-only database, of a statement that is not
+ * a read, named by its first word (`keyword`, from nextStatementKeyword).
+ * `compiled` marks a statement refused after it compiled: one that starts as
+ * a read can (a WITH that leads into a write) and is not one.
+ */
+function readOnlyConsoleRefusal(keyword, compiled = false) {
+  const word = typeof keyword === 'string' && /^[A-Za-z]{1,16}$/.test(keyword) ? keyword.toUpperCase() : null;
+  let subject = word ?? 'This statement';
+  if (compiled) subject = word === 'WITH' ? 'A WITH statement that is not a SELECT' : 'This statement';
+  const pragma = subject === 'PRAGMA'
+    ? '; a pragma reads through its table-valued function, as in SELECT * FROM pragma_table_info(\'t\')'
+    : '';
+  return new Error(
+    `${subject} is unavailable because the database is read-only; the console runs only ` +
+    `SELECT, VALUES and WITH ... SELECT statements on it${pragma}`
+  );
+}
+
+/**
+ * Execute an ad hoc, possibly multi-statement SQL script typed into a
+ * console/scratchpad. Unlike runQuery (a single compiled statement plus
+ * bound params), this compiles and steps every semicolon-separated
+ * statement in `sql` in turn, returning one result set per SELECT-shaped
+ * statement -- DML/DDL statements contribute no result set -- plus
+ * aggregate mutation/timing metadata for the whole script.
+ *
+ * No transaction wrapping: statements before a failing one remain applied,
+ * matching how the same script would behave pasted into any other sqlite3
+ * client one statement at a time.
+ *
+ * FAILURE IS A RESOLUTION, NOT A REJECTION -- but only once execution has
+ * begun. The pre-execution guards below (no database, a NUL byte, malformed
+ * parameters) still throw: nothing was applied, so there is no mutation state
+ * for a caller to lose. Any error after that point (a statement error, a
+ * timeout, a cancellation, a read-only refusal) resolves with the same
+ * mutation/timing metadata the success path reports, plus `error`. That is
+ * load-bearing, not cosmetic: `INSERT ...; SELECT * FROM nope;` really does
+ * leave the INSERT applied, and a rejection would hide the `mutated: true`
+ * that the desktop host needs to record an undo barrier, mark the file dirty,
+ * and honour instantCommit. A rejected mutation is an untracked mutation.
+ *
+ * A READ-ONLY DATABASE runs reads only, as the extension's query console
+ * does: each read under the session's query_only, and the first statement
+ * that is not a read refused by name before it is compiled (see the loop),
+ * which ends the run as any statement error does.
+ *
+ * POSITIONAL PARAMETERS (`options.params`) bind to EVERY statement of the
+ * script, so a parameterised run is in practice a single statement: SQLite
+ * refuses a value with no placeholder to land in (SQLITE_RANGE), and that
+ * refusal is reported against the statement it hit rather than silently
+ * dropping the value. Neither engine exposes `sqlite3_bind_parameter_count`,
+ * so binding only where placeholders exist is not an option here. Fewer values
+ * than placeholders leaves the rest NULL, as SQLite always has.
+ *
+ * EXPLAIN (`options.explain`): the plan of ONE statement, never its
+ * execution -- see readQueryPlan for the two engine mechanisms. It answers the
+ * same shape as a run (one result set of `id, parent, notused, detail` rows,
+ * `mutated`/`changes` measured for real) plus `explain: true`, so the
+ * renderer and the host need no second contract; a refused or failed plan
+ * resolves with `error` like an execution-phase failure would, because the
+ * page renders both through the same pane.
+ *
+ * @param {string} sql - One or more semicolon-separated SQL statements
+ * @param {{ maxRows?: number, maxStatements?: number, params?: unknown[], explain?: boolean }} [options]
+ * @param {Int32Array} [cancellationFlag] - Shared cancellation flag; mirrors runQuery
+ * @returns {Promise<{
+ *   results: Array<{ headers: string[], rows: unknown[][], truncated: boolean }>,
+ *   mutated: boolean,
+ *   changes: number,
+ *   durationMs: number,
+ *   statementsSkipped?: boolean,
+ *   explain?: boolean,
+ *   error?: string,
+ *   multiStatement?: boolean
+ * }>} `statementsSkipped` means the statement cap left part of the script
+ *   unexecuted. It is exact when the tail was drained, and conservatively
+ *   `true` when the tail contained a pragma and so was left untouched -- in
+ *   that case statements really were skipped, they just were not counted, so
+ *   a tail of `-- pragma note` reports `true` while any other comment-only
+ *   tail reports `false`.
+ */
+async function runConsole(sql, options = {}, cancellationFlag) {
+  if (!db) throw new Error('No database initialized');
+
+  // A NUL byte ends the SQL string BOTH engines hand to sqlite3_prepare_v2:
+  // sql.js copies the script onto the WASM heap as a C string, and the fork's
+  // binding does the same. Everything from the first NUL onwards is silently
+  // never compiled -- WASM ran the prefix and dropped the rest without a word,
+  // native reported a confusing leftover-SQL error. Refuse up front, on both
+  // engines, with the actual reason. This is a PRE-EXECUTION guard: nothing has
+  // been applied, so it throws rather than resolving (see the header).
+  if (typeof sql === 'string' && sql.includes('\0')) {
+    throw new Error(
+      'SQL contains a NUL byte; SQLite stops compiling at the first NUL, so the ' +
+      'rest of the script would be silently skipped'
+    );
+  }
+
+  // PRE-EXECUTION guard too (throws): a malformed parameter list is a caller
+  // error, and nothing has run yet.
+  const params = normalizeConsoleParams(options.params);
+  // Integers stay exact INTEGERs and numbers REALs on both engines; a plan
+  // describes the text as typed, so Explain binds the same values unconverted.
+  const typed = typedConsoleScript(sql, params);
+  const maxRows = clampConsoleMaxRows(options.maxRows);
+  const maxStatements = clampConsoleMaxStatements(options.maxStatements);
+  const startedAt = Date.now();
+  const changesBefore = db.exec('SELECT total_changes()')[0].values[0][0];
+  const schemaBefore = db.exec('PRAGMA schema_version')[0].values[0][0];
+
+  // Read AFTER execution on both the success and the failure path, from the
+  // before-values captured above: a script that failed halfway still changed
+  // whatever its earlier statements changed.
+  const mutationMetadata = () => {
+    const changesAfter = db.exec('SELECT total_changes()')[0].values[0][0];
+    const schemaAfter = db.exec('PRAGMA schema_version')[0].values[0][0];
+    return {
+      mutated: changesAfter - changesBefore > 0 || schemaAfter !== schemaBefore,
+      changes: changesAfter - changesBefore,
+      durationMs: Date.now() - startedAt
+    };
+  };
+
+  // The failure-path read of the same metadata. Unreachable today:
+  // total_changes()/schema_version cannot fail on a handle that just executed
+  // SQL. But if the handle ever IS wedged badly enough to refuse them, guess
+  // DIRTY. That direction is the safe one -- a false "mutated" costs a
+  // redundant undo barrier and a Save prompt, while a false "clean" silently
+  // discards real writes, which is the exact bug this whole resolve-on-failure
+  // path exists to prevent.
+  const mutationMetadataAfterFailure = () => {
+    try {
+      return mutationMetadata();
+    } catch {
+      return { mutated: true, changes: 0, durationMs: Date.now() - startedAt };
+    }
+  };
+
+  if (options.explain === true) {
+    // Measured, not assumed: a plan lookup compiles and lists and never
+    // executes, and `mutated` here is what proves it to the host on every
+    // run (the host skips its session-transaction bracket for EXPLAIN on the
+    // strength of this contract, and still honours a `mutated: true`).
+    try {
+      const plan = executeWithProgressHandler(
+        () => readQueryPlan(sql, typed.params),
+        cancellationFlag
+      );
+      return { results: [plan], explain: true, statementsSkipped: false, ...mutationMetadata() };
+    } catch (error) {
+      // No `statement N:` prefix: a plan is always exactly one statement, and
+      // the refusals below already say what is wrong with it.
+      return {
+        results: [],
+        error: getErrorMessage(error),
+        explain: true,
+        multiStatement: false,
+        statementsSkipped: false,
+        ...mutationMetadataAfterFailure()
+      };
+    }
+  }
+
+  let statementIndex = 0;
+  let statementsSkipped = false;
+  let results;
+  try {
+    results = executeWithProgressHandler(() => {
+      const collected = [];
+      const iterator = db.iterateStatements(typed.sql);
+      let capped = false;
+      // Advance the iterator manually (rather than `for...of`) so the index
+      // reported on a prepare-time failure (e.g. "no such table") names the
+      // statement that failed to prepare. `for...of` only re-enters the loop
+      // body -- where a naive counter would live -- after next() has already
+      // returned successfully, which under-counts by one on exactly that
+      // failure class.
+      for (;;) {
+        // statementIndex is incremented immediately before every next(), so at
+        // the top of an iteration it is exactly the number of statements
+        // already executed -- no second counter needed.
+        if (statementIndex >= maxStatements) { capped = true; break; }
+        statementIndex++;
+        // READ-ONLY: a statement that is not a read is refused BEFORE it is
+        // compiled, from the text where SQLite starts its next prepare. Refusing
+        // only after next() would be too late: some pragmas act while being
+        // prepared, on both engines (preparing `PRAGMA query_only = 0` disarms
+        // the read-only guard, `PRAGMA locking_mode = EXCLUSIVE` takes effect,
+        // neither needing a step). So only a statement that starts as a SELECT
+        // can start -- SELECT, VALUES or WITH, none of which compiles a pragma
+        // -- reaches prepare. The tail is live here: next() has not yet
+        // reported `done`, the one point after which sql.js frees it.
+        if (readOnlyMode) {
+          const keyword = nextStatementKeyword(iterator.getRemainingSQL());
+          if (keyword !== '' && !READ_STATEMENT_KEYWORDS.has(keyword?.toUpperCase())) {
+            throw readOnlyConsoleRefusal(keyword);
+          }
+        }
+        const step = iterator.next();
+        if (step.done) break;
+        const statement = step.value;
+        // A statement that is a read runs with SQLite refusing every write on
+        // the connection, as the extension's query console does since 1.9.0:
+        // the console stays a read-write console for everything else, except
+        // on a read-only database, where it runs reads only.
+        const runStatement = () => {
+          if (typed.params.length > 0) bindConsoleParams(statement, typed.params);
+          // Zero columns BEFORE the first step is authoritative on sql.js --
+          // sqlite3_column_count is known at prepare time, so it really does
+          // mean DML/DDL. It is NOT authoritative on the native shim, whose
+          // binding exposes no column metadata at all: it recovers the names by
+          // compiling the statement as a TEMP VIEW, which a `PRAGMA ...` or a
+          // `... RETURNING` clause can never be, so those reported zero columns
+          // and this loop threw their rows away without a word. Stepping once
+          // and asking again is the answer that is right on both engines: a
+          // step that produced a row proves the statement HAS columns, and the
+          // DML branch below would have stepped anyway.
+          let headers = statement.getColumnNames();
+          let probed = false;
+          let hasRow = false;
+          if (headers.length === 0) {
+            hasRow = statement.step();
+            probed = true;
+            if (hasRow) headers = statement.getColumnNames();
+          }
+          if (headers.length === 0) {
+            // DML/DDL: run to completion, no result set. Guarded on the probe
+            // above: sqlite3_step on a statement that already returned
+            // SQLITE_DONE auto-resets and RE-RUNS it, so a second step here
+            // would apply the statement twice.
+            if (!probed || hasRow) {
+              while (statement.step()) { /* side effects only */ }
+            }
+          } else {
+            const rows = [];
+            let truncated = false;
+            if (!probed) hasRow = statement.step();
+            while (hasRow) {
+              // Keep stepping past the cap without collecting: a capped
+              // statement may still be mutating rows (e.g. UPDATE ...
+              // RETURNING), so total_changes must reflect the full run,
+              // not just the collected prefix.
+              if (rows.length < maxRows) rows.push(statement.get());
+              else truncated = true;
+              hasRow = statement.step();
+            }
+            collected.push({ headers: headers.map(header => restoreConsoleHeader(header, typed.renames)), rows, truncated });
+          }
+        };
+        try {
+          // Classified from its own first token: the compiled text also holds
+          // the empty `;` statements before it (`SELECT 1;; SELECT 2`), which
+          // isReadStatement does not read as a read, so the read would step
+          // without the boundary.
+          const text = statement.getSQL();
+          const read = isReadStatement(text.slice(statementStart(text)));
+          // Compiled (it starts as a read can) but never stepped: a WITH that
+          // leads into a write. isReadStatement is not the boundary itself --
+          // it can read a write as a read -- query_only is: on a read-only
+          // database it is armed for the whole session, so a misread write
+          // still steps with SQLite refusing it.
+          if (readOnlyMode && !read) throw readOnlyConsoleRefusal(nextStatementKeyword(text), true);
+          if (read) readRefusingWrites(runStatement);
+          else runStatement();
+        } finally {
+          // iterateStatements()'s own next() frees the previous statement
+          // lazily, right before preparing the next one -- but only on the
+          // *next* call to next(). If statement.step() throws above (e.g. a
+          // constraint violation), nothing would ever call next() again and
+          // this statement would leak. Freeing explicitly here closes that
+          // gap. The iterator then "frees" an already-freed statement
+          // (this.stmt reset to NULL) on its own next() call; empirically
+          // (and per the vendored Statement.prototype.free source) that is
+          // a documented no-op -- sqlite3_finalize(NULL) is safe, and the
+          // wrapper's own sentinel guards the JS-level bookkeeping.
+          statement.free();
+        }
+      }
+      if (capped) {
+        // Release the tail without RUNNING it. Draining (rather than just
+        // abandoning the iterator) is what frees its heap copy of the SQL: the
+        // vendored StatementIterator releases that buffer only when it reaches
+        // `done` or a prepare throws, and exposes no return()/close(), so
+        // walking away would leak the script's bytes on every capped run --
+        // i.e. on every EXPLAIN click.
+        //
+        // "Preparing does not execute" is ALMOST true, and the exception is
+        // the whole reason for the guard below: some flag-setting pragmas take
+        // effect at PREPARE time. Verified empirically against this vendored
+        // wasm build -- draining `PRAGMA foreign_keys=ON` and `PRAGMA
+        // query_only=ON` flipped both. `query_only` is the one that matters:
+        // an EXPLAIN over `SELECT ...; PRAGMA query_only=ON;` would render its
+        // plan, honestly report the tail as not executed, and leave the
+        // connection silently write-locked.
+        //
+        // So: if anything in the tail even LOOKS like a pragma, do not drain
+        // it. The trade is deliberate and one-directional -- a false positive
+        // (the word "pragma" inside a string literal or a comment) costs one
+        // leaked SQL buffer for that run and nothing else, while a false
+        // negative would silently reconfigure the connection.
+        const tail = iterator.getRemainingSQL?.() ?? '';
+        if (/\bpragma\b/i.test(tail)) {
+          statementsSkipped = true;
+          return collected;
+        }
+
+        // A prepare error in the tail is swallowed deliberately: those
+        // statements were not run, so their compile errors are not this run's
+        // failure -- an EXPLAIN must still show its plan when a later
+        // statement references a missing table. The iterator frees itself on
+        // that path too (its own catch), so the buffer is released either way.
+        //
+        // Counting statements the drain actually yields is a stricter test
+        // than inspecting leftover SQL text: a tail of nothing but whitespace
+        // or comments yields none, and correctly reports nothing skipped.
+        try {
+          for (;;) {
+            const step = iterator.next();
+            if (step.done) break;
+            statementsSkipped = true;
+            step.value.free();
+          }
+        } catch {
+          statementsSkipped = true;
+        }
+        return collected;
+      }
+
+      // NO leftover-SQL check on natural completion. There used to be one here
+      // and it was unsound on both engines:
+      //
+      //   - sql.js's StatementIterator FREES its heap copy of the script inside
+      //     the very next() call that reports `done`, but leaves its tail
+      //     pointer dangling. getRemainingSQL() afterwards is a use-after-free:
+      //     it decoded whatever byte the allocator had just written there, and
+      //     a fresh worker running `SELECT 1` (no trailing `;`) reliably read
+      //     back a stray 0x10 -- so the guard fired, and the failure path below
+      //     discarded a correct, already-collected result set and reported a
+      //     fabricated error instead.
+      //   - the native shim's tail is a plain string slice, but its cursor does
+      //     not advance past trailing trivia, so `SELECT 1; -- note` left
+      //     "-- note" behind and tripped the guard on a perfectly complete run.
+      //
+      // Nor was it ever meaningful: BOTH iterators report `done` only when
+      // sqlite3_prepare_v2 found no further statement in the tail, so by
+      // construction there is no unexecuted statement left to warn about. The
+      // one case that really did drop SQL -- an embedded NUL, which ends the
+      // string prepare() sees -- is now refused up front, before anything runs,
+      // on both engines. The CAPPED path above still inspects the tail, and is
+      // safe to: it holds a live iterator.
+      return collected;
+    }, cancellationFlag);
+  } catch (error) {
+    // Resolve, don't reject: see the header. The caller gets the failure AND
+    // the mutation metadata for whatever ran before it.
+    //
+    // Duck-typed rather than `instanceof Error`: sql.js errors are constructed
+    // in whatever realm initialized the WASM module, which in the unit-test
+    // harness is not this worker's own realm, so a strict instanceof check
+    // silently misses and double-wraps via String(error). Built BEFORE the
+    // metadata read so a second failure there cannot lose the real one.
+    const message = `statement ${statementIndex}: ${getErrorMessage(error)}`;
+    const metadata = mutationMetadataAfterFailure();
+    return {
+      results: [],
+      error: message,
+      // Computed here rather than guessed by the caller from a `;` scan: the
+      // worker knows how far it actually got, so the renderer's "statements
+      // before the error were applied" note is only shown when statements
+      // really did precede the failure.
+      multiStatement: statementIndex > 1,
+      statementsSkipped,
+      ...metadata
+    };
+  }
+
+  return fitConsoleAnswer({ results, statementsSkipped, ...mutationMetadata() });
+}
+
+/**
+ * The console's answer, cut to what this engine can return. A run writes
+ * before it answers, so an answer the native frame refused would leave its
+ * writes in the session with the host never told the run mutated: no undo
+ * barrier, no unsaved mark. Rows are cut by halves, each cut result set marked
+ * truncated as the row cap marks it, until the answer fits; the mutation
+ * metadata stays whole.
+ */
+function fitConsoleAnswer(answer) {
+  if (!measureEngineReply || !measureEngineReply(answer)) return answer;
+  let keep = Math.max(0, ...answer.results.map(result => result.rows.length));
+  for (;;) {
+    keep = Math.floor(keep / 2);
+    const cut = {
+      ...answer,
+      results: answer.results.map(result => result.rows.length > keep
+        ? { ...result, rows: result.rows.slice(0, keep), truncated: true }
+        : result)
+    };
+    if (keep === 0 || !measureEngineReply(cut)) return cut;
+  }
+}
+
+/**
+ * Export the database to binary.
+ *
+ * @param {string} _name - Database name (ignored, uses 'main')
+ * @returns {Promise<Uint8Array>} Binary database content
+ */
+async function exportDatabase(_name) {
+  if (!db) throw new Error('No database initialized');
+  const writablePaged = storageMode === 'paged' && !readOnlyMode;
+  if (storageMode === 'paged' && readOnlyMode) {
+    throw new Error(
+      'paged databases are read-only snapshots; export() is only available ' +
+      'on openPagedWritable instances'
+    );
+  }
+  const limitError = () => new Error(
+    'Cannot download this page-on-demand database: the merged image would ' +
+    `exceed the ${pagedExportMaxBytes}-byte browser memory limit. Saving ` +
+    'materializes the complete database in memory; use the desktop extension ' +
+    'or reduce the database size.'
+  );
+  if (writablePaged && pagedFileSizeBytes > pagedExportMaxBytes) {
+    throw limitError();
+  }
+
+  // A writable page-on-demand database is never in WAL mode.
+  const walMode = !writablePaged && db.exec('PRAGMA journal_mode')[0]?.values[0]?.[0] === 'wal';
+  let exported;
+  try {
+    exported = db.export();
+    // sql.js exports through the backup API and marks the copy as a
+    // rollback-journal file; download a WAL database in WAL mode, as the
+    // extension's save writes it.
+    if (walMode && exported.length >= 20) {
+      exported[18] = 2;
+      exported[19] = 2;
+    }
+  } catch (error) {
+    const message = getErrorMessage(error);
+    if (writablePaged && /transaction is open|while a transaction/i.test(message)) {
+      throw new Error(
+        'Cannot save while a database transaction is open; retry after the edit completes.',
+        { cause: error }
+      );
+    }
+    throw error;
+  }
+  // Inserts can grow the merged image beyond the snapshotted base size. This
+  // post-check cannot undo the allocation, but it prevents another oversized
+  // transfer/Blob allocation and keeps the external limit exact.
+  if (writablePaged && exported.byteLength > pagedExportMaxBytes) {
+    throw limitError();
+  }
+  return exported;
+}
+
+/**
+ * Export a table to various formats (CSV, JSON, SQL).
+ * The worker RPC is request/response only: it cannot progressively transfer a
+ * download. Keep the honest bounded fallback explicit by refusing a worst-case
+ * source/output estimate above the effective cap, then return small assembly
+ * chunks rather than one monolithic string. 16 MiB is a browser-download-path
+ * policy default, not a physical limit -- hosts that move whole DB images
+ * another way (e.g. the desktop's saveToDisk) may raise it via
+ * exportOptions.maxExportBytes, up to a 1 GiB hard sanity ceiling.
+ *
+ * @param {Object} dbParams - Database parameters with 'table' property
+ * @param {Array<string>} columns - Columns to export
+ * @param {Object} _dbOptions - Database options (unused)
+ * @param {Object} _tableStore - Table store (unused)
+ * @param {Object} exportOptions - Export options including 'format', 'maxExportBytes'
+ * @returns {Promise<Object>} Export result with contentChunks and filename
+ */
+async function exportTable(dbParams, columns, _dbOptions, _tableStore, exportOptions = {}) {
+  if (!db) throw new Error('No database initialized');
+
+  const table = dbParams?.table;
+  if (!table) throw new Error('No table specified');
+
+  const {
+    format = 'csv',
+    header = true,
+    includeTableName = true,
+    rowIds = null,
+    maxExportBytes
+  } = exportOptions;
+  if (!['csv', 'json', 'sql', 'excel'].includes(format)) {
+    throw new Error(`Unsupported export format: ${format}`);
+  }
+  // Any positive integer cap under the hard ceiling is honored; anything else
+  // (omitted, NaN, <= 0, non-integer) falls back to the web demo's own cap.
+  const exportCapBytes = Number.isSafeInteger(maxExportBytes) && maxExportBytes > 0
+    ? Math.min(maxExportBytes, EXPORT_MAX_BYTES_HARD_CEILING)
+    : WEB_DEMO_EXPORT_MAX_BYTES;
+  let predicateChunks = [{ sql: '', params: [] }];
+
+  // Filter by rowIds if specified
+  if (rowIds && rowIds.length > 0) {
+    const identity = await resolveTableIdentity(table);
+    if (rowIds.some(isPrimaryKeyRecordId) && !rowIds.every(isPrimaryKeyRecordId)) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    const seen = new Set();
+    const uniqueRowIds = [];
+    for (const rowId of rowIds) {
+      const normalized = identity.kind === 'rowid' ? validateRowId(rowId) : rowId;
+      const key = String(normalized);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueRowIds.push(normalized);
+    }
+    predicateChunks = buildRecordIdentityPredicateChunks(uniqueRowIds, identity);
+  }
+
+  const requestedColumns = columns && columns.length > 0
+    ? columns
+    : getExportProjectionColumns(table);
+  const selectedColumns = format === 'sql'
+    ? await withoutGeneratedColumns(table, requestedColumns)
+    : requestedColumns;
+  if (selectedColumns.length > SQLITE_MAX_RESULT_COLUMNS) {
+    throw new Error(`Cannot export more than ${SQLITE_MAX_RESULT_COLUMNS} columns`);
+  }
+  const includeBlobBytes = format !== 'csv' && format !== 'excel';
+  // One ASCII envelope per source column stays within SQLite's 2,000-result-
+  // column ceiling while preserving exact INTEGER and raw TEXT/BLOB bytes.
+  const projection = selectedColumns.map((column, index) => {
+    const identifier = escapeIdentifier(column);
+    const storageClass = `typeof(${identifier})`;
+    const byteLength = `octet_length(${identifier})`;
+    return (
+      `CASE ${storageClass} ` +
+      `WHEN 'null' THEN 'n:0:' ` +
+      `WHEN 'integer' THEN 'i:0:' || CAST(${identifier} AS TEXT) ` +
+      `WHEN 'real' THEN 'r:0:' || printf('%!.17g', ${identifier}) ` +
+      `WHEN 'text' THEN 't:' || CAST(${byteLength} AS TEXT) || ':' || ` +
+      `hex(CAST(${identifier} AS BLOB)) ` +
+      `WHEN 'blob' THEN 'b:' || CAST(${byteLength} AS TEXT) || ':' || ` +
+      (includeBlobBytes ? `hex(${identifier}) ` : `'' `) +
+      `END AS ${escapeIdentifier(`__export_cell_${index}`)}`
+    );
+  }).join(', ');
+  const savepointName = createViewSavepointName('sp_export_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  let rawRows = [];
+  try {
+    let estimatedBytes = 1024;
+    for (const predicate of predicateChunks) {
+      const whereSql = predicate.sql ? ` WHERE ${predicate.sql}` : '';
+      estimatedBytes += estimateWebDemoExportBytes(
+        table,
+        selectedColumns,
+        whereSql,
+        predicate.params,
+        format,
+        exportCapBytes
+      );
+      if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes > exportCapBytes) {
+        throw exportLimitError(exportCapBytes);
+      }
+    }
+    for (const predicate of predicateChunks) {
+      const whereSql = predicate.sql ? ` WHERE ${predicate.sql}` : '';
+      const results = readRefusingWrites(() => db.exec(
+        `SELECT ${projection} FROM ${escapeMainIdentifier(table)}${whereSql}`,
+        predicate.params
+      ));
+      if (results.length > 0) {
+        rawRows.push(...results[0].values);
+      }
+    }
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'exportTable');
+    throw error;
+  }
+
+  const headers = selectedColumns;
+  const textEncoding = normalizeCellTextEncoding(
+    db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]
+  );
+  const rows = rawRows.map((row, rowIndex) => {
+    if (row.length !== selectedColumns.length) {
+      throw new Error(
+        `SQLite returned ${row.length} packed export cells for row ${rowIndex}; ` +
+        `expected ${selectedColumns.length}`
+      );
+    }
+    return selectedColumns.map((column, index) => parseWebDemoExportCell(
+      table,
+      column,
+      row[index],
+      includeBlobBytes,
+      textEncoding
+    ));
+  });
+
+  const output = new WebDemoExportChunkCollector(exportCapBytes);
+  let mimeType = 'text/plain';
+  let filename = `${table}.${format}`;
+
+  switch (format) {
+    case 'csv':
+      exportToCsv(headers, rows, header, output);
+      mimeType = 'text/csv';
+      break;
+    case 'json':
+      exportToJson(headers, rows, output);
+      mimeType = 'application/json';
+      break;
+    case 'sql':
+      exportToSql(table, headers, rows, includeTableName, output);
+      mimeType = 'text/sql';
+      break;
+    case 'excel':
+      // For Excel, just use CSV format (Excel can open CSV)
+      exportToCsv(headers, rows, header, output);
+      mimeType = 'text/csv';
+      filename = `${table}.csv`;
+      break;
+  }
+
+  return { contentChunks: output.finish(), filename, mimeType };
+}
+
+/**
+ * @param {number} capBytes - The effective cap in force for this export (the
+ *   web demo's own default, or a host-raised exportOptions.maxExportBytes).
+ */
+function exportLimitError(capBytes) {
+  if (capBytes === WEB_DEMO_EXPORT_MAX_BYTES) {
+    // Verbatim: this is the only wording a browser-hosted web demo caller
+    // ever sees, and "use the desktop extension" is only true for them.
+    return new Error(
+      `Web demo exports are limited to ${WEB_DEMO_EXPORT_LIMIT_DESCRIPTION} because ` +
+      'the worker RPC cannot stream downloads; use the desktop extension for larger exports.'
+    );
+  }
+  const mebibytes = capBytes / (1024 * 1024);
+  return new Error(
+    `Export exceeds the ${mebibytes} MiB (${capBytes} bytes) limit; the worker assembles ` +
+    'the whole file in memory, so larger exports need the native engine.'
+  );
+}
+
+function getExportProjectionColumns(table) {
+  const statement = db.prepare(`SELECT * FROM ${escapeMainIdentifier(table)} LIMIT 0`);
+  try {
+    return statement.getColumnNames();
+  } finally {
+    statement.free();
+  }
+}
+
+// SQLite refuses an INSERT that names a VIRTUAL or STORED generated column, so
+// SQL exports list only the other columns, as sqlite3's .dump does; loading
+// the file recomputes the generated values.
+async function withoutGeneratedColumns(table, columns) {
+  const generated = new Set(
+    (await getTableInfo(table))
+      .filter(column => column.isGenerated)
+      .map(column => foldSqliteIdentifier(column.identifier))
+  );
+  const insertable = columns.filter(column => !generated.has(foldSqliteIdentifier(column)));
+  if (insertable.length === 0) {
+    throw new Error(
+      `Cannot export ${table} as SQL: every selected column is generated, and SQLite ` +
+      'computes generated values itself. Select at least one other column.'
+    );
+  }
+  return insertable;
+}
+
+function decodeWebDemoExportHex(payload, expectedBytes, context) {
+  if (payload.length !== expectedBytes * 2 || /[^0-9a-f]/i.test(payload)) {
+    throw new Error(`SQLite returned invalid packed bytes for ${context}`);
+  }
+  const bytes = new Uint8Array(expectedBytes);
+  for (let index = 0; index < expectedBytes; index++) {
+    bytes[index] = Number.parseInt(payload.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function parseWebDemoExportCell(
+  table,
+  column,
+  packed,
+  includeBlobBytes,
+  textEncoding
+) {
+  const context = `${table}.${column}`;
+  if (typeof packed !== 'string') {
+    throw new Error(`SQLite returned an invalid packed export cell for ${context}`);
+  }
+  const firstSeparator = packed.indexOf(':');
+  const secondSeparator = packed.indexOf(':', firstSeparator + 1);
+  if (firstSeparator !== 1 || secondSeparator < 0) {
+    throw new Error(`SQLite returned malformed packed export metadata for ${context}`);
+  }
+  const storageCode = packed[0];
+  const lengthText = packed.slice(firstSeparator + 1, secondSeparator);
+  if (!/^(?:0|[1-9][0-9]*)$/.test(lengthText)) {
+    throw new Error(`SQLite returned an unsafe byte length for ${context}`);
+  }
+  const byteLength = Number(lengthText);
+  if (!Number.isSafeInteger(byteLength)) {
+    throw new Error(`SQLite returned an unsafe byte length for ${context}`);
+  }
+  const payload = packed.slice(secondSeparator + 1);
+  const storageClass = storageCode === 'n'
+    ? 'null'
+    : storageCode === 'i'
+      ? 'integer'
+      : storageCode === 'r'
+        ? 'real'
+        : storageCode === 't'
+          ? 'text'
+          : storageCode === 'b'
+            ? 'blob'
+            : null;
+  if (!storageClass) {
+    throw new Error(`SQLite returned an invalid storage class for ${context}`);
+  }
+  if (['null', 'integer', 'real'].includes(storageClass) && byteLength !== 0) {
+    throw new Error(`SQLite returned invalid scalar byte metadata for ${context}`);
+  }
+
+  if (storageClass === 'null') {
+    if (payload !== '') throw new Error(`SQLite returned a value for NULL cell ${context}`);
+    return { storageClass, value: null };
+  }
+  if (storageClass === 'integer') {
+    try {
+      if (BigInt(payload).toString() !== payload) throw new Error();
+    } catch {
+      throw new Error(`SQLite returned non-canonical INTEGER text for ${context}`);
+    }
+    return { storageClass, value: payload };
+  }
+  if (storageClass === 'real') {
+    const value = payload === 'Inf'
+      ? Number.POSITIVE_INFINITY
+      : payload === '-Inf'
+        ? Number.NEGATIVE_INFINITY
+        : Number(payload);
+    if (Number.isNaN(value)) {
+      throw new Error(`SQLite returned invalid REAL text for ${context}`);
+    }
+    return { storageClass, value };
+  }
+  if (storageClass === 'blob' && !includeBlobBytes) {
+    if (payload !== '') throw new Error(`SQLite returned unexpected BLOB bytes for ${context}`);
+    return { storageClass, value: null };
+  }
+
+  const bytes = decodeWebDemoExportHex(payload, byteLength, context);
+  if (storageClass === 'blob') return { storageClass, value: bytes };
+  try {
+    return {
+      storageClass,
+      value: createCellTextDecoder(textEncoding).decode(bytes)
+    };
+  } catch {
+    return {
+      storageClass,
+      value: bytes,
+      unrepresentableTextBytes: bytes,
+      textEncoding
+    };
+  }
+}
+
+function buildBalancedSqlSum(expressions) {
+  if (expressions.length === 0) return '0';
+  let level = expressions;
+  while (level.length > 1) {
+    const next = [];
+    for (let index = 0; index < level.length; index += 2) {
+      next.push(index + 1 < level.length
+        ? `(${level[index]} + ${level[index + 1]})`
+        : level[index]);
+    }
+    level = next;
+  }
+  return level[0];
+}
+
+function estimateWebDemoExportBytes(table, columns, whereSql, params, format, capBytes) {
+  // A left-deep `a + b + ...` exceeds SQLite's expression-depth limit on wide
+  // tables. A balanced sum keeps the estimate in one snapshot-consistent scan.
+  const estimateCells = buildBalancedSqlSum(columns.map(column => {
+    const identifier = escapeIdentifier(column);
+    const blobBytes = `length(${identifier})`;
+    const blobEstimate = format === 'csv' || format === 'excel'
+      ? '64'
+      : format === 'json'
+        ? `((${blobBytes} + 2) / 3) * 4 + 64`
+        : `${blobBytes} * 2 + 64`;
+    return `CASE typeof(${identifier}) ` +
+      `WHEN 'text' THEN length(CAST(${identifier} AS BLOB)) * 6 + 64 ` +
+      `WHEN 'blob' THEN ${blobEstimate} ELSE 64 END`;
+  }));
+  const result = db.exec(
+    `SELECT COUNT(*), COALESCE(SUM(${estimateCells}), 0) ` +
+    `FROM ${escapeMainIdentifier(table)}${whereSql}`,
+    params
+  );
+  const row = result[0]?.values?.[0] ?? [0, 0];
+  const rowCount = Number(row[0]);
+  const estimatedBytes = Number(row[1]) + rowCount * 128;
+  if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes < 0) {
+    // Overflow/corruption in the SQL SUM, not a real over-cap estimate -- this
+    // refuses regardless of what cap was requested, but still needs it to
+    // report an accurate limit in the message.
+    throw exportLimitError(capBytes);
+  }
+  return estimatedBytes;
+}
+
+function utf8ByteLength(value) {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xd800 && code <= 0xdbff && index + 1 < value.length) {
+      const low = value.charCodeAt(index + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        bytes += 4;
+        index++;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+class WebDemoExportChunkCollector {
+  constructor(capBytes = WEB_DEMO_EXPORT_MAX_BYTES) {
+    this.chunks = [];
+    this.pending = '';
+    this.outputBytes = 0;
+    this.capBytes = capBytes;
+  }
+
+  append(value) {
+    this.outputBytes += utf8ByteLength(value);
+    if (!Number.isSafeInteger(this.outputBytes) || this.outputBytes > this.capBytes) {
+      throw exportLimitError(this.capBytes);
+    }
+
+    let offset = 0;
+    while (offset < value.length) {
+      let take = Math.min(
+        WEB_DEMO_EXPORT_CHUNK_CHARS - this.pending.length,
+        value.length - offset
+      );
+      const boundary = offset + take;
+      if (
+        boundary < value.length &&
+        take > 0 &&
+        value.charCodeAt(boundary - 1) >= 0xd800 &&
+        value.charCodeAt(boundary - 1) <= 0xdbff &&
+        value.charCodeAt(boundary) >= 0xdc00 &&
+        value.charCodeAt(boundary) <= 0xdfff
+      ) {
+        take--;
+      }
+      if (take === 0) {
+        this.flush();
+        continue;
+      }
+      this.pending += value.slice(offset, offset + take);
+      offset += take;
+      if (this.pending.length >= WEB_DEMO_EXPORT_CHUNK_CHARS) this.flush();
+    }
+  }
+
+  flush() {
+    if (this.pending.length > 0) {
+      this.chunks.push(this.pending);
+      this.pending = '';
+    }
+  }
+
+  finish() {
+    this.flush();
+    return this.chunks;
+  }
+}
+
+/**
+ * Convert data to CSV format.
+ */
+function exportToCsv(headers, rows, includeHeader, output) {
+  let wroteLine = false;
+  const writeLine = cells => {
+    if (wroteLine) output.append('\n');
+    // A record of one empty field is written as "": as a blank line it would
+    // be no record at all to CSV readers at the end of the file, and to many
+    // readers anywhere.
+    output.append(cells.join(',') || '""');
+    wroteLine = true;
+  };
+  if (includeHeader) {
+    writeLine(headers.map(value => encodeCsvExportCell({
+      storageClass: 'text',
+      value
+    })));
+  }
+  for (const row of rows) {
+    writeLine(row.map(encodeCsvExportCell));
+  }
+}
+
+/**
+ * Convert data to JSON format.
+ */
+function exportToJson(headers, rows, output) {
+  output.append('[');
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const row = rows[rowIndex];
+    const obj = Object.create(null);
+    for (let i = 0; i < headers.length; i++) {
+      obj[headers[i]] = row[i];
+    }
+    output.append(rowIndex === 0 ? '\n' : ',\n');
+    const keys = Object.keys(obj);
+    if (keys.length === 0) {
+      output.append('  {}');
+      continue;
+    }
+    output.append('  {\n');
+    keys.forEach((key, keyIndex) => {
+      if (keyIndex > 0) output.append(',\n');
+      output.append(`    ${JSON.stringify(key)}: ${encodeJsonExportCell(obj[key])}`);
+    });
+    output.append('\n  }');
+  }
+  output.append(rows.length === 0 ? ']' : '\n]');
+}
+
+/**
+ * Convert data to SQL INSERT statements.
+ */
+function exportToSql(table, headers, rows, includeTableName, output) {
+  const tableName = includeTableName ? escapeIdentifier(table) : '"table_name"';
+  const columnList = headers.map(escapeIdentifier).join(', ');
+
+  rows.forEach((row, rowIndex) => {
+    const values = row.map(encodeSqlExportCell).join(', ');
+    if (rowIndex > 0) output.append('\n');
+    output.append(`INSERT INTO ${tableName} (${columnList}) VALUES (${values});`);
+  });
+}
+
+async function findTableIdentity(table) {
+  const metadata = db.exec(
+    `SELECT "type", "wr" FROM pragma.pragma_table_list ` +
+    `WHERE "schema" = 'main' AND "name" = ? LIMIT 1`,
+    [table]
+  );
+  if ((metadata[0]?.values.length ?? 0) === 0) return undefined;
+  const kind = classifyTableIdentity(metadata[0].values[0][0], metadata[0].values[0][1]);
+  if (!kind) return undefined;
+  if (kind === 'rowid') return { kind: 'rowid' };
+  const columns = primaryKeyColumnsFromTableInfo(await getTableInfo(table));
+  if (columns.length === 0) {
+    throw new Error(`WITHOUT ROWID table ${table} has no declared primary key`);
+  }
+  return { kind: 'primaryKey', columns };
+}
+
+async function resolveTableIdentity(table) {
+  const identity = await findTableIdentity(table);
+  if (!identity) throw new Error(`Table not found: ${table}`);
+  if (identity.kind === 'rowid') {
+    const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+    if ((authority[0]?.values.length ?? 0) !== 1) {
+      throw new Error(
+        `Table ${table} is read-only because a declared "rowid" column ` +
+        `shadows SQLite's intrinsic row identity`
+      );
+    }
+  }
+  return identity;
+}
+
+function unresolvableTriggeredPrimaryKeyUpdateError(table) {
+  return new Error(
+    `An UPDATE trigger changed or removed the primary-key identity in ${table}; ` +
+    'the edit was rolled back because SQLite Explorer cannot safely identify the resulting row.'
+  );
+}
+
+function readPrimaryKeyRecordId(table, identity, predicate, missingRowError) {
+  const result = db.exec(
+    `SELECT ${buildByteFaithfulPrimaryKeyProjection(identity)} ` +
+    `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+    normalizeBindParams(predicate.params),
+    { useBigInt: true }
+  );
+  const rows = result[0]?.values ?? [];
+  if (rows.length === 0) {
+    throw missingRowError ?? new Error(`Updated row in ${table} no longer exists`);
+  }
+  if (rows.length !== 1) {
+    throw new Error(`Primary-key identity for ${table} matched more than one row`);
+  }
+  return encodeByteFaithfulPrimaryKeyRecordId(
+    identity,
+    rows[0],
+    normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]),
+    `Cannot resolve updated identity in ${table}`
+  );
+}
+
+function readRowIdAliasColumn(table) {
+  const result = db.exec(ROWID_ALIAS_COLUMN_SQL, [table]);
+  return parseRowIdAliasColumn(result[0]?.values ?? [], table);
+}
+
+function buildMainDeleteTriggerProbeSql(table) {
+  return `EXPLAIN DELETE FROM ${escapeMainIdentifier(table)} WHERE 0`;
+}
+
+function assertUpdateHasNoTargetTableTriggerWrites(
+  table,
+  columns,
+  hasIntrinsicRowId = true
+) {
+  const rootPageResult = db.exec(
+    MAIN_TABLE_ROOT_PAGE_SQL,
+    normalizeBindParams([table]),
+    { useBigInt: true }
+  );
+  const rootPage = parseMainTableRootPage(
+    rootPageResult[0]?.values ?? [],
+    table
+  );
+  const result = db.exec(
+    buildUpdateTriggerProbeSql(table, columns, hasIntrinsicRowId),
+    normalizeBindParams(hasIntrinsicRowId ? [0] : []),
+    { useBigInt: true }
+  );
+  assertNoApplicableUpdateTriggerTargetWrites(
+    table,
+    rootPage,
+    result[0]?.values ?? [],
+    hasIntrinsicRowId ? 'rowid' : 'primary-key'
+  );
+}
+
+function assertMutationHasNoUntrackedPrograms(operation, table, columns = []) {
+  const sql = operation === 'INSERT'
+    ? buildInsertTriggerProbeSql(table, columns)
+    : buildMainDeleteTriggerProbeSql(table);
+  const result = db.exec(sql, [], { useBigInt: true });
+  assertNoUntrackedMutationPrograms(operation, table, result[0]?.values ?? []);
+}
+
+function readUpdatedRowId(
+  table,
+  aliasColumn,
+  previousRowId,
+  updatedColumn,
+  updatedValue
+) {
+  const aliasWasUpdated = aliasColumn !== undefined
+    && updatedColumn !== undefined
+    && sqliteIdentifiersEqual(aliasColumn, updatedColumn);
+  const predicateColumn = aliasWasUpdated ? escapeIdentifier(aliasColumn) : 'rowid';
+  const candidate = aliasWasUpdated ? updatedValue : previousRowId;
+  const result = db.exec(
+    `SELECT CAST(rowid AS TEXT) FROM ${escapeMainIdentifier(table)} ` +
+    `WHERE ${predicateColumn} = ? LIMIT 2`,
+    normalizeBindParams([candidate ?? null]),
+    { useBigInt: true }
+  );
+  const rows = result[0]?.values ?? [];
+  if (rows.length === 0) throw unresolvableTriggeredRowIdUpdateError(table);
+  if (rows.length !== 1) {
+    throw new Error(`Rowid identity for ${table} matched more than one row`);
+  }
+  return validateRowId(rows[0][0]);
+}
+
+function applyJsonPatchValue(currentValue, patch) {
+  const patchText = typeof patch === 'string' ? patch : JSON.stringify(patch);
+  const value = db.exec(
+    `SELECT json_patch(COALESCE(?, '{}'), ?)`,
+    normalizeBindParams([currentValue, patchText])
+  )[0]?.values?.[0]?.[0];
+  if (typeof value !== 'string') {
+    throw new Error('SQLite returned an invalid json_patch result');
+  }
+  return value;
+}
+
+function updateRowIdAliasCellBatchWithinSavepoint(
+  table,
+  aliasColumn,
+  updates,
+  editLimitBytes,
+  isHistoryReplay
+) {
+  const textEncoding = getCellTextEncoding();
+  const updatesByRow = new Map();
+  for (const update of updates) {
+    const rowId = validateRowId(update.rowId);
+    const rowUpdates = updatesByRow.get(rowId) ?? [];
+    rowUpdates.push({ ...update, rowId });
+    updatesByRow.set(rowId, rowUpdates);
+  }
+
+  const results = [];
+  for (const [rowId, rowUpdates] of updatesByRow) {
+    const columns = [...new Set(rowUpdates.map(update => update.column))];
+    if (columns.length !== rowUpdates.length) {
+      throw new Error(`Batch update for ${table} contains the same column more than once`);
+    }
+    const current = db.exec(
+      `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+      `FROM ${escapeMainIdentifier(table)} WHERE rowid = ? LIMIT 2`,
+      normalizeBindParams([rowId]),
+      { useBigInt: true }
+    )[0];
+    if ((current?.values.length ?? 0) !== 1) {
+      throw new Error(`Cannot update ${table}: row identity no longer exists`);
+    }
+
+    const preparedUpdates = rowUpdates.map((update, index) => {
+      const priorState = parseStoredCellState(
+        current.values[0][index * 2],
+        current.values[0][index * 2 + 1],
+        `${table}.${update.column}`,
+        { textEncoding }
+      );
+      const priorValue = priorState.value;
+      const prepared = prepareCellUpdateForStorage(
+        update.value,
+        priorValue,
+        update.operation ?? 'set'
+      );
+      const storedValue = prepared.operation === 'json_patch'
+        ? applyJsonPatchValue(priorValue, prepared.value)
+        : prepared.value;
+      if (!isHistoryReplay && prepared.operation === 'json_patch') {
+        assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+      }
+      return { update, priorValue, priorState, prepared, storedValue };
+    });
+    let newRowId = rowId;
+    for (const preparedUpdate of preparedUpdates) {
+      const escapedColumn = escapeIdentifier(preparedUpdate.update.column);
+      const useNativePatch = preparedUpdate.prepared.operation === 'json_patch';
+      const storedBindValue = useNativePatch
+        ? (typeof preparedUpdate.prepared.value === 'string'
+            ? preparedUpdate.prepared.value
+            : JSON.stringify(preparedUpdate.prepared.value))
+        : preparedUpdate.storedValue;
+      const expression = useNativePatch
+        ? `json_patch(COALESCE(${escapedColumn}, '{}'), ?)`
+        : bindPlaceholder(preparedUpdate.storedValue);
+      db.run(
+        `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${expression} ` +
+        'WHERE rowid = ?',
+        normalizeBindParams([storedBindValue, newRowId])
+      );
+      const changes = db.exec('SELECT changes()')[0]?.values?.[0]?.[0];
+      if (changes !== 1) {
+        throw new Error(`Cannot update ${table}: row identity no longer exists`);
+      }
+      newRowId = readUpdatedRowId(
+        table,
+        aliasColumn,
+        newRowId,
+        preparedUpdate.update.column,
+        preparedUpdate.storedValue
+      );
+    }
+    const post = db.exec(
+      `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+      `FROM ${escapeMainIdentifier(table)} WHERE rowid = ? LIMIT 2`,
+      normalizeBindParams([newRowId]),
+      { useBigInt: true }
+    )[0];
+    if ((post?.values.length ?? 0) !== 1) {
+      throw unresolvableTriggeredRowIdUpdateError(table);
+    }
+    for (const [index, preparedUpdate] of preparedUpdates.entries()) {
+      results.push({
+        rowId,
+        newRowId,
+        columnName: preparedUpdate.update.column,
+        priorValue: preparedUpdate.priorValue,
+        newValue: preparedUpdate.prepared.value,
+        priorState: preparedUpdate.priorState,
+        postState: parseStoredCellState(
+          post.values[0][index * 2],
+          post.values[0][index * 2 + 1],
+          `${table}.${preparedUpdate.update.column}`,
+          { textEncoding }
+        ),
+        operation: preparedUpdate.prepared.operation
+      });
+    }
+  }
+  return results;
+}
+
+/**
+ * Fetch table data with pagination and filtering.
+ *
+ * @param {string} table - Table name
+ * @param {Object} options - Query options
+ * @returns {Promise<Object>} Result set with headers and rows
+ */
+async function fetchTableData(table, options = {}) {
+  if (!db) throw new Error('No database initialized');
+
+  options = normalizeTablePageOptions(options, 1000);
+
+  const {
+    columns = null,
+    offset,
+    limit,
+    orderBy = null,
+    orderDir = 'ASC',
+    filters = [],
+    globalFilter = '',
+    globalFilterColumns = null
+  } = options;
+
+  let projectionColumns = columns;
+  let effectiveOrderBy = orderBy;
+  let identityOrderBy = null;
+  let primaryKeyContext;
+  let tableIdentity;
+  let isRowIdTable = false;
+  let rowIdTableType;
+  if (columns?.[0]?.toLowerCase() === 'rowid') {
+    tableIdentity = await findTableIdentity(table);
+    if (tableIdentity?.kind === 'primaryKey') {
+      const identity = tableIdentity;
+      const visibleColumns = columns.slice(1);
+      const hiddenPrimaryKeyColumns = identity.columns
+        .map(column => column.identifier)
+        .filter(column => !visibleColumns.includes(column));
+      projectionColumns = [...visibleColumns, ...hiddenPrimaryKeyColumns];
+      primaryKeyContext = { identity, visibleColumns };
+      if (ordersBySyntheticRowId({ ...options, columns })) {
+        effectiveOrderBy = null;
+        identityOrderBy = identity.columns.map(column => column.identifier);
+      }
+    } else if (tableIdentity?.kind === 'rowid') {
+      // Keyset seeks and anchors require an unshadowed intrinsic rowid; a
+      // declared rowid/_rowid_/oid column would make "rowid" nullable,
+      // non-unique table data. The demo owns a private in-memory database,
+      // so this early read matches the fetch below.
+      const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+      isRowIdTable = (authority[0]?.values.length ?? 0) > 0;
+      rowIdTableType = authority[0]?.values[0]?.[0];
+    }
+  }
+  const keysetIdentity = tableIdentity?.kind === 'primaryKey'
+    ? tableIdentity
+    : (isRowIdTable ? tableIdentity : undefined);
+  const keysetKey = computeKeysetKey(options, keysetIdentity);
+  const keysetTag = keysetKey ? computeKeysetQueryTag(table, options) : undefined;
+  const keysetPlan = keysetKey ? resolveKeysetPlan(table, options, keysetIdentity) : undefined;
+
+  const splitSyntheticRowId = isRowIdTable
+    && projectionColumns?.[0]?.toLowerCase() === 'rowid'
+    && projectionColumns.length > SQLITE_MAX_RESULT_COLUMNS;
+  const valueProjectionColumns = splitSyntheticRowId
+    ? projectionColumns.slice(1)
+    : projectionColumns;
+
+  // Build column list - if columns specified, use them; otherwise SELECT *
+  let columnList;
+  if (valueProjectionColumns && valueProjectionColumns.length > 0) {
+    // INTEGER PRIMARY KEY aliases make an unaliased rowid project as the PK's
+    // name too. Give the synthetic identity its own name so the native shim can
+    // obtain all columns before stepping a parameterized (filtered) page.
+    columnList = valueProjectionColumns.map((column, index) =>
+      isRowIdTable && index === 0 && column.toLowerCase() === 'rowid'
+        ? `${escapeIdentifier(column)} AS ${escapeIdentifier('rowid')}`
+        : escapeIdentifier(column)
+    ).join(', ');
+  } else {
+    columnList = '*';
+  }
+
+  // Build WHERE clause from filters array and globalFilter
+  const { conditions: whereClauses, params: filterParams } = buildDemoFilterConditions(
+    filters, globalFilter, columns, globalFilterColumns
+  );
+  let params;
+
+  const buildPageQuery = (selectListSql, rowIdLookupSelectListSql) => {
+    if (keysetPlan) {
+      // Validated seek: the shared assembly owns WHERE, ORDER BY, and LIMIT so
+      // this worker cannot drift from the extension engines. Any invalid or
+      // stale request resolved to no plan and takes the unchanged path below.
+      return assembleKeysetSelect({
+        selectListSql,
+        escapedTable: escapeMainIdentifier(table),
+        whereClauses,
+        filterParams,
+        plan: keysetPlan,
+        rowIdLookupSelectListSql
+      });
+    }
+
+    const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
+    let querySql = `SELECT ${selectListSql} FROM ${escapeMainIdentifier(table)}${whereSql}`;
+
+    // Add ordering. One total order for both paths: an anchorable query's
+    // OFFSET fallback adopts the exact keyset ORDER BY (full key columns,
+    // key direction) so keyset and OFFSET pages interleave in one session
+    // without skips or duplicates. keysetKey is gated on the early authority
+    // read above, so shadowed-rowid tables and views keep the pre-keyset SQL
+    // byte-identical.
+    const fallbackOrder = keysetFallbackOrder(keysetKey, keysetPlan);
+    const orderedColumns = fallbackOrder
+      ? fallbackOrder.orderByColumns
+      : (identityOrderBy ?? (effectiveOrderBy ? [effectiveOrderBy] : []));
+    const direction = fallbackOrder
+      ? fallbackOrder.orderDir
+      : (orderDir === 'DESC' ? 'DESC' : 'ASC');
+    const pageSql = ` LIMIT ${parseInt(limit, 10)} OFFSET ${parseInt(offset, 10)}`;
+    if (rowIdLookupSelectListSql !== undefined && rowIdLookupApplies(orderedColumns)) {
+      return {
+        sql: buildRowIdLookupSelect({
+          selectListSql: rowIdLookupSelectListSql,
+          escapedTable: escapeMainIdentifier(table),
+          whereSql,
+          keyColumns: orderedColumns,
+          innerDirection: direction,
+          outerDirection: direction,
+          pageSql
+        }),
+        params: filterParams
+      };
+    }
+    if (orderedColumns.length > 0) {
+      // Key members order under their key collations, as in buildSelectQuery.
+      const keyCollations = primaryKeyCollations(tableIdentity);
+      querySql += ` ORDER BY ${orderedColumns
+        .map(column => `${keyColumnOrderSql(column, keyCollations.get(column))} ${direction}`)
+        .join(', ')}`;
+    }
+
+    // Add pagination
+    querySql += pageSql;
+    return { sql: querySql, params: filterParams };
+  };
+  // An ordinary rowid table's sorted page sorts only its keys and reads its
+  // rows by rowid, as the extension's engines do (buildRowIdLookupSelect).
+  // A virtual table need not serve rowid IN without a scan.
+  const rowIdLookup = isRowIdTable && rowIdTableType !== 'virtual';
+  const lookupColumn = column => `${ROW_ID_LOOKUP_ROW}.${escapeIdentifier(column)}`;
+  const lookupColumnList = !rowIdLookup ? undefined
+    : columnList === '*' ? `${ROW_ID_LOOKUP_ROW}.*`
+      : valueProjectionColumns.map(lookupColumn).join(', ');
+  const { sql, params: pageParams } = buildPageQuery(columnList, lookupColumnList);
+  params = pageParams;
+  const rowIdQuery = splitSyntheticRowId
+    ? buildPageQuery(escapeIdentifier('rowid'), rowIdLookup ? lookupColumn('rowid') : undefined)
+    : undefined;
+
+  const sourceStatement = db.prepare(sql, params);
+  const valueHeaders = sourceStatement.getColumnNames();
+  const headers = splitSyntheticRowId ? ['rowid', ...valueHeaders] : valueHeaders;
+  sourceStatement.free();
+  const requestedCellLimit = Number.isSafeInteger(options.maxInlineCellBytes)
+    && options.maxInlineCellBytes > 0
+    ? options.maxInlineCellBytes
+    : DEFAULT_MAX_INLINE_CELL_BYTES;
+  const requestedPageLimit = Number.isSafeInteger(options.maxPageResponseBytes)
+    && options.maxPageResponseBytes > 0
+    ? options.maxPageResponseBytes
+    : DEFAULT_MAX_PAGE_RESPONSE_BYTES;
+  const containmentOptions = {
+    limit: parseInt(limit, 10),
+    maxInlineCellBytes: Math.min(DEFAULT_MAX_INLINE_CELL_BYTES, requestedCellLimit),
+    maxPageResponseBytes: Math.min(DEFAULT_MAX_PAGE_RESPONSE_BYTES, requestedPageLimit)
+  };
+  const primaryKeyColumnIndices = primaryKeyContext
+    ? primaryKeyContext.identity.columns.map(column => {
+        const index = headers.indexOf(column.identifier);
+        if (index < 0) {
+          throw new Error(`Primary-key column missing from table fetch: ${column.identifier}`);
+        }
+        return index;
+      })
+    : [];
+  const keysetColumnIndices = keysetKey
+    ? keysetKey.keyColumns
+        .map(column => headers.indexOf(column))
+        .filter(index => index >= 0)
+    : [];
+  const identityRawTextColumnIndices = [
+    ...new Set([...primaryKeyColumnIndices, ...keysetColumnIndices])
+  ];
+  const identityContainmentRawTextColumnIndices = splitSyntheticRowId
+    ? identityRawTextColumnIndices
+        .filter(index => index > 0)
+        .map(index => index - 1)
+    : identityRawTextColumnIndices;
+  const containmentRawTextColumnIndices =
+    valueHeaders.length * 2 + 1 <= SQLITE_MAX_RESULT_COLUMNS
+      ? valueHeaders.map((_, index) => index)
+      : identityContainmentRawTextColumnIndices;
+  const textEncoding = containmentRawTextColumnIndices.length > 0
+    ? getCellTextEncoding()
+    : undefined;
+  const containmentQuery = buildCellContainmentQuery(
+    sql,
+    valueHeaders.length,
+    containmentOptions,
+    containmentRawTextColumnIndices,
+    cellHelpersApply(textEncoding) ? 'checked' : 'blob',
+    true,
+    true
+  );
+  const transportQuery = containmentQuery.numericTransport;
+  // Pages and counts run under the query deadline, as every read does on the
+  // extension's engines since 1.9.0: a view that never finishes fails with a
+  // timeout instead of holding the engine.
+  const results = readRefusingWrites(() => executeWithProgressHandler(
+    () => db.exec(transportQuery.sql, params, { useBigInt: true })
+  ));
+  const valueSourceRows = mergeCellContainmentMetadataRows(
+    results[0]?.values ?? [],
+    undefined,
+    containmentQuery
+  );
+  const rowIdResults = rowIdQuery
+    ? readRefusingWrites(() => executeWithProgressHandler(
+        () => db.exec(rowIdQuery.sql, rowIdQuery.params, { useBigInt: true })
+      ))
+    : undefined;
+  const rowIdRows = rowIdResults?.[0]?.values;
+  if (rowIdRows && rowIdRows.length !== valueSourceRows.length) {
+    throw new Error('Synthetic rowid companion row count does not match the value page');
+  }
+  const sourceRows = rowIdRows
+    ? rowIdRows.map((row, rowIndex) => {
+        if (row.length !== 1) {
+          throw new Error(`Synthetic rowid companion row ${rowIndex} is not one value`);
+        }
+        return [row[0], ...valueSourceRows[rowIndex]];
+      })
+    : valueSourceRows;
+  const companionResults = [];
+  const hasRowIdShape = headers[0]?.toLowerCase() === 'rowid';
+  const needsExactRowIdIdentity = hasRowIdShape
+    && hasUnsafeBigIntAtColumn(sourceRows, 0);
+  const needsRowIdCompanions = transportQuery.valueColumnCount === undefined
+    && hasRowIdShape;
+  // The demo owns a private in-memory database, so no external process can
+  // commit between the source read and this authority/companion work. The
+  // early keyset-eligibility read above may have settled isRowIdTable already.
+  if (
+    !isRowIdTable
+    && (needsRowIdCompanions || needsExactRowIdIdentity)
+    && sourceRows.length > 0
+  ) {
+    const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+    isRowIdTable = (authority[0]?.values.length ?? 0) > 0;
+  }
+  if (isRowIdTable && needsRowIdCompanions) {
+    for (const query of buildRowIdExactRealTextQueries(
+      table,
+      headers,
+      sourceRows.map(row => row[0])
+    )) {
+      const result = readRefusingWrites(() => executeWithProgressHandler(
+        () => db.exec(query.sql, query.params, { useBigInt: true })
+      ));
+      companionResults.push({ query, rows: result[0]?.values ?? [] });
+    }
+  }
+  const companionExactTexts = collectRowIdExactRealTexts(sourceRows, companionResults);
+  const normalized = normalizeIntegerRowsForTransport(
+    valueSourceRows,
+    transportQuery.valueColumnCount,
+    splitSyntheticRowId ? undefined : companionExactTexts,
+    !splitSyntheticRowId && isRowIdTable && needsExactRowIdIdentity ? 0 : undefined,
+    transportQuery.realTextColumnCount,
+    transportQuery.packedRealTextColumnCount
+  );
+  // From here on the page is contained (containForEngine): its values within
+  // valueWire, the identity column it gains after them within pageWire.
+  return containForEngine((valueWire, pageWire, cut, reservedAnchors) => {
+    const valueContained = decodeCellContainment(
+      normalized.rows,
+      valueHeaders.length,
+      normalized.exactIntegerTexts,
+      containmentOptions.maxPageResponseBytes,
+      containmentQuery.metadataMayBeNull,
+      valueWire
+    );
+    const decodedContained = rowIdRows
+      ? prependCellContainmentColumn(
+          normalizeIntegerRowsForTransport(
+            rowIdRows,
+            undefined,
+            undefined,
+            needsExactRowIdIdentity ? 0 : undefined
+          ).rows.map(row => row[0]),
+          valueContained,
+          companionExactTexts
+        )
+      : valueContained;
+    if (cut) cut.values = emptiedValueCells(decodedContained);
+    const rawTextRows = decodeRawTextColumns(normalized.rows, containmentQuery);
+    const sourceRawTextColumnIndices = splitSyntheticRowId
+      ? containmentQuery.rawTextColumnIndices.map(index => index + 1)
+      : containmentQuery.rawTextColumnIndices;
+    const contained = textEncoding
+      ? containUnrepresentableTextCells({
+          sourceRows,
+          rawTextRows,
+          rawTextColumnIndices: sourceRawTextColumnIndices,
+          textEncoding,
+          contained: decodedContained,
+          decodedWithinBudget: !rowIdRows,
+          // Prefixes within the values' budget, the page within its own: an
+          // oversized entry the pass must add may take what the values left
+          // the identity steps, which then check what remains.
+          wire: valueWire,
+          fitWire: pageWire
+        })
+      : decodedContained;
+    const { rows, oversizedCells, exactIntegerTexts } = contained;
+    const shadowedRowId = tableIdentity?.kind === 'rowid'
+      && hasRowIdShape
+      && !isRowIdTable
+      ? remapShadowedRowIdContainment({
+          rows,
+          oversizedCells,
+          exactIntegerTexts,
+          rowOffset: parseInt(offset, 10),
+          wire: pageWire
+        })
+      : undefined;
+    const remapped = primaryKeyContext && textEncoding
+      // A frame round may cut key cells for room (remapGivingWayKeys); the
+      // webview pass stays as the WebAssembly worker contains it.
+      ? (pageWire === WEBVIEW_CELL_WIRE ? remapPrimaryKeyContainment : remapGivingWayKeys)({
+          identity: primaryKeyContext.identity,
+          sourceColumns: headers,
+          visibleColumnCount: primaryKeyContext.visibleColumns.length,
+          identityRows: sourceRows,
+          rawTextBytes: rawTextRows,
+          rawTextColumnIndices: sourceRawTextColumnIndices,
+          rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable,
+          textEncoding,
+          rows,
+          oversizedCells,
+          exactIntegerTexts,
+          effectiveInlineCellBytes: containmentQuery.effectiveInlineCellBytes,
+          rowOffset: parseInt(offset, 10),
+          wire: pageWire
+        })
+      : undefined;
+    const unrepresentableKeysetTextRows = keysetKey && textEncoding
+      ? findUnrepresentableTextRows({
+          sourceRows,
+          sourceColumnIndices: keysetColumnIndices,
+          rawTextRows,
+          rawTextColumnIndices: sourceRawTextColumnIndices,
+          textEncoding,
+          rawTextValidationUnavailable: containmentQuery.rawTextValidationUnavailable
+        })
+      : undefined;
+    // Anchors come from the exact source rows (BigInt-preserving, display order)
+    // so every OFFSET or keyset page re-anchors itself.
+    const mintAnchors = (clippedCells) => mintKeysetAnchors({
+      tag: keysetTag,
+      key: keysetKey,
+      projectionColumns: headers,
+      rows: sourceRows,
+      oversizedCells: clippedCells,
+      excludedRowIndices: unrepresentableKeysetTextRows
+    });
+    let keysetAnchors = keysetKey && keysetTag !== undefined ? mintAnchors(oversizedCells) : undefined;
+    // A frame round cuts cells for the reply's room, a boundary row's key cell
+    // among them, and that row then minted no anchor: the next page fell back
+    // to OFFSET. Its source row still holds the whole key; only a cell past
+    // effectiveInlineCellBytes is a SQL prefix there (cell-containment.ts
+    // remapPrimaryKeyContainment tells them apart the same way), and
+    // unrepresentable TEXT stays excluded above. Such anchors are kept when
+    // the round's budget left room for as many anchor bytes, so that no
+    // answer's cells change for them.
+    if (reservedAnchors && (keysetAnchors?.first === undefined || keysetAnchors?.last === undefined)
+      && keysetTag !== undefined && keysetKey && oversizedCells) {
+      const clippedBySql = {};
+      for (const rowIndex of [0, sourceRows.length - 1]) {
+        for (const [columnIndex, metadata] of Object.entries(oversizedCells[rowIndex] ?? {})) {
+          if (metadata.byteLength > containmentQuery.effectiveInlineCellBytes) {
+            (clippedBySql[rowIndex] ??= {})[columnIndex] = metadata;
+          }
+        }
+      }
+      const roomAnchors = mintAnchors(clippedBySql);
+      if (roomAnchors && JSON.stringify(roomAnchors).length <= JSON.stringify(reservedAnchors).length) {
+        keysetAnchors = roomAnchors;
+      }
+    }
+    if (primaryKeyContext && remapped) {
+      return {
+        headers: ['rowid', ...primaryKeyContext.visibleColumns],
+        rows: remapped.rows,
+        exactIntegerTexts: remapped.exactIntegerTexts,
+        ...(remapped.oversizedCells ? { oversizedCells: remapped.oversizedCells } : {}),
+        ...(remapped.readOnlyRowReasons
+          ? { readOnlyRowReasons: remapped.readOnlyRowReasons }
+          : {}),
+        ...(keysetAnchors ? { keysetAnchors } : {})
+      };
+    }
+    return {
+      headers,
+      rows: shadowedRowId?.rows ?? rows,
+      exactIntegerTexts: shadowedRowId
+        ? shadowedRowId.exactIntegerTexts
+        : exactIntegerTexts,
+      ...((shadowedRowId ? shadowedRowId.oversizedCells : oversizedCells)
+        ? { oversizedCells: shadowedRowId ? shadowedRowId.oversizedCells : oversizedCells }
+        : {}),
+      ...(shadowedRowId?.readOnlyRowReasons
+        ? { readOnlyRowReasons: shadowedRowId.readOnlyRowReasons }
+        : {}),
+      ...(keysetAnchors ? { keysetAnchors } : {})
+    };
+  }, headers);
+}
+
+/**
+ * What the containment steps answer when a page does not fit the transport
+ * (src/core/cell-containment.ts: the value decode, the raw-TEXT pass and the
+ * identity remaps all say it so); pinned by cell_containment_wire.test.ts.
+ */
+const CONTAINMENT_TRANSPORT_REFUSAL = /containment cannot fit this page within the \d+-byte transport limit/;
+const MAX_CONTAINMENT_ATTEMPTS = 4;
+
+/** The key of the offer native-host.js sendGuarded takes up (offerFrameContainment). */
+const CONTAIN_AGAIN = Symbol.for('sqlite-explorer.contain-again');
+/** The reply envelope beside a page answer: its keys, and the longest messageId as six-byte units. */
+const FRAME_ENVELOPE_BYTES = 2048;
+
+/**
+ * A page answer contained as the WebAssembly worker contains it (the webview
+ * model: a string at its UTF-8 bytes, within 32 MiB), which is what every
+ * page on both engines was until a page could not fit the native frame, and
+ * is still the answer for every page that does: costing a string as the frame
+ * writes it means reading every character, a fifth of an ordinary page's
+ * time. On the native engine the answer carries an offer to contain it again
+ * against the frame, which native-host.js sendGuarded takes up only when the
+ * frame comes out over its cap; a page the webview model refuses goes to the
+ * frame at once.
+ *
+ * @param {(valueWire: object, pageWire: object, cut?: object, reservedAnchors?: object) => object} containPage
+ *   contains the fetched page: its values (the decode and the raw-TEXT pass)
+ *   within `valueWire`, the identity column it gains after them within
+ *   `pageWire`. It must not change its inputs, since it may run again. When
+ *   given `cut` (containWithinFrame), it records there, once the decode has
+ *   answered and before a later step runs, how many value cells the decode
+ *   emptied (`values`, by emptiedValueCells); a refusal with none recorded
+ *   is the values' own. `reservedAnchors`, from the same caller, are the
+ *   keyset anchors the frame budget left room for.
+ * @param {string[]} headers the page's column names, which share the frame
+ */
+function containForEngine(containPage, headers) {
+  if (frameCellWire === null) return containPage(WEBVIEW_CELL_WIRE, WEBVIEW_CELL_WIRE);
+  let answer;
+  let valueLimit = null;
+  try {
+    answer = containPage(WEBVIEW_CELL_WIRE, WEBVIEW_CELL_WIRE);
+  } catch (error) {
+    if (!CONTAINMENT_TRANSPORT_REFUSAL.test(getErrorMessage(error))) throw error;
+    valueLimit = frameValueLimit({ headers }, frameCellWire.limitBytes);
+    answer = containWithinFrame(containPage, valueLimit);
+  }
+  return offerFrameContainment(answer, containPage, valueLimit);
+}
+
+/**
+ * Attach to `answer` (non-enumerable, so it never reaches the wire) the
+ * offer native-host.js sendGuarded calls with the size the frame measured and
+ * its limit. `valueLimit` is what the answer was contained in against the
+ * frame, null when it was contained as the WebAssembly worker contains it:
+ * then the first round gives the cells all of the frame but what the headers,
+ * the keyset anchors and the envelope take; every later round gives them less
+ * than the last round did and than its cells measured.
+ *
+ * The offer holds no reference back to the answer or to itself: such a cycle
+ * outlives the reply until the engine's cycle collector runs, holding the
+ * page's source rows with it, which cost an ordinary native page 2-3% of its
+ * time.
+ */
+function offerFrameContainment(answer, containPage, valueLimit) {
+  const { headers, keysetAnchors } = answer;
+  return Object.defineProperty(answer, CONTAIN_AGAIN, {
+    value: (frameBytes, limitBytes) => {
+      const firstLimit = frameValueLimit({ headers, keysetAnchors }, limitBytes);
+      // After a round that did not fit: less than both its budget and what
+      // its cells measured, by the excess and by an eighth of the frame at
+      // least, since a budget the cells did not fill to the byte (cells of a
+      // megabyte each, or a count short of the codec's) would otherwise
+      // return the same page.
+      const nextLimit = valueLimit === null
+        ? firstLimit
+        : Math.min(valueLimit, frameBytes - (limitBytes - firstLimit))
+          - Math.max(frameBytes - limitBytes + FRAME_ENVELOPE_BYTES, Math.floor(limitBytes / 8));
+      return offerFrameContainment(containWithinFrame(containPage, nextLimit, keysetAnchors), containPage, nextLimit);
+    }
+  });
+}
+
+/** The cells of a contained page's values that their oversized entries show empty. */
+function emptiedValueCells(contained) {
+  let emptied = 0;
+  for (const [rowIndex, cells] of Object.entries(contained.oversizedCells ?? {})) {
+    for (const columnIndex of Object.keys(cells)) {
+      if (contained.rows[rowIndex][columnIndex].length === 0) emptied++;
+    }
+  }
+  return emptied;
+}
+
+/**
+ * remapPrimaryKeyContainment on a frame round. When read-only identities for
+ * every row still leave the page past its limit, the keys themselves filled
+ * the room the values left: a control character costs six bytes in the
+ * frame, and an editable identity repeats its key. Rows from the tail then
+ * give up their key cells too, cut for the reply's room (an oversized entry
+ * within the inline limit, which remapPrimaryKeyContainment makes read-only
+ * and names so), and the rows before them keep both key and identity and
+ * stay editable: as many as fit, found by halving, each try the remap
+ * itself. Every row is returned (grid-data.js takes a short first page as
+ * the row count and a short keyset page as the end); a page that does not
+ * fit with every key cut is refused as before.
+ */
+function remapGivingWayKeys(input) {
+  let refusal;
+  try {
+    return remapPrimaryKeyContainment(input);
+  } catch (error) {
+    if (!CONTAINMENT_TRANSPORT_REFUSAL.test(getErrorMessage(error))) throw error;
+    refusal = error;
+  }
+  const keyColumns = input.identity.columns.map(column => input.sourceColumns.indexOf(column.identifier));
+  // A whole TEXT or BLOB key cell; one with an entry already is a prefix,
+  // and its row read-only.
+  const cuttable = (rowIndex, columnIndex) => {
+    const value = input.rows[rowIndex][columnIndex];
+    return (typeof value === 'string' || value instanceof Uint8Array) && value.length > 0
+      && !input.oversizedCells?.[rowIndex]?.[columnIndex];
+  };
+  if (!input.rows.some((_row, rowIndex) => keyColumns.some(columnIndex => cuttable(rowIndex, columnIndex)))) {
+    throw refusal;
+  }
+  // The remapped page with the key cells of rows `from` on cut, or
+  // undefined when it still does not fit.
+  // A cut TEXT key is named by its stored length where its stored bytes
+  // were projected (a UTF-16 database's differ from the string's UTF-8);
+  // a verified slot is plain UTF-8, whose string is its stored bytes.
+  const rawSlots = keyColumns.map(columnIndex => input.rawTextColumnIndices.indexOf(columnIndex));
+  const remapCutFrom = (from) => {
+    const rows = input.rows.slice();
+    const oversizedCells = { ...input.oversizedCells };
+    for (let rowIndex = from; rowIndex < rows.length; rowIndex++) {
+      keyColumns.forEach((columnIndex, keyIndex) => {
+        if (!cuttable(rowIndex, columnIndex)) return;
+        const value = rows[rowIndex][columnIndex];
+        const text = typeof value === 'string';
+        const rawBytes = rawSlots[keyIndex] >= 0 ? input.rawTextBytes[rowIndex]?.[rawSlots[keyIndex]] : undefined;
+        if (rows[rowIndex] === input.rows[rowIndex]) rows[rowIndex] = rows[rowIndex].slice();
+        rows[rowIndex][columnIndex] = text ? '' : new Uint8Array(0);
+        oversizedCells[rowIndex] = {
+          ...oversizedCells[rowIndex],
+          [columnIndex]: {
+            storageClass: text ? 'text' : 'blob',
+            byteLength: !text ? value.byteLength : rawBytes instanceof Uint8Array ? rawBytes.byteLength : utf8ByteLength(value)
+          }
+        };
+      });
+    }
+    try {
+      return remapPrimaryKeyContainment({ ...input, rows, oversizedCells });
+    } catch (error) {
+      if (!CONTAINMENT_TRANSPORT_REFUSAL.test(getErrorMessage(error))) throw error;
+      return undefined;
+    }
+  };
+  // The rows editable with room enough; a page that has to downgrade one of
+  // them before `from` (the remap does so from the tail) kept too many keys.
+  const withRoom = remapPrimaryKeyContainment({ ...input, wire: { ...input.wire, limitBytes: Infinity } });
+  const editable = (page, from) => {
+    let count = 0;
+    for (let rowIndex = 0; rowIndex < from; rowIndex++) {
+      if (withRoom.readOnlyRowReasons?.[rowIndex] !== undefined) continue;
+      if (page.readOnlyRowReasons?.[rowIndex] !== undefined) return -1;
+      count++;
+    }
+    return count;
+  };
+  let best = remapCutFrom(0);
+  if (!best) throw refusal;
+  // remapCutFrom(low) fits keeping every row before it editable; high does not.
+  let low = 0;
+  let high = input.rows.length;
+  while (high - low > 1) {
+    const middle = Math.floor((low + high) / 2);
+    const page = remapCutFrom(middle);
+    if (page && editable(page, middle) >= 0) {
+      low = middle;
+      best = page;
+    } else {
+      high = middle;
+    }
+  }
+  // A row gives up its identity before its key: row `low` keeps its key,
+  // read-only, when that alone fits (the halving found its identity cannot).
+  if (high < input.rows.length) {
+    const page = remapCutFrom(high);
+    if (page && editable(page, low) === editable(best, low)) best = page;
+  }
+  return best;
+}
+
+/** What the frame leaves a page's cells and sidecars beside its headers, anchors and envelope. */
+function frameValueLimit(answer, limitBytes) {
+  let bytes = FRAME_ENVELOPE_BYTES;
+  for (const header of answer.headers ?? []) bytes += frameCellWire.stringBytes(String(header)) + 1;
+  // URI-encoded, so one byte a character.
+  if (answer.keysetAnchors) bytes += JSON.stringify(answer.keysetAnchors).length + 16;
+  return limitBytes - bytes;
+}
+
+/**
+ * The page contained against the frame, costed as the frame writes it: the
+ * identity steps check the whole of `valueLimit`, and the values give way
+ * when they left the identities no room -- by an eighth of the frame each
+ * time, up to MAX_CONTAINMENT_ATTEMPTS -- cutting more of them to oversized
+ * cells (read-only, named as not byte-exact), never a row. Two budgets, since
+ * the raw-TEXT pass spends what the values leave on byte prefixes: on the
+ * whole one it would fill again what each round freed. The pass's oversized
+ * entries are another matter: a page needs them, so they are checked against
+ * the whole, where a value budget the decode filled had no room for them.
+ * `reservedAnchors` are the keyset anchors `valueLimit` left room for (the
+ * offer's answer's; none when the page went to the frame at once).
+ *
+ * Once the decode refuses in one budget it refuses in any (it has cut every
+ * value a preview can shorten), so the page is refused at once when the
+ * values themselves did not fit. A later step's refusal is not final: a
+ * smaller budget cuts values only once it falls below what they cost, which
+ * can take more than one attempt.
+ */
+function containWithinFrame(containPage, valueLimit, reservedAnchors) {
+  // cell-containment.ts keeps WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES of each
+  // limit for what this counts in valueLimit instead.
+  const wireFor = (bytes) => ({ ...frameCellWire, limitBytes: bytes + WEBVIEW_GRID_RESPONSE_HEADROOM_BYTES });
+  const pageWire = wireFor(valueLimit);
+  for (let attempt = 1, valueBudget = valueLimit; ; attempt++) {
+    const cut = {};
+    try {
+      return containPage(wireFor(valueBudget), pageWire, cut, reservedAnchors);
+    } catch (error) {
+      if (!CONTAINMENT_TRANSPORT_REFUSAL.test(getErrorMessage(error))) throw error;
+      if (cut.values === undefined) {
+        throw new Error(
+          `This page does not fit the native engine's ${frameCellWire.limitBytes}-byte reply frame, ` +
+          'and cutting its values to previews cannot make it fit'
+        );
+      }
+      if (attempt >= MAX_CONTAINMENT_ATTEMPTS) {
+        // Said only when the last attempt did cut values.
+        throw new Error(
+          `This page does not fit the native engine's ${frameCellWire.limitBytes}-byte reply frame` +
+          (cut.values > 0 ? ', even with its values cut to previews' : '')
+        );
+      }
+    }
+    valueBudget -= Math.floor(frameCellWire.limitBytes / 8);
+  }
+}
+
+/**
+ * Count rows in a table.
+ *
+ * @param {string} table - Table name
+ * @param {Object} options - Query options
+ * @returns {Promise<{count: number, isExact: boolean}>} Exact count or safe upper bound
+ */
+async function fetchTableCount(table, options = {}) {
+  if (!db) throw new Error('No database initialized');
+
+  const {
+    columns = [],
+    filters = [],
+    globalFilter = '',
+    globalFilterColumns = null
+  } = options;
+
+  let sql = `SELECT COUNT(*) FROM ${escapeMainIdentifier(table)}`;
+
+  // Build WHERE clause from filters array and globalFilter
+  const { conditions: whereClauses, params } = buildDemoFilterConditions(
+    filters, globalFilter, columns, globalFilterColumns
+  );
+
+  if (whereClauses.length > 0) {
+    sql += ` WHERE ${whereClauses.join(' AND ')}`;
+  }
+
+  // Shared paged count policy (src/core/paged-count.ts, also consumed by
+  // the desktop WASM engine): large paged opens answer unfiltered counts
+  // without a complete b-tree scan. OP_Count never yields to the progress
+  // handler and a full scan through per-page host callbacks wedges every
+  // queued RPC past the webview deadline. Filtered counts stay exact.
+  const countPolicyInput = {
+    storage: storageMode,
+    filtered: whereClauses.length > 0,
+    // Stage the cheap size/filter decision before paying for authority.
+    authorityConfirmedRowIdTable: true,
+    pagedFileSizeBytes,
+    exactCountMaxFileBytes: pagedExactCountMaxFileBytes
+  };
+  if (shouldAnswerCountWithUpperBound(countPolicyInput)) {
+    let authorityConfirmedRowIdTable = false;
+    try {
+      const authority = db.exec(ROWID_TABLE_AUTHORITY_SQL, [table, table]);
+      authorityConfirmedRowIdTable = (authority[0]?.values.length ?? 0) > 0;
+      if (shouldAnswerCountWithUpperBound({
+        ...countPolicyInput,
+        authorityConfirmedRowIdTable
+      })) {
+        const upperBound = db.exec(buildCountUpperBoundSql(table));
+        const resolvedUpperBound = resolveCountUpperBound(upperBound[0]?.values?.[0]);
+        if (resolvedUpperBound !== undefined) {
+          return { count: resolvedUpperBound, isExact: false };
+        }
+      }
+    } catch {
+      // A failed rowid shortcut may still be a WITHOUT ROWID table below.
+    }
+
+    if (!authorityConfirmedRowIdTable) {
+      let withoutRowIdTable = false;
+      try {
+        const metadata = db.exec(WITHOUT_ROWID_TABLE_SQL, [table]);
+        withoutRowIdTable = (metadata[0]?.values.length ?? 0) > 0;
+      } catch {
+        // Preserve exact semantics for views and relations we cannot classify.
+      }
+      if (withoutRowIdTable) {
+        try {
+          const probe = db.exec(
+            buildCappedCountProbeSql(table),
+            [PAGED_COUNT_PROBE_MAX_ROWS + 1]
+          );
+          const resolved = resolveCappedCount(
+            probe[0]?.values?.[0]?.[0],
+            pagedFileSizeBytes
+          );
+          if (resolved) return resolved;
+        } catch {
+          // Never trade a failed bounded probe for the non-interruptible scan.
+        }
+        return {
+          count: resolveFileSizeRowUpperBound(pagedFileSizeBytes),
+          isExact: false
+        };
+      }
+    }
+  }
+
+  const results = readRefusingWrites(() => executeWithProgressHandler(() => db.exec(sql, params)));
+
+  if (results.length === 0 || results[0].values.length === 0) {
+    return { count: 0, isExact: true };
+  }
+
+  return { count: results[0].values[0][0], isExact: true };
+}
+
+/**
+ * Fetch database schema (tables, views, indexes).
+ *
+ * @returns {Promise<Object>} Schema snapshot
+ */
+async function fetchSchema() {
+  if (!db) throw new Error('No database initialized');
+
+  // Get tables
+  // Note: Property names must match VS Code extension format (identifier, parentTable, etc.)
+  const tablesResult = db.exec(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `);
+  const identityResult = db.exec(TABLE_IDENTITY_METADATA_SQL);
+  const identities = buildTableIdentityMap(identityResult[0]?.values || []);
+  const tables = (tablesResult[0]?.values || []).map(row => {
+    const identifier = row[0];
+    const identity = identities.get(identifier);
+    if (!identity) throw new Error(`Table not found: ${identifier}`);
+    return { identifier, identity };
+  });
+
+  // Get views
+  const viewsResult = db.exec(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'view'
+    ORDER BY name
+  `);
+  const views = (viewsResult[0]?.values || []).map(row => ({ identifier: row[0] }));
+
+  // Get indexes
+  const indexesResult = db.exec(`
+    SELECT name, tbl_name FROM sqlite_master
+    WHERE type = 'index' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `);
+  const indexes = (indexesResult[0]?.values || []).map(row => ({
+    identifier: row[0],
+    parentTable: row[1]
+  }));
+
+  return { tables, views, indexes };
+}
+
+/**
+ * Get column information for a table.
+ *
+ * @param {string} table - Table name
+ * @returns {Promise<Array>} Column metadata
+ */
+async function getTableInfo(table) {
+  if (!db) throw new Error('No database initialized');
+
+  const results = db.exec(TABLE_XINFO_WITH_ROWID_ALIAS_SQL, [table]);
+
+  if (results.length === 0) {
+    return [];
+  }
+
+  // Property names must match VS Code extension format
+  return results[0].values
+    .filter(row => Number(row[6] ?? 0) !== 1)
+    .map(row => ({
+      ordinal: row[0],
+      identifier: row[1],
+      declaredType: row[2],
+      isRequired: row[3],
+      defaultExpression: row[4],
+      primaryKeyPosition: row[5],
+      isGenerated: Number(row[6] ?? 0) === 2 || Number(row[6] ?? 0) === 3,
+      isRowidAlias: Number(row[7] ?? 0) === 1,
+      ...(typeof row[8] === 'string' ? { primaryKeyCollation: row[8] } : {})
+    }));
+}
+
+function readImportSchemaVersion() {
+  // Read positional values without getColumnNames: the native shim probes
+  // column names with transient TEMP views, which advance temp.schema_version.
+  const read = (sql) => {
+    const statement = db.prepare(sql);
+    const rows = [];
+    try {
+      while (statement.step()) rows.push(statement.get());
+      return rows;
+    } finally { statement.free(); }
+  };
+  const main = read('PRAGMA main.schema_version')[0]?.[0];
+  if (!Number.isSafeInteger(main)) throw new Error('Unable to read the destination database schema version.');
+  // Persistent schema cookies also catch identical DROP/CREATE replacements.
+  // TEMP definitions detect user schema changes without counting the shim's
+  // short-lived metadata views as changes to the import destination.
+  return JSON.stringify([main, read('SELECT type, name, tbl_name, sql FROM temp.sqlite_schema ORDER BY type, name')]);
+}
+
+async function getImportTarget(table) {
+  if (!db) throw new Error('No database initialized');
+  assertUsableSqlIdentifier(table, 'Table name');
+  const savepoint = createViewSavepointName('sp_import_preview');
+  runSingleStatement(`SAVEPOINT ${savepoint}`);
+  try {
+    const columns = await getTableInfo(table);
+    if (!columns.length) throw new Error(`Table not found: ${table}`);
+    const schemaVersion = readImportSchemaVersion();
+    runSingleStatement(`RELEASE SAVEPOINT ${savepoint}`);
+    return { columns, schemaVersion };
+  } catch (error) {
+    safeRollbackSavepoint(savepoint, 'getImportTarget');
+    throw error;
+  }
+}
+
+// Row-history columns, as getInsertableColumnNames in the WASM engine: no
+// generated columns, and no FTS command, docid or rank column.
+function getInsertableColumnNames(table) {
+  // hidden: 0 ordinary, 1 virtual-table HIDDEN, 2 GENERATED VIRTUAL,
+  // 3 GENERATED STORED. Generated columns are never insertable.
+  //
+  // A full-text table's hidden command column (named after the table), its
+  // docid and its rank are left out as well: a delete snapshot that carried
+  // them produced `INSERT INTO docs (title, body, docs, rank)`, which SQLite
+  // refuses. The rowid is snapshotted separately by the caller, so dropping
+  // them loses nothing an insert could have restored.
+  const result = db.exec(
+    'SELECT name FROM pragma.pragma_table_xinfo(?1) WHERE hidden NOT IN (2, 3) ' +
+    "AND NOT (hidden = 1 AND (name = ?1 COLLATE NOCASE OR name COLLATE NOCASE IN ('docid', 'rank')) " +
+    'AND EXISTS (SELECT 1 FROM pragma.pragma_table_xinfo(?1) WHERE hidden = 1 AND name = ?1 COLLATE NOCASE)) ' +
+    'ORDER BY cid',
+    [table]
+  );
+  return (result[0]?.values ?? []).map(row => {
+    if (typeof row[0] !== 'string') {
+      throw new Error(`SQLite returned invalid column metadata for ${table}`);
+    }
+    return row[0];
+  });
+}
+
+/**
+ * The undo memory an edit's history entry may take, as its caller passes it.
+ *
+ * The desktop host passes `{ limitBytes, reservedBytes, setting }`: the
+ * configured limit, what the rest of the entry (labels, identities, new
+ * values) already takes, and how its user raises the limit (the desktop has
+ * no Configuration field for it, and VS Code's setting name means nothing
+ * there). A refusal then states what the whole entry needs against the
+ * limit the user configured. It used to state the remainder: a paste whose new
+ * values alone passed the limit had none left, and was refused as exceeding
+ * "the 0-byte memory budget". A bare number is the older form, still sent by
+ * the web demo and direct callers: the bytes left for the stored values,
+ * refused with the older message. Absent: no budget.
+ *
+ * @returns {null | { availableBytes: number,
+ *   limit: null | { limitBytes: number, reservedBytes: number, setting?: string } }}
+ */
+function resolveUndoBudget(value, what) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'object') return { availableBytes: value, limit: null };
+  const { limitBytes, reservedBytes, setting, raisable } = value;
+  if (!Number.isSafeInteger(limitBytes) || limitBytes < 0 || !Number.isSafeInteger(reservedBytes) || reservedBytes < 0) {
+    throw new Error(`${what} undo memory limit needs non-negative safe integer limitBytes and reservedBytes`);
+  }
+  if (setting !== undefined && (typeof setting !== 'string' || setting.length === 0 || setting.length > 120)) {
+    throw new Error(`${what} undo memory limit's setting must be a short description of the setting`);
+  }
+  // Only a host that knows its setting's range can say the limit cannot go higher.
+  if (raisable !== undefined && raisable !== false) {
+    throw new Error(`${what} undo memory limit's raisable must be false when given`);
+  }
+  return {
+    availableBytes: limitBytes - reservedBytes,
+    limit: {
+      limitBytes,
+      reservedBytes,
+      ...(setting === undefined ? {} : { setting }),
+      ...(raisable === undefined ? {} : { raisable })
+    }
+  };
+}
+
+/** Whether `valueBytes` of stored values pass what `budget` leaves for them. */
+const overUndoBudget = (budget, valueBytes) => !Number.isSafeInteger(valueBytes) || valueBytes > budget.availableBytes;
+
+/** The refusal of an edit whose history entry would need more undo memory than its limit. */
+function undoMemoryRefusal(limit, subject, valueBytes, advice, outcome) {
+  const setting = limit.setting ?? 'the undo memory limit';
+  // A limit already at its setting's maximum cannot be raised: advising it would
+  // send the user to a change that does nothing.
+  return new Error(
+    `${subject} needs ${limit.reservedBytes + valueBytes} bytes of undo memory; the limit is ` +
+    (limit.raisable === false
+      ? `${limit.limitBytes} bytes, the largest ${setting} allows. ${advice}. ${outcome}`
+      : `${limit.limitBytes} bytes. ${advice}, or raise ${setting}. ${outcome}`)
+  );
+}
+
+function readRowHistorySnapshot(table, identity, rowId, insertableColumns) {
+  const textEncoding = getCellTextEncoding();
+  const predicate = buildRecordIdentityPredicate(rowId, identity);
+  const projections = insertableColumns.map(buildStoredCellStateProjection);
+  const result = db.exec(
+    `SELECT ${projections.join(', ') || '1'} ` +
+    `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+    normalizeBindParams(predicate.params),
+    { useBigInt: true }
+  )[0];
+  const rows = result?.values ?? [];
+  if (rows.length !== 1) throw new RowHistoryConflictError(table);
+  const states = insertableColumns.map((column, index) => parseStoredCellState(
+    rows[0][index * 2],
+    rows[0][index * 2 + 1],
+    `${table}.${column}`,
+    { textEncoding }
+  ));
+  return {
+    rowId,
+    row: Object.fromEntries(insertableColumns.map((column, index) => [
+      column,
+      states[index].rawTextBytes ?? states[index].value
+    ])),
+    storageClasses: insertableColumns.map((column, index) => ({
+      column,
+      storageClass: states[index].storageClass
+    }))
+  };
+}
+
+function assertRowHistoryFitsUndoBudget(
+  table,
+  identity,
+  rowId,
+  insertableColumns,
+  maxUndoSnapshotBytes
+) {
+  const budget = resolveUndoBudget(maxUndoSnapshotBytes, 'Insert');
+  if (budget === null) return;
+  const predicate = buildRecordIdentityPredicate(rowId, identity);
+  const valueColumns = deleteSnapshotValueColumns(
+    insertableColumns,
+    identity.kind === 'rowid'
+  );
+  const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
+  const result = db.exec(
+    query.sql,
+    normalizeBindParams(query.params),
+    { useBigInt: true }
+  )[0]?.values?.[0];
+  const size = parseDeleteSnapshotSizeRow(result);
+  const snapshot = {
+    table,
+    insertableColumns,
+    includeSyntheticRowId: identity.kind === 'rowid',
+    rowIds: [rowId],
+    rowCount: size.rowCount,
+    valueBytes: size.valueBytes,
+    operation: 'Insert'
+  };
+  // With a limit, the shared check runs for its identity refusal only.
+  assertDeleteSnapshotFitsUndoBudget({
+    ...snapshot,
+    maxSnapshotBytes: budget.limit === null ? budget.availableBytes : Number.MAX_SAFE_INTEGER
+  });
+  // The entry keeps the row's identity twice: in its image and as targetRowId.
+  const projected = projectDeletedRowEntryBytes(snapshot) + estimateUndoMemoryBytes(rowId);
+  if (budget.limit !== null && overUndoBudget(budget, projected)) {
+    throw undoMemoryRefusal(budget.limit, `Inserting a row into ${table}`, projected,
+      'Insert smaller values', 'Nothing was changed.');
+  }
+}
+
+function captureInsertedRowHistory(table, identity, rowId, maxUndoSnapshotBytes) {
+  const insertableColumns = getInsertableColumnNames(table);
+  const predicate = buildRecordIdentityPredicate(rowId, identity);
+  assertDeleteSnapshotFitsWebTransport(
+    table,
+    [rowId],
+    insertableColumns,
+    [predicate]
+  );
+  assertRowHistoryFitsUndoBudget(
+    table,
+    identity,
+    rowId,
+    insertableColumns,
+    maxUndoSnapshotBytes
+  );
+  return readRowHistorySnapshot(table, identity, rowId, insertableColumns);
+}
+
+/**
+ * Get current pragma values.
+ *
+ * @returns {Promise<Object>} Pragma key-value pairs
+ */
+async function getPragmas() {
+  if (!db) throw new Error('No database initialized');
+
+  const pragmas = {};
+  const pragmaNames = [
+    'foreign_keys',
+    'journal_mode',
+    'synchronous',
+    'cache_size',
+    'locking_mode',
+    'temp_store',
+    'encoding',
+    'auto_vacuum'
+  ];
+
+  for (const name of pragmaNames) {
+    // SQLite answers a pragma it does not know with no rows, not an error,
+    // so an absent row leaves the key out and a failure is a real one: the
+    // Configuration modal shows it rather than an incomplete snapshot.
+    let results;
+    try {
+      results = db.exec(`PRAGMA ${name}`);
+    } catch (error) {
+      throw new Error(`PRAGMA ${name} could not be read: ${getErrorMessage(error)}`, { cause: error });
+    }
+    if (results.length > 0 && results[0].values.length > 0) {
+      pragmas[name] = results[0].values[0][0];
+    }
+  }
+
+  return pragmas;
+}
+
+/**
+ * Set a pragma value.
+ *
+ * @param {string} pragma - Pragma name
+ * @param {*} value - Pragma value
+ */
+async function setPragma(pragma, value) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Pragma updates');
+
+  const allowedPragmas = [
+    'foreign_keys',
+    'journal_mode',
+    'synchronous',
+    'cache_size',
+    'locking_mode',
+    'temp_store',
+    'auto_vacuum'
+  ];
+  if (!allowedPragmas.includes(pragma)) {
+    throw new Error(`Invalid or disallowed PRAGMA: ${pragma}`);
+  }
+
+  let sql;
+  if (typeof value === 'string') {
+    if (!/^[a-zA-Z0-9_-]+$/.test(value)) {
+      throw new Error('Invalid PRAGMA string value: contains disallowed characters');
+    }
+    sql = `PRAGMA ${pragma} = '${value}'`;
+  } else if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error('Invalid PRAGMA numeric value: must be finite');
+    }
+    sql = `PRAGMA ${pragma} = ${value}`;
+  } else if (typeof value === 'boolean') {
+    sql = `PRAGMA ${pragma} = ${value ? 'ON' : 'OFF'}`;
+  } else {
+    throw new Error(`Invalid PRAGMA value type: ${typeof value}`);
+  }
+
+  runSingleStatement(sql);
+}
+
+/**
+ * Update a cell value.
+ *
+ * @param {string} table - Table name
+ * @param {string|number} rowId - Row ID (rowid)
+ * @param {string} column - Column name
+ * @param {*} value - New value
+ */
+async function updateCell(
+  table,
+  rowId,
+  column,
+  value,
+  _originalValue,
+  maxEditValueBytes,
+  historyReplayToken
+) {
+  const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+  // An edit's whole number past int32 stores INTEGER, as in the extension.
+  if (!isHistoryReplay) value = bindableIntegerValue(value);
+  const enforcePriorPolicy = !isHistoryReplay && maxEditValueBytes !== undefined;
+  const editLimitBytes = isHistoryReplay
+    ? 0
+    : assertCellValuesWithinEditLimit([value], maxEditValueBytes);
+  assertMutableRecordId(rowId);
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Cell updates');
+
+  if (isPrimaryKeyRecordId(rowId)) {
+    const outcomes = await updateCellBatch(table, [{
+      rowId,
+      column,
+      value,
+      operation: 'set'
+    }], undefined, maxEditValueBytes, historyReplayToken, ANSWER_STAYS_IN_WORKER);
+    return outcomes[0]?.newRowId ?? rowId;
+  }
+
+  const rowIdValue = validateRowId(rowId);
+  const identity = await resolveTableIdentity(table);
+  if (identity.kind !== 'rowid') {
+    throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
+  }
+  const savepointName = createViewSavepointName('sp_update_rowid_cell');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const rowIdAliasColumn = readRowIdAliasColumn(table);
+    assertUpdateHasNoTargetTableTriggerWrites(table, [column]);
+    const escapedColumn = escapeIdentifier(column);
+    // Every edit write in this worker says OR ABORT, as the extension's do. It
+    // overrides a schema ON CONFLICT clause: REPLACE would delete a colliding
+    // row history never saw, IGNORE would skip a write reported as done. The
+    // shared trigger probes compile the same OR ABORT.
+    db.run(
+      `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ` +
+      `${bindPlaceholder(value)} WHERE rowid = ?` +
+      (enforcePriorPolicy
+        ? ` AND NOT (typeof(${escapedColumn}) IN ('text', 'blob') ` +
+          `AND length(CAST(${escapedColumn} AS BLOB)) > ?)`
+        : ''),
+      normalizeBindParams(
+        enforcePriorPolicy ? [value, rowIdValue, editLimitBytes] : [value, rowIdValue]
+      )
+    );
+    const changes = db.exec('SELECT changes()')[0]?.values?.[0]?.[0];
+    if (changes !== 1) {
+      if (enforcePriorPolicy) {
+        const metadata = await getCellMetadata({ table, rowId: rowIdValue, column });
+        if (
+          (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+          && metadata.byteLength > editLimitBytes
+        ) {
+          throw new OversizedCellReplacementRequiredError(
+            table,
+            column,
+            metadata.storageClass,
+            metadata.byteLength,
+            editLimitBytes
+          );
+        }
+      }
+      throw new Error(`Cannot update ${table}.${column}: row ${rowId} no longer exists`);
+    }
+    const newRowId = readUpdatedRowId(
+      table,
+      rowIdAliasColumn,
+      rowIdValue,
+      column,
+      value
+    );
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return newRowId;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'updateCell');
+    throw error;
+  }
+}
+
+/** Exact-metadata compare-and-set that never selects the previous cell value. */
+async function replaceOversizedCell(
+  table,
+  rowId,
+  column,
+  value,
+  expected,
+  maxEditValueBytes
+) {
+  const editLimitBytes = assertCellValuesWithinEditLimit(
+    [value],
+    maxEditValueBytes
+  );
+  assertOversizedCellReplacementExpectation(expected, editLimitBytes);
+  assertMutableRecordId(rowId);
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Oversized cell replacement');
+
+  const identity = await resolveTableIdentity(table);
+  const predicate = buildRecordIdentityPredicate(rowId, identity);
+  const escapedColumn = escapeIdentifier(column);
+  const applyGuardedUpdate = () => {
+    db.run(
+      `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${escapedColumn} = ${bindPlaceholder(value)} ` +
+      `WHERE ${predicate.sql} AND typeof(${escapedColumn}) = ? ` +
+      `AND length(CAST(${escapedColumn} AS BLOB)) = ?`,
+      normalizeBindParams([
+        value,
+        ...predicate.params,
+        expected.storageClass,
+        expected.byteLength
+      ])
+    );
+    const changes = db.exec('SELECT changes()')[0]?.values?.[0]?.[0];
+    if (changes !== 1) throw new Error(OVERSIZED_CELL_REPLACEMENT_CONFLICT_MESSAGE);
+    if (identity.kind === 'rowid') {
+      return readUpdatedRowId(
+        table,
+        readRowIdAliasColumn(table),
+        validateRowId(rowId),
+        column,
+        value
+      );
+    }
+
+    const keyIndex = identity.columns.findIndex(key => key.identifier === column);
+    const candidateId = replacePrimaryKeyRecordIdValues(
+      rowId,
+      identity,
+      keyIndex >= 0 ? [{ column, value }] : []
+    );
+    return readPrimaryKeyRecordId(
+      table,
+      identity,
+      buildRecordIdentityPredicate(candidateId, identity, keyIndex >= 0 ? [column] : []),
+      unresolvableTriggeredPrimaryKeyUpdateError(table)
+    );
+  };
+
+  const savepointName = createViewSavepointName('sp_replace_oversized_cell');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    assertUpdateHasNoTargetTableTriggerWrites(
+      table,
+      [column],
+      identity.kind === 'rowid'
+    );
+    const newRowId = applyGuardedUpdate();
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return newRowId;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'replaceOversizedCell');
+    throw error;
+  }
+}
+
+/**
+ * Insert a new row.
+ *
+ * @param {string} table - Table name
+ * @param {Object} data - Column-value pairs
+ * @returns {Promise<number>} Inserted row ID
+ */
+async function insertRowInternal(
+  table,
+  data,
+  maxEditValueBytes,
+  historyReplayToken,
+  captureHistory,
+  maxUndoSnapshotBytes
+) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Row insertion');
+  if (historyReplayToken !== HISTORY_REPLAY_EDIT_TOKEN) {
+    data = Object.fromEntries(Object.entries(data).map(([column, value]) => [column, bindableIntegerValue(value)]));
+    assertCellValuesWithinEditLimit(Object.values(data), maxEditValueBytes);
+  }
+
+  const columns = Object.keys(data);
+  const values = Object.values(data);
+  const identity = await resolveTableIdentity(table);
+
+  let insertSql;
+
+  if (columns.length === 0) {
+    insertSql = `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} DEFAULT VALUES`;
+  } else {
+    const columnList = columns.map(escapeIdentifier).join(', ');
+    const placeholders = values.map(bindPlaceholder).join(', ');
+
+    insertSql = `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} (${columnList}) VALUES (${placeholders})`;
+  }
+
+  if (identity.kind === 'primaryKey') {
+    const savepointName = createViewSavepointName('sp_insert_pk_row');
+    runSingleStatement(`SAVEPOINT ${savepointName}`);
+    try {
+      assertMutationHasNoUntrackedPrograms('INSERT', table, columns);
+      const statement = db.prepare(
+        `${insertSql} RETURNING ` +
+        buildByteFaithfulPrimaryKeyProjection(identity),
+        normalizeBindParams(values)
+      );
+      let row;
+      try {
+        if (!statement.step()) {
+          throw new Error(`Insert into ${table} did not return a primary-key identity`);
+        }
+        row = statement.get(null, { useBigInt: true });
+        if (!row || statement.step()) {
+          throw new Error(`Insert into ${table} did not return exactly one primary-key identity`);
+        }
+      } finally {
+        statement.free();
+      }
+      const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+        identity,
+        row,
+        normalizeCellTextEncoding(db.exec('PRAGMA encoding')[0]?.values?.[0]?.[0]),
+        `Cannot insert into ${table}`
+      );
+      const rowId = readPrimaryKeyRecordId(
+        table,
+        identity,
+        buildRecordIdentityPredicate(candidateId, identity)
+      );
+      const result = captureHistory
+        ? captureInsertedRowHistory(table, identity, rowId, maxUndoSnapshotBytes)
+        : rowId;
+      assertWriteAnswerFits(`Inserting a row into ${table}`, result,
+        captureHistory ? copiedIdentityBytes('targetRowId', rowId) : 0);
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return result;
+    } catch (error) {
+      safeRollbackSavepoint(savepointName, 'insertPrimaryKeyRow');
+      throw error;
+    }
+  }
+
+  const savepointName = createViewSavepointName('sp_insert_rowid_row');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    assertMutationHasNoUntrackedPrograms('INSERT', table, columns);
+    db.run(insertSql, normalizeBindParams(values));
+    const metadata = db.exec(
+      'SELECT changes(), CAST(last_insert_rowid() AS TEXT)'
+    )[0]?.values?.[0];
+    if (!metadata || Number(metadata[0]) !== 1) {
+      throw new Error(`Insert into ${table} did not create exactly one row`);
+    }
+    const rowId = validateRowId(metadata[1]);
+    const predicate = buildRecordIdentityPredicate(rowId, identity);
+    const current = db.exec(
+      `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql} LIMIT 2`,
+      normalizeBindParams(predicate.params)
+    )[0];
+    if ((current?.values.length ?? 0) !== 1) {
+      throw new Error(
+        `Insert into ${table} did not leave one addressable row; the insert was rolled back`
+      );
+    }
+    const result = captureHistory
+      ? captureInsertedRowHistory(table, identity, rowId, maxUndoSnapshotBytes)
+      : rowId;
+    assertWriteAnswerFits(`Inserting a row into ${table}`, result,
+      captureHistory ? copiedIdentityBytes('targetRowId', rowId) : 0);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return result;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'insertRowIdRow');
+    throw error;
+  }
+}
+
+async function insertRow(table, data, maxEditValueBytes, historyReplayToken) {
+  return insertRowInternal(
+    table,
+    data,
+    maxEditValueBytes,
+    historyReplayToken,
+    false
+  );
+}
+
+async function insertRowWithHistory(
+  table,
+  data,
+  maxEditValueBytes,
+  maxUndoSnapshotBytes
+) {
+  return insertRowInternal(
+    table,
+    data,
+    maxEditValueBytes,
+    undefined,
+    true,
+    maxUndoSnapshotBytes
+  );
+}
+
+// ============================================================================
+// Bulk import (CSV/JSON rows mapped by the page)
+// ============================================================================
+
+/**
+ * Overhead the native frame codec adds around a value JSON cannot carry
+ * directly (`{"__type":"BigInt","decimal":"…"}`, `{"__type":"Uint8Array",
+ * "base64":"…"}`), counted by `estimateImportTransportBytes` so its answer stays
+ * an upper bound of the encoded frame. Both markers are under 40 bytes.
+ */
+const IMPORT_TRANSPORT_MARKER_BYTES = 40;
+
+/**
+ * Validate the caller's budgets. Every budget is OPTIONAL and, when present,
+ * must be a non-negative safe integer: a budget that cannot be interpreted is
+ * refused rather than treated as "unlimited", because every one of them exists
+ * to stop the import from producing an answer its caller cannot hold.
+ */
+function resolveImportOptions(options) {
+  if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+    throw new Error('Import options must be an object');
+  }
+  if (options.expectedSchemaVersion !== undefined && typeof options.expectedSchemaVersion !== 'string') {
+    throw new Error('Import expectedSchemaVersion must be a string');
+  }
+  const budget = (name) => {
+    const value = options[name];
+    if (value === undefined) return undefined;
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`Import ${name} must be a non-negative safe integer`);
+    }
+    return value;
+  };
+  const undo = options.maxUndoSnapshotBytes;
+  const legacyUndo = undo !== null && typeof undo === 'object' ? undefined : budget('maxUndoSnapshotBytes');
+  return {
+    maxEditValueBytes: options.maxEditValueBytes,
+    // resolveUndoBudget: a limit object from the desktop host, or the older
+    // bare number of bytes left for the snapshots.
+    undoBudget: resolveUndoBudget(legacyUndo ?? undo, 'Import'),
+    maxSnapshotTransportBytes: budget('maxSnapshotTransportBytes')
+  };
+}
+
+/**
+ * Shape and limit checks for the rows, all before the first SQL statement:
+ * the array bound, the shared column/cell ceilings (the same constants the
+ * page's parser enforces, re-checked here because the worker is the trust
+ * boundary), one plain object per row, usable column names, and every value
+ * inside the per-value edit cap. Returns each row's column list so the insert
+ * loop reads the keys exactly once.
+ *
+ * @returns {string[][]}
+ */
+function validateImportRows(rows, maxEditValueBytes) {
+  if (!Array.isArray(rows)) throw new Error('Import rows must be an array');
+  if (rows.length === 0) throw new Error('Import requires at least one row');
+  if (rows.length > IMPORT_MAX_ROWS) {
+    throw new Error(`Import supports at most ${IMPORT_MAX_ROWS.toLocaleString('en-US')} rows`);
+  }
+  const editLimit = assertCellValuesWithinEditLimit([], maxEditValueBytes);
+  const rowColumns = new Array(rows.length);
+  let cells = 0;
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) {
+      throw new Error(`Import row ${index + 1} must be an object of column values`);
+    }
+    const columns = Object.keys(row);
+    if (columns.length > IMPORT_MAX_COLUMNS) {
+      throw new Error(`Import supports at most ${IMPORT_MAX_COLUMNS} columns`);
+    }
+    cells += columns.length;
+    if (cells > IMPORT_MAX_CELLS) {
+      throw new Error(
+        `Import supports at most ${IMPORT_MAX_CELLS.toLocaleString('en-US')} cells; ` +
+        'split the file into smaller imports'
+      );
+    }
+    for (const column of columns) {
+      assertUsableSqlIdentifier(column, 'Column name');
+      assertCellValueWithinEditLimit(row[column], editLimit);
+    }
+    rowColumns[index] = columns;
+  }
+  return rowColumns;
+}
+
+/**
+ * The INSERT for one column/placeholder signature. WITHOUT ROWID tables have no
+ * `last_insert_rowid()`, so their identity comes back through RETURNING (the
+ * byte-faithful projection insertRowInternal also uses); rowid tables read it
+ * afterwards, which also lets the same statement serve virtual tables.
+ */
+function buildImportInsertSql(table, columns, placeholders, identity) {
+  const target = escapeMainIdentifier(table);
+  // OR ABORT, as every other edit write here: a schema ON CONFLICT REPLACE
+  // would delete the row an imported row collides with, which the import's
+  // undo cannot bring back, and IGNORE would skip the row.
+  const insert = columns.length === 0
+    ? `INSERT OR ABORT INTO ${target} DEFAULT VALUES`
+    : `INSERT OR ABORT INTO ${target} (${columns.map(escapeIdentifier).join(', ')}) ` +
+      `VALUES (${placeholders.join(', ')})`;
+  if (identity.kind !== 'primaryKey') return insert;
+  return `${insert} RETURNING ${buildByteFaithfulPrimaryKeyProjection(identity)}`;
+}
+
+/**
+ * Re-read every inserted row's exact stored state in identity chunks and pack
+ * it as {@link ImportedRowSnapshots}: the column list once, storage-class
+ * patterns deduplicated, values per row in INSERTION order (the undo path
+ * deletes in reverse, so a self-referencing foreign key unwinds children
+ * before parents).
+ */
+function readImportSnapshots(table, identity, rowIds, textEncoding) {
+  const insertableColumns = getInsertableColumnNames(table);
+  const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
+  const identityProjection = identity.kind === 'rowid'
+    ? 'CAST(rowid AS TEXT)'
+    : buildByteFaithfulPrimaryKeyProjection(identity);
+  const identityWidth = identity.kind === 'rowid' ? 1 : identity.columns.length * 2;
+  const stateProjections = insertableColumns.map(buildStoredCellStateProjection);
+  const indexByRowId = new Map(rowIds.map((rowId, index) => [String(rowId), index]));
+  const storageClassPatterns = [];
+  const patternIndexByKey = new Map();
+  const snapshots = new Array(rowIds.length);
+  let matched = 0;
+  for (const predicate of predicates) {
+    const result = db.exec(
+      `SELECT ${identityProjection}` +
+      `${stateProjections.length > 0 ? ', ' : ''}${stateProjections.join(', ')} ` +
+      `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+      normalizeBindParams(predicate.params),
+      { useBigInt: true }
+    )[0];
+    for (const row of result?.values ?? []) {
+      const rowId = identity.kind === 'rowid'
+        ? validateRowId(row[0])
+        : encodeByteFaithfulPrimaryKeyRecordId(
+            identity,
+            row.slice(0, identityWidth),
+            textEncoding,
+            `Cannot import into ${table}`
+          );
+      const index = indexByRowId.get(String(rowId));
+      if (index === undefined || snapshots[index] !== undefined) {
+        throw new Error(`Import into ${table} could not re-read an inserted row by its identity`);
+      }
+      const states = insertableColumns.map((column, offset) => parseStoredCellState(
+        row[identityWidth + offset * 2],
+        row[identityWidth + offset * 2 + 1],
+        `${table}.${column}`,
+        { textEncoding }
+      ));
+      const classes = states.map(state => state.storageClass);
+      const key = classes.join(',');
+      let pattern = patternIndexByKey.get(key);
+      if (pattern === undefined) {
+        pattern = storageClassPatterns.length;
+        storageClassPatterns.push(classes);
+        patternIndexByKey.set(key, pattern);
+      }
+      snapshots[index] = {
+        rowId,
+        values: states.map(state => state.rawTextBytes ?? state.value),
+        pattern
+      };
+      matched += 1;
+    }
+  }
+  if (matched !== rowIds.length) {
+    throw new Error(
+      `Import into ${table} inserted ${rowIds.length} rows but could re-read only ${matched}`
+    );
+  }
+  return { columns: insertableColumns, storageClassPatterns, rows: snapshots };
+}
+
+/**
+ * Upper bound of the bytes `value` occupies once the native frame codec has
+ * JSON-encoded it (BigInt and bytes become marker objects, bytes as base64).
+ * Structural, not a serialization: measuring 100,000 rows by stringifying them
+ * would cost a second copy of the whole answer.
+ */
+function estimateImportTransportBytes(value) {
+  if (value === null || value === undefined) return 4;
+  switch (typeof value) {
+    case 'string': {
+      // Quotes, plus one escape byte for every character JSON escapes
+      // (`"`, `\`) and the six-byte `\uXXXX` form for controls.
+      let bytes = utf8ByteLength(value) + 2;
+      for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code === 0x22 || code === 0x5c) bytes += 1;
+        else if (code < 0x20) bytes += 5;
+      }
+      return bytes;
+    }
+    case 'number':
+      return Number.isFinite(value) ? String(value).length : IMPORT_TRANSPORT_MARKER_BYTES;
+    case 'bigint':
+      return String(value).length + IMPORT_TRANSPORT_MARKER_BYTES;
+    case 'boolean':
+      return 5;
+    case 'object': {
+      if (value instanceof Uint8Array) {
+        return Math.ceil(value.byteLength / 3) * 4 + IMPORT_TRANSPORT_MARKER_BYTES;
+      }
+      if (Array.isArray(value)) {
+        let bytes = 2 + Math.max(0, value.length - 1);
+        for (const item of value) bytes += estimateImportTransportBytes(item);
+        return bytes;
+      }
+      let bytes = 2;
+      for (const key of Object.keys(value)) {
+        bytes += utf8ByteLength(key) + 4 + estimateImportTransportBytes(value[key]);
+      }
+      return bytes;
+    }
+    default:
+      return IMPORT_TRANSPORT_MARKER_BYTES;
+  }
+}
+
+/**
+ * Room kept below the native frame for the label, description and type the
+ * desktop host puts around an answer when it sends it back as the undo or redo
+ * request for its history entry. What else the host copies into the entry is
+ * passed by each caller (`hostAddedBytes`): the `newRowId` of each rowid
+ * cell, an insert's `targetRowId`. The rest of the request is the answer
+ * itself, so an answer that fits with this room can always be undone and redone.
+ */
+const HISTORY_REQUEST_RESERVE_BYTES = 4096;
+
+/** What the host's entry adds for a copied identity: its key and the value. */
+function copiedIdentityBytes(key, rowId) {
+  return key.length + 4 + estimateImportTransportBytes(rowId);
+}
+
+/**
+ * Refuse a write whose answer this engine cannot return. Called inside the
+ * write's own savepoint, before it is released (or before the write itself),
+ * so the refusal leaves nothing behind. Past the native frame, the transport
+ * replaces the answer with a frame error after the write has landed: the
+ * change would stay in the session with no history entry to undo it and no
+ * refresh to show it, and the next Save would commit it.
+ *
+ * @param {string} what - the write, as the message's subject
+ * @param {unknown} answer - exactly what the method is about to return
+ * @param {number} [hostAddedBytes] - what the host's entry copies in besides the answer
+ */
+function assertWriteAnswerFits(what, answer, hostAddedBytes = 0) {
+  if (!measureEngineReply) return;
+  const overflow = measureEngineReply(answer, HISTORY_REQUEST_RESERVE_BYTES + hostAddedBytes);
+  if (!overflow) return;
+  // A history-bearing write's answer may cross the native transport in pieces
+  // (core/native/native-transfer.js); its limit is then counted in encoded
+  // characters rather than frame bytes.
+  const [size, limit] = overflow.unit === 'characters'
+    ? ['encoded characters', 'character']
+    : ['bytes', 'byte'];
+  throw new Error(
+    `${what} needs ${overflow.bytes} ${size} to return the values undo restores, over the ` +
+    `${overflow.limitBytes}-${limit} limit of one native engine reply. Nothing was changed; ` +
+    'change fewer cells or rows at a time.'
+  );
+}
+
+/**
+ * The two budgets an import's answer must fit, checked while the savepoint is
+ * still open so a refusal takes every row back with it:
+ *
+ * - undo memory: `estimateUndoMemoryBytes` over the snapshots, which is the
+ *   exact figure the host's ModificationTracker charges the entry;
+ * - transport: the encoded size of the answer against the caller's cap and,
+ *   always, the shared aggregate response ceiling. An answer the transport
+ *   drops after the rows are committed is the one outcome this method must
+ *   never produce — the rows would exist with no history entry to undo them.
+ */
+function assertImportSnapshotsWithinBudgets(table, rowCount, snapshots, limits) {
+  if (limits.undoBudget !== null) {
+    const bytes = estimateUndoMemoryBytes(snapshots);
+    if (overUndoBudget(limits.undoBudget, bytes)) {
+      if (limits.undoBudget.limit !== null) {
+        throw undoMemoryRefusal(limits.undoBudget.limit, `Importing ${rowCount} rows into ${table}`, bytes,
+          'Import fewer rows at a time', 'No rows were imported.');
+      }
+      throw new Error(
+        `Import undo history for ${rowCount} rows into ${table} needs ${bytes} bytes, ` +
+        `over the ${limits.undoBudget.availableBytes}-byte undo memory budget; import fewer rows ` +
+        'at a time or increase maxUndoMemory. No rows were imported.'
+      );
+    }
+  }
+  // The web transport's aggregate ceiling does not apply to the native
+  // engine, whose import answer crosses in pieces; its caller's cap does.
+  const transportCap = measureEngineReply
+    ? limits.maxSnapshotTransportBytes ?? Number.MAX_SAFE_INTEGER
+    : Math.min(
+        limits.maxSnapshotTransportBytes ?? Number.MAX_SAFE_INTEGER,
+        MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES
+      );
+  const encodedBytes = estimateImportTransportBytes({ rowCount, snapshots });
+  if (encodedBytes > transportCap) {
+    throw new Error(
+      `Import undo history for ${rowCount} rows into ${table} is about ${encodedBytes} bytes ` +
+      `encoded, over the ${transportCap}-byte limit this engine can return in one edit; ` +
+      'import fewer rows at a time. No rows were imported.'
+    );
+  }
+}
+
+/**
+ * Insert many rows as ONE guarded edit.
+ *
+ * Why a method of its own rather than N insertRowWithHistory calls: a
+ * 100,000-row import would be 100,000 RPC round trips and 100,000 undo
+ * entries, and a failure at row 60,000 would leave the first 59,999 in place.
+ * Here the whole batch runs inside one SAVEPOINT — any refusal (constraint,
+ * edit limit, undo budget, transport budget) rolls every row back — and the
+ * answer is one compact post-image set the host records as ONE `row_insert`
+ * history entry (`importedRows`). Undo deletes those exact states and redo
+ * re-inserts them through the same row-history paths `deleteRows` uses.
+ *
+ * Rows are plain `{column: value}` objects, already mapped by the page from a
+ * CSV or JSON source; the worker never sees a file or a path. Rows may carry
+ * different column sets (a JSON row without a key takes that column's
+ * DEFAULT), so one statement is prepared per column/placeholder signature and
+ * re-bound per row.
+ *
+ * @param {string} table
+ * @param {Array<Record<string, CellValue>>} rows
+ * @param {{
+ *   maxEditValueBytes?: number,
+ *   maxUndoSnapshotBytes?: number | {limitBytes: number, reservedBytes: number},
+ *   maxSnapshotTransportBytes?: number
+ * }} [options] `maxEditValueBytes` caps every value (the host passes its cell
+ *   edit limit); `maxUndoSnapshotBytes` is this entry's undo memory limit
+ *   (resolveUndoBudget);
+ *   `maxSnapshotTransportBytes` is the largest answer the caller's transport
+ *   carries (the desktop passes it for the native sidecar, whose response
+ *   frame is capped). Both budgets are enforced before the savepoint is
+ *   released, so a refused import leaves no rows behind.
+ * @returns {Promise<{ rowCount: number, snapshots: ImportedRowSnapshots }>}
+ */
+async function importRows(table, rows, options = {}) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Row import');
+  assertUsableSqlIdentifier(table, 'Table name');
+  const limits = resolveImportOptions(options ?? {});
+  const rowColumns = validateImportRows(rows, limits.maxEditValueBytes);
+
+  const savepointName = createViewSavepointName('sp_import_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    if (options?.expectedSchemaVersion !== undefined && readImportSchemaVersion() !== options.expectedSchemaVersion) {
+      throw new Error('The destination database schema changed after the preview was prepared. Start the import again.');
+    }
+    const identity = await resolveTableIdentity(table);
+    const textEncoding = getCellTextEncoding();
+    const rowIds = new Array(rows.length);
+    const statements = new Map();
+    let identityStatement = null;
+    try {
+      for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        const columns = rowColumns[index];
+        const values = columns.map(column => row[column]);
+        const placeholders = values.map(bindPlaceholder);
+        const signature = `${JSON.stringify(columns)}|${placeholders.join(',')}`;
+        let statement = statements.get(signature);
+        if (!statement) {
+          // A trigger program writing the target table behind the insert would
+          // make its post-image unreliable; refused once per column set.
+          assertMutationHasNoUntrackedPrograms('INSERT', table, columns);
+          statement = db.prepare(buildImportInsertSql(table, columns, placeholders, identity));
+          statements.set(signature, statement);
+        }
+        statement.bind(normalizeBindParams(values));
+        if (identity.kind === 'primaryKey') {
+          if (!statement.step()) {
+            throw new Error(`Import into ${table} did not return a primary-key identity`);
+          }
+          const returned = statement.get(null, { useBigInt: true });
+          if (!returned || statement.step()) {
+            throw new Error(
+              `Import into ${table} did not return exactly one primary-key identity`
+            );
+          }
+          statement.reset();
+          const candidateId = encodeByteFaithfulPrimaryKeyRecordId(
+            identity,
+            returned,
+            textEncoding,
+            `Cannot import into ${table}`
+          );
+          rowIds[index] = readPrimaryKeyRecordId(
+            table,
+            identity,
+            buildRecordIdentityPredicate(candidateId, identity)
+          );
+          continue;
+        }
+        statement.step();
+        statement.reset();
+        identityStatement ??= db.prepare('SELECT changes(), CAST(last_insert_rowid() AS TEXT)');
+        identityStatement.step();
+        const metadata = identityStatement.get(null, { useBigInt: true });
+        identityStatement.reset();
+        if (!metadata || Number(metadata[0]) !== 1) {
+          throw new Error(`Import into ${table} did not create exactly one row for row ${index + 1}`);
+        }
+        rowIds[index] = validateRowId(metadata[1]);
+      }
+    } finally {
+      for (const statement of statements.values()) statement.free();
+      identityStatement?.free();
+    }
+    const snapshots = readImportSnapshots(table, identity, rowIds, textEncoding);
+    assertImportSnapshotsWithinBudgets(table, rows.length, snapshots, limits);
+    const answer = { rowCount: rows.length, snapshots };
+    assertWriteAnswerFits(`Importing ${rows.length} rows into ${table}`, answer);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return answer;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'importRows');
+    throw error;
+  }
+}
+
+/**
+ * Expand an import's compact post-images back into the `DeletedRow[]` the
+ * row-history replay paths take. Strict about shape: the entry arrives from the
+ * host's history store, so a malformed one is refused here rather than turned
+ * into a partial predicate downstream.
+ *
+ * @param {import('../src/core/types.ts').ImportedRowSnapshots} imported
+ * @returns {import('../src/core/types.ts').DeletedRow[]}
+ */
+function expandImportedRows(imported) {
+  if (
+    imported === null || typeof imported !== 'object'
+    || !Array.isArray(imported.columns) || !Array.isArray(imported.storageClassPatterns)
+    || !Array.isArray(imported.rows) || imported.rows.length === 0
+    || imported.columns.some(column => typeof column !== 'string')
+  ) {
+    throw new LegacyRowHistoryError();
+  }
+  const width = imported.columns.length;
+  const patterns = imported.storageClassPatterns.map(pattern => {
+    if (!Array.isArray(pattern) || pattern.length !== width) throw new LegacyRowHistoryError();
+    return imported.columns.map((column, index) => ({ column, storageClass: pattern[index] }));
+  });
+  return imported.rows.map(entry => {
+    if (
+      entry === null || typeof entry !== 'object'
+      || !Array.isArray(entry.values) || entry.values.length !== width
+      || !Number.isInteger(entry.pattern) || entry.pattern < 0 || entry.pattern >= patterns.length
+    ) {
+      throw new LegacyRowHistoryError();
+    }
+    return {
+      rowId: entry.rowId,
+      row: Object.fromEntries(imported.columns.map((column, index) => [column, entry.values[index]])),
+      storageClasses: patterns[entry.pattern]
+    };
+  });
+}
+
+const DELETE_SNAPSHOT_PREFLIGHT_COLUMN_CHUNK_SIZE = 64;
+
+function readDeleteSnapshotPreflightInteger(value, label) {
+  const normalized = typeof value === 'bigint' ? Number(value) : value;
+  if (!Number.isSafeInteger(normalized) || normalized < 0) {
+    throw new Error(`Demo delete snapshot ${label} exceeds the web transport safety bound`);
+  }
+  return normalized;
+}
+
+function deleteSnapshotValueEstimateSql(column) {
+  const escaped = escapeIdentifier(column);
+  // JSON can escape one source TEXT byte as six ASCII bytes. Raw worker BLOBs
+  // are budgeted as their eventual base64 representation by the shared guard.
+  return (
+    `CASE typeof(${escaped}) ` +
+    `WHEN 'text' THEN 6 * octet_length(${escaped}) ` +
+    `WHEN 'blob' THEN 4 * ((octet_length(${escaped}) + 2) / 3) + 40 ` +
+    `WHEN 'integer' THEN 8 WHEN 'real' THEN 8 ELSE 4 END`
+  );
+}
+
+function deleteSnapshotBlobLengthSql(column) {
+  const escaped = escapeIdentifier(column);
+  return `COALESCE(MAX(CASE WHEN typeof(${escaped}) = 'blob' ` +
+    `THEN octet_length(${escaped}) ELSE 0 END), 0)`;
+}
+
+/**
+ * Refuse before SELECTing row values or executing DELETE when the result cannot cross RPC.
+ *
+ * Not on the native engine (measureEngineReply set): its history-bearing
+ * answers cross in pieces, bounded by the caller's undo budget (the
+ * metadata-only preflights in deleteRows and insertRowWithHistory) and by the
+ * transfer ceiling assertWriteAnswerFits measures, not by the web demo's RPC.
+ */
+function assertDeleteSnapshotFitsWebTransport(table, rowIds, insertableColumns, predicates) {
+  if (measureEngineReply) return;
+  let estimatedBytes = 1024;
+  for (const rowId of rowIds) {
+    estimatedBytes += 64 + 6 * String(rowId).length;
+  }
+
+  const rowStructureBytes = 128 + insertableColumns.reduce(
+    (total, column) => total + 48 + 6 * column.length,
+    0
+  );
+  let matchedRows = 0;
+  for (const predicate of predicates) {
+    for (
+      let offset = 0;
+      offset < insertableColumns.length;
+      offset += DELETE_SNAPSHOT_PREFLIGHT_COLUMN_CHUNK_SIZE
+    ) {
+      const columnChunk = insertableColumns.slice(
+        offset,
+        offset + DELETE_SNAPSHOT_PREFLIGHT_COLUMN_CHUNK_SIZE
+      );
+      const result = db.exec(
+        `SELECT COUNT(*), COALESCE(SUM(` +
+        `${columnChunk.map(deleteSnapshotValueEstimateSql).join(' + ') || '0'}), 0)` +
+        `${columnChunk.length > 0 ? ', ' : ''}` +
+        columnChunk.map(deleteSnapshotBlobLengthSql).join(', ') +
+        ` FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params),
+        { useBigInt: true }
+      )[0]?.values?.[0];
+      if (!result) throw new Error('Demo delete snapshot preflight returned no metadata');
+
+      const rowCount = readDeleteSnapshotPreflightInteger(result[0], 'row count');
+      if (offset === 0) {
+        matchedRows += rowCount;
+        estimatedBytes += rowCount * rowStructureBytes;
+      }
+      estimatedBytes += readDeleteSnapshotPreflightInteger(result[1], 'encoded size');
+      for (const blobLength of result.slice(2)) {
+        if (
+          readDeleteSnapshotPreflightInteger(blobLength, 'BLOB size')
+          > MAX_WEBVIEW_BINARY_VALUE_BYTES
+        ) {
+          throw new Error(
+            `Demo delete snapshot exceeds the ${MAX_WEBVIEW_BINARY_VALUE_BYTES}-byte ` +
+            `web transport binary limit; the row was not deleted`
+          );
+        }
+      }
+      if (!Number.isSafeInteger(estimatedBytes)) {
+        throw new Error('Demo delete snapshot exceeds the web transport safety bound');
+      }
+    }
+  }
+  if (matchedRows !== rowIds.length) {
+    throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+  }
+  if (estimatedBytes > MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES) {
+    throw new Error(
+      `Demo delete snapshot exceeds the ${MAX_WEBVIEW_AGGREGATE_PAYLOAD_BYTES}-byte ` +
+      `web transport response limit; no rows were deleted`
+    );
+  }
+}
+
+/**
+ * Refuse a delete whose pre-delete images would not fit the undo memory left
+ * for its history entry, before any row value is read (metadata-only
+ * aggregates, src/core/delete-history.ts). The desktop host passes what
+ * maxUndoMemory leaves after the entry's own metadata; without a budget
+ * nothing is checked here.
+ */
+function assertDeletedRowsFitUndoBudget(table, identity, rowIds, insertableColumns, predicates, maxUndoSnapshotBytes) {
+  const budget = resolveUndoBudget(maxUndoSnapshotBytes, 'Delete');
+  if (budget === null) return;
+  const valueColumns = deleteSnapshotValueColumns(insertableColumns, identity.kind === 'rowid');
+  let rowCount = 0;
+  let valueBytes = 0;
+  for (const predicate of predicates) {
+    const query = buildDeleteSnapshotSizeQuery(table, valueColumns, predicate);
+    const size = parseDeleteSnapshotSizeRow(db.exec(
+      query.sql,
+      normalizeBindParams(query.params),
+      { useBigInt: true }
+    )[0]?.values?.[0]);
+    rowCount += size.rowCount;
+    valueBytes += size.valueBytes;
+  }
+  const snapshot = {
+    table,
+    insertableColumns,
+    includeSyntheticRowId: identity.kind === 'rowid',
+    rowIds,
+    rowCount,
+    valueBytes
+  };
+  // With a limit, the shared check runs for its identity refusal only.
+  assertDeleteSnapshotFitsUndoBudget({
+    ...snapshot,
+    maxSnapshotBytes: budget.limit === null ? budget.availableBytes : Number.MAX_SAFE_INTEGER
+  });
+  const projected = projectDeletedRowEntryBytes(snapshot);
+  if (budget.limit !== null && overUndoBudget(budget, projected)) {
+    throw undoMemoryRefusal(budget.limit, `Deleting ${rowIds.length} ${rowIds.length === 1 ? 'row' : 'rows'} from ${table}`,
+      projected, 'Delete fewer rows at a time', 'Nothing was changed.');
+  }
+}
+
+/**
+ * Delete rows by ID.
+ *
+ * @param {string} table - Table name
+ * @param {Array<string|number>} rowIds - Row IDs to delete
+ * @param {number | {limitBytes: number, reservedBytes: number}} [maxUndoSnapshotBytes] -
+ *   the entry's undo memory limit (resolveUndoBudget)
+ */
+async function deleteRows(table, rowIds, maxUndoSnapshotBytes) {
+  rowIds.forEach(assertMutableRecordId);
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Row deletion');
+
+  if (rowIds.length === 0) return [];
+  const identity = await resolveTableIdentity(table);
+  const textEncoding = getCellTextEncoding();
+
+  if (rowIds.some(isPrimaryKeyRecordId)) {
+    if (!rowIds.every(isPrimaryKeyRecordId)) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    if (identity.kind !== 'primaryKey') {
+      throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+    }
+    const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
+    const savepointName = createViewSavepointName('sp_delete_pk_rows');
+    runSingleStatement(`SAVEPOINT ${savepointName}`);
+    try {
+      assertMutationHasNoUntrackedPrograms('DELETE', table);
+      const insertableColumns = getInsertableColumnNames(table);
+      assertDeleteSnapshotFitsWebTransport(
+        table,
+        rowIds,
+        insertableColumns,
+        predicates
+      );
+      assertDeletedRowsFitUndoBudget(table, identity, rowIds, insertableColumns, predicates, maxUndoSnapshotBytes);
+      const deletedRows = [];
+      for (const predicate of predicates) {
+        const current = db.exec(
+          `SELECT ${insertableColumns.map(buildStoredCellStateProjection).join(', ') || '1'} ` +
+          `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+          normalizeBindParams(predicate.params),
+          { useBigInt: true }
+        )[0];
+        const rows = current?.values ?? [];
+        const primaryKeyIndices = identity.columns.map(column => {
+          const index = insertableColumns.indexOf(column.identifier);
+          if (index < 0) throw new Error(`Primary-key column missing from ${table}: ${column.identifier}`);
+          return index;
+        });
+        deletedRows.push(...rows.map(row => {
+          const states = insertableColumns.map((column, index) => parseStoredCellState(
+            row[index * 2],
+            row[index * 2 + 1],
+            `${table}.${column}`,
+            { textEncoding }
+          ));
+          return {
+            rowId: encodePrimaryKeyRecordId(
+              identity.columns,
+              primaryKeyIndices.map(index => states[index].value)
+            ),
+            row: Object.fromEntries(insertableColumns.map((column, index) => [
+              column,
+              states[index].rawTextBytes ?? states[index].value
+            ])),
+            storageClasses: insertableColumns.map((column, index) => ({
+              column,
+              storageClass: states[index].storageClass
+            }))
+          };
+        }));
+      }
+      assertOneRowPerIdentity(table, rowIds, deletedRows.map(row => row.rowId));
+      assertWriteAnswerFits(`Deleting ${rowIds.length} rows from ${table}`, deletedRows);
+      for (const predicate of predicates) {
+        db.run(
+          `DELETE FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+          normalizeBindParams(predicate.params)
+        );
+      }
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return deletedRows;
+    } catch (error) {
+      safeRollbackSavepoint(savepointName, 'deletePrimaryKeyRows');
+      throw error;
+    }
+  }
+
+  if (identity.kind !== 'rowid') {
+    throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
+  }
+
+  const predicates = buildRecordIdentityPredicateChunks(rowIds, identity);
+  const savepointName = createViewSavepointName('sp_delete_rowid_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    assertMutationHasNoUntrackedPrograms('DELETE', table);
+    const insertableColumns = getInsertableColumnNames(table);
+    assertDeleteSnapshotFitsWebTransport(
+      table,
+      rowIds,
+      insertableColumns,
+      predicates
+      );
+    assertDeletedRowsFitUndoBudget(table, identity, rowIds, insertableColumns, predicates, maxUndoSnapshotBytes);
+      const deletedRows = [];
+    for (const predicate of predicates) {
+      const current = db.exec(
+        `SELECT CAST(rowid AS TEXT)` +
+        `${insertableColumns.length > 0 ? ', ' : ''}` +
+        `${insertableColumns.map(buildStoredCellStateProjection).join(', ')} ` +
+        `FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params),
+        { useBigInt: true }
+      )[0];
+      deletedRows.push(...(current?.values ?? []).map(row => {
+        const deletedRowId = validateRowId(row[0]);
+        const states = insertableColumns.map((column, index) => parseStoredCellState(
+          row[index * 2 + 1],
+          row[index * 2 + 2],
+          `${table}.${column}`,
+          { textEncoding }
+        ));
+        return {
+          rowId: deletedRowId,
+          row: Object.fromEntries(insertableColumns.map((column, index) => [
+            column,
+            states[index].rawTextBytes ?? states[index].value
+          ])),
+          storageClasses: insertableColumns.map((column, index) => ({
+            column,
+            storageClass: states[index].storageClass
+          }))
+        };
+      }));
+    }
+    if (deletedRows.length !== rowIds.length) {
+      throw new Error(`Cannot delete from ${table}: one or more row identities no longer exist`);
+    }
+    assertWriteAnswerFits(`Deleting ${rowIds.length} rows from ${table}`, deletedRows);
+    for (const predicate of predicates) {
+      db.run(
+        `DELETE FROM ${escapeMainIdentifier(table)} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params)
+      );
+    }
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return deletedRows;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'deleteRowidRows');
+    throw error;
+  }
+}
+
+/**
+ * Discover persistent indexes whose expressions or predicates reference any
+ * selected column. SQLite itself is the parser: each stored definition is
+ * recreated against a temporary table, then DROP COLUMN determines whether
+ * that definition depends on the target.
+ *
+ * @returns {Promise<Array<{identifier: string, sql: string}>>}
+ */
+async function findDependentIndexes(table, columns) {
+  if (!db) throw new Error('No database initialized');
+  if (!Array.isArray(columns)) throw new Error('Column names must be an array');
+  assertUsableSqlIdentifier(table, 'Table name');
+  columns.forEach(column => assertUsableSqlIdentifier(column, 'Column name'));
+
+  const indexResult = db.exec(
+    `SELECT name, sql FROM main.sqlite_schema ` +
+    `WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL ORDER BY name`,
+    [table]
+  );
+  const indexes = (indexResult[0]?.values ?? []).map(row => ({
+    identifier: row[0],
+    sql: row[1]
+  }));
+  if (indexes.length === 0 || columns.length === 0) return [];
+
+  const tableInfo = db.exec(`PRAGMA main.table_xinfo(${escapeIdentifier(table)})`);
+  const tableColumns = (tableInfo[0]?.values ?? []).map(row => row[1]);
+  const targetColumns = resolveIndexDependencyColumns(tableColumns, columns);
+  if (targetColumns.length === 0) return [];
+
+  const suffix = crypto.randomUUID().replace(/-/g, '');
+  const probeTable = `__sqlite_explorer_index_probe_${suffix}`;
+  const probeIndex = `__sqlite_explorer_index_candidate_${suffix}`;
+  const savepointName = createViewSavepointName('sp_index_dependencies');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    runSingleStatement(buildIndexDependencyProbeTableSql(probeTable, tableColumns));
+
+    const baselineSavepoint = createViewSavepointName('sp_index_baseline');
+    runSingleStatement(`SAVEPOINT ${baselineSavepoint}`);
+    try {
+      for (const column of targetColumns) {
+        runSingleStatement(
+          `ALTER TABLE temp.${escapeIdentifier(probeTable)} ` +
+          `DROP COLUMN ${escapeIdentifier(column)}`
+        );
+      }
+      runSingleStatement(`ROLLBACK TO ${baselineSavepoint}`);
+      runSingleStatement(`RELEASE ${baselineSavepoint}`);
+    } catch (error) {
+      safeRollbackSavepoint(baselineSavepoint, 'findDependentIndexBaseline');
+      throw new Error('Cannot establish the index dependency probe baseline', { cause: error });
+    }
+
+    const dependentIndexes = [];
+    for (const index of indexes) {
+      const candidateSavepoint = createViewSavepointName('sp_index_candidate');
+      runSingleStatement(`SAVEPOINT ${candidateSavepoint}`);
+      try {
+        runSingleStatement(buildIndexDependencyProbeIndexSql(
+          probeTable,
+          probeIndex,
+          index.sql
+        ));
+        let isDependent = false;
+        for (const column of targetColumns) {
+          try {
+            runSingleStatement(
+              `ALTER TABLE temp.${escapeIdentifier(probeTable)} ` +
+              `DROP COLUMN ${escapeIdentifier(column)}`
+            );
+          } catch {
+            isDependent = true;
+            break;
+          }
+        }
+        runSingleStatement(`ROLLBACK TO ${candidateSavepoint}`);
+        runSingleStatement(`RELEASE ${candidateSavepoint}`);
+        if (isDependent) dependentIndexes.push(index);
+      } catch (error) {
+        safeRollbackSavepoint(candidateSavepoint, 'findDependentIndex');
+        throw new Error(
+          `Cannot inspect dependency for index ${escapeIdentifier(index.identifier)}`,
+          { cause: error }
+        );
+      }
+    }
+
+    runSingleStatement(`ROLLBACK TO ${savepointName}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return dependentIndexes;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'findDependentIndexes');
+    throw error;
+  }
+}
+
+function normalizeDependentIndexConfirmation(value) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error('Dependent-index confirmation must be an array');
+  }
+  return value.map(entry => {
+    if (
+      !entry
+      || typeof entry !== 'object'
+      || Array.isArray(entry)
+      || typeof entry.identifier !== 'string'
+      || typeof entry.sql !== 'string'
+    ) {
+      throw new Error('Dependent-index confirmation contains an invalid definition');
+    }
+    assertUsableSqlIdentifier(entry.identifier, 'Index name');
+    return { identifier: entry.identifier, sql: entry.sql };
+  });
+}
+
+function assertDependentIndexConfirmationCurrent(table, current, confirmed) {
+  if (current.length === 0 && (confirmed?.length ?? 0) === 0) return;
+  if (!confirmed) {
+    throw new Error(
+      `Column deletion requires confirmation for dependent indexes: ` +
+      current.map(index => index.identifier).join(', ')
+    );
+  }
+  const confirmedByName = new Map(
+    confirmed.map(index => [index.identifier, index.sql])
+  );
+  const isCurrent = confirmedByName.size === confirmed.length
+    && confirmed.length === current.length
+    && current.every(index => confirmedByName.get(index.identifier) === index.sql);
+  if (!isCurrent) {
+    throw new Error(
+      `Cannot delete columns from ${table}: dependent indexes changed while the confirmation was open`
+    );
+  }
+}
+
+/**
+ * Delete columns from a table.
+ * @param {string} table - Table name
+ * @param {Array<string>} columns - Columns to delete
+ * @param {Array<{identifier: string, sql: string}>|undefined} dropDependentIndexes - Exact confirmed index definitions to drop first
+ */
+async function deleteColumns(table, columns, dropDependentIndexes) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Column deletion');
+  if (columns.length === 0) return;
+
+  const savepointName = createViewSavepointName('sp_delete_columns');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const confirmedIndexes = normalizeDependentIndexConfirmation(dropDependentIndexes);
+    const currentIndexes = await findDependentIndexes(table, columns);
+    assertDependentIndexConfirmationCurrent(table, currentIndexes, confirmedIndexes);
+    await executeSchemaPreservingColumnDrop(
+      table,
+      columns,
+      currentIndexes.map(index => index.identifier),
+      sql => runSingleStatement(sql)
+    );
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (e) {
+    safeRollbackSavepoint(savepointName, 'deleteColumns');
+    throw describeColumnDropFailure(e, columns);
+  }
+}
+
+/**
+ * Name the views/triggers that could explain a refused DROP COLUMN.
+ *
+ * SQLite rejects a drop that would break a view or trigger, and only one engine
+ * says so usefully: sql.js reports `error in view active_logs after drop
+ * column: no such column: level` while the native fork collapses the same
+ * failure to `SQL logic error`. Runs ONLY after the engine has already refused,
+ * so the over-inclusive name match can add a wrong name to a message but can
+ * never block a drop that would have worked.
+ */
+function describeColumnDropFailure(error, columns) {
+  let dependents;
+  try {
+    dependents = findDependentSchemaObjects(columns);
+  } catch {
+    // A diagnostic must never replace the failure it is describing.
+    return error;
+  }
+  if (dependents.length === 0) return error;
+  const original = error instanceof Error ? error.message : String(error);
+  const names = dependents.map(object => `${object.type} ${object.identifier}`).join(', ');
+  return new Error(
+    `${original} — these schema objects mention ${columns.join(', ')} and may be blocking ` +
+    `the drop: ${names}. Drop or edit them first.`,
+    { cause: error }
+  );
+}
+
+/** Views/triggers whose stored SQL mentions any of `columns`, by bare-word match. */
+function findDependentSchemaObjects(columns) {
+  const rows = db.exec(COLUMN_DROP_DEPENDENT_OBJECT_SQL)[0]?.values ?? [];
+  return rows
+    .filter(row => (
+      typeof row[1] === 'string'
+      && typeof row[2] === 'string'
+      && columns.some(column => schemaObjectSqlMentionsColumn(row[2], column))
+    ))
+    .map(row => ({ type: row[0], identifier: row[1] }));
+}
+
+/**
+ * Create a new table.
+ *
+ * @param {string} table - Table name
+ * @param {Array<Object>} columns - Column definitions
+ * @param {{ withoutRowid?: boolean }} [options] - Table-level options
+ *   (absent on the JSON lane when the caller passed none; validated by
+ *   buildCreateTableSql, which also refuses WITHOUT ROWID without a key)
+ */
+async function createTable(table, columns, options) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Table creation');
+  const createSql = buildCreateTableSql(table, columns, options);
+  const savepointName = createViewSavepointName('sp_create_table');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    runSingleStatement(createSql);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'createTable');
+    throw error;
+  }
+}
+
+async function findViewDefinition(view, allowUnparsed = false) {
+  if (!db) throw new Error('No database initialized');
+  const viewResult = db.exec(
+    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+    [view]
+  );
+  const createSql = viewResult[0]?.values?.[0]?.[0];
+  if (typeof createSql !== 'string') return null;
+
+  const triggerRows = VIEW_TRIGGER_SCHEMA_QUERIES.map(source => (
+    db.exec(source.sql, source.params(view))[0]?.values || []
+  ));
+  const {
+    triggers,
+    ambiguousTemporaryTriggerNames,
+    unqualifiedTemporaryTriggers
+  } = mapViewTriggerRows(
+    view,
+    triggerRows
+  );
+  if (unqualifiedTemporaryTriggers.length > 0) {
+    const columnsResult = db.exec(
+      "SELECT name FROM pragma.pragma_table_xinfo(?, 'main') ORDER BY cid",
+      [view]
+    );
+    const writableColumns = (columnsResult[0]?.values ?? []).map(row => {
+      if (typeof row[0] !== 'string') {
+        throw new Error(`SQLite returned invalid view column metadata for ${view}`);
+      }
+      return row[0];
+    });
+    for (const trigger of unqualifiedTemporaryTriggers) {
+      if (triggers.some(candidate => (
+        !candidate.temporary
+        && sqliteIdentifiersEqual(candidate.identifier, trigger.identifier)
+      ))) {
+        ambiguousTemporaryTriggerNames.push(trigger.identifier);
+        continue;
+      }
+      try {
+        const validationSql = buildStoredTriggerValidationSql(
+          trigger.sql,
+          'main',
+          view,
+          writableColumns
+        );
+        if (validationSql === undefined) {
+          ambiguousTemporaryTriggerNames.push(trigger.identifier);
+          continue;
+        }
+        const probe = db.exec(validationSql);
+        if (explainIncludesTriggerProgram(probe[0]?.values ?? [], trigger.identifier)) {
+          triggers.push({
+            ...trigger,
+            sql: qualifyMainTriggerTargetSql(trigger.sql, trigger.identifier)
+          });
+        }
+      } catch {
+        ambiguousTemporaryTriggerNames.push(trigger.identifier);
+      }
+    }
+  }
+
+  let selectSql;
+  let columnListSql;
+  try {
+    selectSql = extractViewSelectSql(createSql);
+    columnListSql = extractViewColumnListSql(createSql);
+  } catch (error) {
+    if (!allowUnparsed) throw error;
+    selectSql = '';
+  }
+  return {
+    identifier: view,
+    sql: createSql,
+    selectSql,
+    columnListSql,
+    triggers,
+    ...(ambiguousTemporaryTriggerNames.length > 0
+      ? { ambiguousTemporaryTriggerNames }
+      : {})
+  };
+}
+
+async function readViewDefinition(view, allowUnparsed = false) {
+  const definition = await findViewDefinition(view, allowUnparsed);
+  if (!definition) throw new Error(`View not found: ${view}`);
+  return definition;
+}
+
+async function getViewDefinition(view) {
+  return readViewDefinition(view, false);
+}
+
+function captureViewDependencySnapshot() {
+  return captureSchemaDependencySnapshot({
+    queryRows: async (sql, params) => (
+      db.exec(sql, normalizeBindParams(params))[0]?.values ?? []
+    ),
+    compileStatements: async statements => statements.map(sql => {
+      try {
+        compileSingleStatement(sql);
+        return undefined;
+      } catch (error) {
+        return getErrorMessage(error);
+      }
+    })
+  });
+}
+
+/** Resolve one canonical installed-view snapshot for intent checks and column preservation. */
+function resolveExistingViewForIntent(view, intent) {
+  const result = db.exec(
+    "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = ?",
+    [view]
+  );
+  const row = result[0]?.values?.[0];
+  assertViewDefinitionIntent(view, row !== undefined, intent);
+  const storedSql = row?.[0];
+  return {
+    storedSql,
+    columnListSql: typeof storedSql === 'string'
+      ? extractViewColumnListSql(storedSql)
+      : undefined
+  };
+}
+
+function assertWritableMutation(operation) {
+  if (readOnlyMode) {
+    throw new Error(`${operation} is unavailable because the database is read-only`);
+  }
+}
+
+async function validateViewDefinition(view, selectSql, intent = 'edit') {
+  assertUsableSqlIdentifier(view, 'View name');
+  if (!db) throw new Error('No database initialized');
+  if (readOnlyMode) {
+    throw new Error('View validation is unavailable because the database is read-only');
+  }
+  const body = normalizeViewSelectSql(selectSql);
+  const { storedSql: existingSql, columnListSql } =
+    resolveExistingViewForIntent(view, intent);
+  const savepointName = createViewSavepointName('sp_validate_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    if (typeof existingSql === 'string') {
+      runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+    }
+    runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    runSingleStatement(`ROLLBACK TO ${savepointName}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'validateViewDefinition');
+    throw error;
+  }
+}
+
+async function previewViewDefinition(
+  view,
+  selectSql,
+  limit = 50,
+  intent = 'edit',
+  cancellationFlag
+) {
+  assertUsableSqlIdentifier(view, 'View name');
+  if (!db) throw new Error('No database initialized');
+  const body = normalizeViewSelectSql(selectSql);
+  const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit) || 50));
+  const { storedSql: existingSql, columnListSql } =
+    resolveExistingViewForIntent(view, intent);
+
+  if (readOnlyMode) {
+    // Read-only demo databases cannot run disposable schema DDL. Match WASM's
+    // target-named CTE fallback; writable previews below use the exact CREATE
+    // VIEW context and therefore also catch schema-qualified self-references.
+    const previewSource = escapeIdentifier(view);
+    if (columnListSql) {
+      return offerPreviewContainment(querySingleStatement(
+        `WITH ${previewSource} ${columnListSql} AS (${body}\n) ` +
+        `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`,
+        cancellationFlag
+      ));
+    }
+    return offerPreviewContainment(querySingleStatement(
+      `WITH ${previewSource} AS (${body}\n) ` +
+      `SELECT * FROM ${previewSource} LIMIT ${boundedLimit}`,
+      cancellationFlag
+    ));
+  }
+
+  const savepointName = createViewSavepointName('sp_preview_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    if (typeof existingSql === 'string') {
+      runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+    }
+    runSingleStatement(buildCreateViewSql(view, body, columnListSql));
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    const result = querySingleStatement(
+      `SELECT * FROM ${escapeMainViewIdentifier(view)} LIMIT ${boundedLimit}`,
+      cancellationFlag
+    );
+    runSingleStatement(`ROLLBACK TO ${savepointName}`);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return offerPreviewContainment(result);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'previewViewDefinition');
+    throw error;
+  }
+}
+
+/**
+ * What a view preview keeps of a long TEXT (UTF-16 units) or BLOB (bytes)
+ * when the native frame cannot carry its rows: views.js shows a TEXT's first
+ * 100 characters and none of a BLOB's bytes.
+ */
+const PREVIEW_CELL_UNITS = 256;
+
+/**
+ * A view preview answers up to 100 rows of whole values, more than the
+ * native reply frame can carry when they are long. On that engine the answer
+ * carries the page offer (offerFrameContainment), which native-host.js
+ * sendGuarded takes up only when the frame refuses it: each value past
+ * PREVIEW_CELL_UNITS cut to that prefix, with an oversized entry naming its
+ * size (a TEXT's as UTF-8, as the engine read it) that views.js marks, and
+ * the rows then contained as a page is. The offer works on the rows already
+ * fetched: by the time the frame refuses the answer, the preview's savepoint
+ * is rolled back. The WebAssembly worker answers as before.
+ */
+function offerPreviewContainment(result) {
+  if (frameCellWire === null) return result;
+  const { headers, rows, exactIntegerTexts } = result;
+  let transported;
+  const containPreview = (valueWire) => {
+    // decodeCellContainment's input: the values, then their packed metadata.
+    transported ??= rows.map(row => {
+      let tokens;
+      const values = row.map((value, columnIndex) => {
+        if (!(typeof value === 'string' || value instanceof Uint8Array) || value.length <= PREVIEW_CELL_UNITS) {
+          return value;
+        }
+        tokens ??= Array(row.length).fill('');
+        if (value instanceof Uint8Array) {
+          tokens[columnIndex] = `b${value.byteLength}`;
+          return value.slice(0, PREVIEW_CELL_UNITS);
+        }
+        tokens[columnIndex] = `t${utf8ByteLength(value)}`;
+        // Never half a surrogate pair.
+        const high = value.charCodeAt(PREVIEW_CELL_UNITS - 1);
+        return value.slice(0, high >= 0xd800 && high <= 0xdbff ? PREVIEW_CELL_UNITS - 1 : PREVIEW_CELL_UNITS);
+      });
+      return [...values, tokens ? tokens.join('|') : null];
+    });
+    return {
+      headers,
+      ...decodeCellContainment(transported, headers.length, exactIntegerTexts, DEFAULT_MAX_PAGE_RESPONSE_BYTES, true, valueWire)
+    };
+  };
+  return offerFrameContainment(result, containPreview, null);
+}
+
+async function createView(view, selectSql) {
+  assertUsableSqlIdentifier(view, 'View name');
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('View creation');
+  const body = normalizeViewSelectSql(selectSql);
+  const savepointName = createViewSavepointName('sp_create_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    runSingleStatement(buildCreateViewSql(view, body));
+    // A raw SELECT can bind to TEMP shadows differently from a stored main
+    // view. Compile the installed object, which is the definition Save creates.
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+    const definition = await getViewDefinition(view);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    assertWriteAnswerFits(`Creating view ${view}`, definition);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return definition;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'createView');
+    throw error;
+  }
+}
+
+async function editView(
+  view,
+  selectSql,
+  preserveTriggers = true,
+  expectedSql,
+  expectedTriggers
+) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('View editing');
+  const body = normalizeViewSelectSql(selectSql);
+  const savepointName = createViewSavepointName('sp_edit_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const before = await getViewDefinition(view);
+    assertViewTriggerSnapshotIsMutationSafe(before);
+    assertViewDefinitionSnapshotCurrent(
+      expectedSql,
+      before.sql,
+      expectedTriggers,
+      before.triggers
+    );
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+    runSingleStatement(buildCreateViewSql(view, body, before.columnListSql, before.columns));
+    // Validate the installed main-schema object, not the raw body in TEMP's
+    // name-resolution context.
+    compileSingleStatement(`EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(view)}`);
+    if (preserveTriggers) {
+      const columnResult = db.exec(`PRAGMA main.table_info(${escapeIdentifier(view)})`);
+      const columns = (columnResult[0]?.values ?? []).map(row => {
+        if (typeof row[1] !== 'string') {
+          throw new Error(`SQLite returned invalid column metadata for view ${view}`);
+        }
+        return row[1];
+      });
+      assertViewTriggersCompatibleWithColumns(before.triggers, columns);
+      for (const trigger of before.triggers) {
+        runSingleStatement(buildCreateViewTriggerSql(trigger));
+      }
+    }
+    const after = await getViewDefinition(view);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    assertWriteAnswerFits(`Editing view ${view}`, { before, after });
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return { before, after };
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'editView');
+    throw error;
+  }
+}
+
+async function dropView(view, expectedSql, expectedTriggers) {
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('View deletion');
+  const savepointName = createViewSavepointName('sp_drop_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const before = await readViewDefinition(view, true);
+    assertViewTriggerSnapshotIsMutationSafe(before);
+    assertViewDefinitionSnapshotCurrent(
+      expectedSql,
+      before.sql,
+      expectedTriggers,
+      before.triggers
+    );
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    assertWriteAnswerFits(`Dropping view ${view}`, before);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return before;
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'dropView');
+    throw error;
+  }
+}
+
+async function applyViewHistoryState(view, expectedCurrent, replacement) {
+  assertWritableMutation('View history replay');
+  const savepointName = createViewSavepointName('sp_restore_view');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const current = await findViewDefinition(view, true);
+    if (current) assertViewTriggerSnapshotIsMutationSafe(current);
+    assertViewDefinitionStateCurrent(expectedCurrent, current);
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    if (current) {
+      runSingleStatement(`DROP VIEW ${escapeMainViewIdentifier(view)}`);
+    }
+    if (replacement) {
+      runSingleStatement(replacement.sql);
+      compileSingleStatement(
+        `EXPLAIN SELECT * FROM ${escapeMainViewIdentifier(replacement.identifier)}`
+      );
+      for (const trigger of replacement.triggers) {
+        runSingleStatement(buildCreateViewTriggerSql(trigger));
+      }
+    }
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'restoreViewDefinition');
+    throw error;
+  }
+}
+
+function readChangesCount() {
+  const raw = db.exec('SELECT changes()', undefined, { useBigInt: true })[0]?.values?.[0]?.[0];
+  const changes = typeof raw === 'bigint' ? Number(raw) : raw;
+  if (!Number.isSafeInteger(changes) || changes < 0) {
+    throw new Error('SQLite returned an invalid changes() count');
+  }
+  return changes;
+}
+
+async function deleteRowHistorySnapshots(table, snapshots) {
+  if (!Array.isArray(snapshots) || snapshots.length === 0) {
+    throw new LegacyRowHistoryError();
+  }
+  const states = snapshots.map(rowHistoryStates);
+  const identity = await resolveTableIdentity(table);
+  const savepointName = createViewSavepointName('sp_history_delete_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    assertMutationHasNoUntrackedPrograms('DELETE', table);
+    for (const [index, snapshot] of snapshots.entries()) {
+      const rowIdentity = buildRecordIdentityPredicate(snapshot.rowId, identity);
+      const rowState = buildRowHistoryPredicate(snapshot, bindPlaceholder, states[index]);
+      db.run(
+        `DELETE FROM ${escapeMainIdentifier(table)} WHERE ` +
+        `(${rowIdentity.sql}) AND (${rowState.sql})`,
+        normalizeBindParams([...rowIdentity.params, ...rowState.params])
+      );
+      if (readChangesCount() !== 1) throw new RowHistoryConflictError(table);
+    }
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'deleteRowHistorySnapshots');
+    throw error;
+  }
+}
+
+async function restoreRowHistorySnapshots(table, snapshots) {
+  if (!Array.isArray(snapshots) || snapshots.length === 0) {
+    throw new LegacyRowHistoryError();
+  }
+  const identity = await resolveTableIdentity(table);
+  const prepared = snapshots.map(snapshot => {
+    const states = rowHistoryStates(snapshot);
+    return { snapshot, states, writes: buildRowHistoryWrites(snapshot, bindPlaceholder, states) };
+  });
+  const savepointName = createViewSavepointName('sp_history_restore_rows');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    for (const entry of prepared) {
+      assertMutationHasNoUntrackedPrograms(
+        'INSERT',
+        table,
+        entry.states.map(state => state.column)
+      );
+    }
+    const identityChunks = buildRecordIdentityPredicateChunks(
+      prepared.map(entry => entry.snapshot.rowId),
+      identity
+    );
+    for (const chunk of identityChunks) {
+      const existing = db.exec(
+        `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ${chunk.sql} LIMIT 1`,
+        normalizeBindParams(chunk.params)
+      );
+      if ((existing[0]?.values.length ?? 0) !== 0) {
+        throw new RowHistoryConflictError(table);
+      }
+    }
+
+    for (const entry of prepared) {
+      const columns = entry.writes.map(item => item.column);
+      const values = entry.writes.map(item => item.write.sql);
+      const params = entry.writes.flatMap(item => item.write.params);
+      if (
+        identity.kind === 'rowid'
+        && !columns.some(column => column.toLowerCase() === 'rowid')
+      ) {
+        columns.unshift('rowid');
+        values.unshift(bindPlaceholder(entry.snapshot.rowId));
+        params.unshift(entry.snapshot.rowId);
+      }
+      db.run(
+        `INSERT OR ABORT INTO ${escapeMainIdentifier(table)} ` +
+        `(${columns.map(escapeIdentifier).join(', ')}) VALUES (${values.join(', ')})`,
+        normalizeBindParams(params)
+      );
+      if (readChangesCount() !== 1) throw new RowHistoryConflictError(table);
+
+      const rowIdentity = buildRecordIdentityPredicate(entry.snapshot.rowId, identity);
+      const rowState = buildRowHistoryPredicate(entry.snapshot, bindPlaceholder, entry.states);
+      const verified = db.exec(
+        `SELECT 1 FROM ${escapeMainIdentifier(table)} WHERE ` +
+        `(${rowIdentity.sql}) AND (${rowState.sql}) LIMIT 2`,
+        normalizeBindParams([...rowIdentity.params, ...rowState.params])
+      );
+      if ((verified[0]?.values.length ?? 0) !== 1) {
+        throw new RowHistoryConflictError(table);
+      }
+    }
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'restoreRowHistorySnapshots');
+    throw error;
+  }
+}
+
+function guardedCellHistoryEntries(modification) {
+  const entries = modification.affectedCells ?? (
+    modification.targetRowId !== undefined && modification.targetColumn
+      ? [{
+          rowId: modification.targetRowId,
+          newRowId: modification.newTargetRowId,
+          columnName: modification.targetColumn,
+          newValue: modification.newValue,
+          operation: modification.operation,
+          priorState: modification.priorState,
+          postState: modification.postState
+        }]
+      : []
+  );
+  if (entries.length === 0) throw new LegacyCellHistoryError();
+  return entries.map(entry => {
+    assertStoredCellState(entry.priorState);
+    assertStoredCellState(entry.postState);
+    return entry;
+  });
+}
+
+/** Replay one cell edit as an exact-state compare-and-swap transaction. */
+async function replayCellHistory(table, modification, direction) {
+  if (modification.undoPolicy === 'barrier') {
+    throw new Error('Forward-only cell history barriers cannot be replayed');
+  }
+  const cells = guardedCellHistoryEntries(modification);
+  const usesPrimaryKey = cells.some(cell => isPrimaryKeyRecordId(cell.rowId));
+  if (usesPrimaryKey && !cells.every(cell => isPrimaryKeyRecordId(cell.rowId))) {
+    throw new Error('Cannot mix rowid and primary-key row identities');
+  }
+  const identity = await resolveTableIdentity(table);
+  if (usesPrimaryKey && identity.kind !== 'primaryKey') {
+    throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+  }
+  if (!usesPrimaryKey && identity.kind !== 'rowid') {
+    throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
+  }
+  const textEncoding = getCellTextEncoding();
+
+  const grouped = new Map();
+  for (const cell of cells) {
+    const row = grouped.get(cell.rowId) ?? [];
+    if (row.some(existing => sqliteIdentifiersEqual(existing.columnName, cell.columnName))) {
+      throw new Error(`Cell history for ${table} contains the same column more than once`);
+    }
+    row.push(cell);
+    grouped.set(cell.rowId, row);
+  }
+  const groups = [...grouped.entries()];
+  if (
+    direction === 'undo'
+    && cells.some(cell => cell.newRowId !== undefined && cell.newRowId !== cell.rowId)
+  ) {
+    groups.reverse();
+  }
+
+  const savepointName = createViewSavepointName('sp_replay_cell_history');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    assertUpdateHasNoTargetTableTriggerWrites(
+      table,
+      cells.map(cell => cell.columnName),
+      identity.kind === 'rowid'
+    );
+    for (const [originalRowId, rowCells] of groups) {
+      const recordedNewRowIds = new Set(
+        rowCells.map(cell => cell.newRowId ?? cell.rowId)
+      );
+      if (recordedNewRowIds.size !== 1) {
+        throw new Error(`Cell history for ${table} has inconsistent post-update identities`);
+      }
+      const recordedNewRowId = rowCells[0].newRowId ?? originalRowId;
+      const currentRowId = direction === 'undo' ? recordedNewRowId : originalRowId;
+      const targetRowId = direction === 'undo' ? originalRowId : recordedNewRowId;
+      const currentPredicate = buildRecordIdentityPredicate(currentRowId, identity);
+      const projections = rowCells.map(cell => buildStoredCellStateProjection(cell.columnName));
+      const current = db.exec(
+        `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
+        `WHERE ${currentPredicate.sql} LIMIT 2`,
+        normalizeBindParams(currentPredicate.params),
+        { useBigInt: true }
+      )[0];
+      if ((current?.values.length ?? 0) !== 1) {
+        throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+      }
+
+      const currentStates = rowCells.map((cell, index) => parseStoredCellState(
+        current.values[0][index * 2],
+        current.values[0][index * 2 + 1],
+        `${table}.${cell.columnName}`,
+        { textEncoding }
+      ));
+      const targetStates = rowCells.map((cell, index) => {
+        const expected = direction === 'undo' ? cell.postState : cell.priorState;
+        const recordedTarget = direction === 'undo' ? cell.priorState : cell.postState;
+        const currentState = currentStates[index];
+        if (cell.operation !== 'json_patch') {
+          if (!storedCellStatesEqual(currentState, expected)) {
+            throw new CellHistoryConflictError(table, [cell.columnName]);
+          }
+          return recordedTarget;
+        }
+        if (
+          currentState.storageClass !== expected.storageClass
+          || cell.newValue === undefined
+        ) {
+          throw new CellHistoryConflictError(table, [cell.columnName]);
+        }
+        const plan = planJsonPatchHistoryReplay(
+          currentState.value,
+          cell.newValue,
+          cell.priorState.value,
+          cell.postState.value,
+          direction
+        );
+        if (plan.kind === 'conflict') {
+          throw new CellHistoryConflictError(table, [cell.columnName]);
+        }
+        return Object.is(plan.value, recordedTarget.value)
+          ? recordedTarget
+          : parseStoredCellState(
+              'text',
+              plan.value,
+              `${table}.${cell.columnName} JSON replay`
+            );
+      });
+
+      const writes = targetStates.map(state => buildStoredCellWrite(state, bindPlaceholder));
+      const guards = currentStates.map((state, index) => buildStoredCellPredicate(
+        rowCells[index].columnName,
+        state,
+        bindPlaceholder
+      ));
+      db.run(
+        `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ` +
+        `${rowCells.map((cell, index) => (
+          `${escapeIdentifier(cell.columnName)} = ${writes[index].sql}`
+        )).join(', ')} WHERE ${currentPredicate.sql} AND ` +
+        guards.map(guard => `(${guard.sql})`).join(' AND '),
+        normalizeBindParams([
+          ...writes.flatMap(write => write.params),
+          ...currentPredicate.params,
+          ...guards.flatMap(guard => guard.params)
+        ])
+      );
+      if (readChangesCount() !== 1) {
+        throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+      }
+
+      const targetPredicate = buildRecordIdentityPredicate(targetRowId, identity);
+      const actual = db.exec(
+        `SELECT ${projections.join(', ')} FROM ${escapeMainIdentifier(table)} ` +
+        `WHERE ${targetPredicate.sql} LIMIT 2`,
+        normalizeBindParams(targetPredicate.params),
+        { useBigInt: true }
+      )[0];
+      if ((actual?.values.length ?? 0) !== 1) {
+        throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+      }
+      const exactTarget = targetStates.every((state, index) => storedCellStatesEqual(
+        state,
+        parseStoredCellState(
+          actual.values[0][index * 2],
+          actual.values[0][index * 2 + 1],
+          `${table}.${rowCells[index].columnName}`,
+          { textEncoding }
+        )
+      ));
+      if (!exactTarget) {
+        throw new CellHistoryConflictError(table, rowCells.map(cell => cell.columnName));
+      }
+    }
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'replayCellHistory');
+    throw error;
+  }
+}
+
+async function undoModification(modification) {
+  const {
+    modificationType,
+    targetTable,
+    viewDefBefore,
+    viewDefAfter,
+    affectedCells,
+    targetRowId,
+    newTargetRowId,
+    targetColumn,
+    priorValue,
+    newValue,
+    operation,
+    deletedRows,
+    insertedRow
+  } = modification;
+  if (!targetTable) return;
+  switch (modificationType) {
+    case 'cell_update':
+      await replayCellHistory(targetTable, modification, 'undo');
+      return;
+    case 'row_insert':
+      if (modification.importedRows) {
+        // One import, one entry: delete the exact post-images in REVERSE
+        // insertion order, so rows that reference earlier rows of the same
+        // batch (a self-referencing foreign key) unwind before their parents.
+        await deleteRowHistorySnapshots(
+          targetTable,
+          expandImportedRows(modification.importedRows).reverse()
+        );
+        return;
+      }
+      if (!insertedRow || targetRowId === undefined) {
+        throw new LegacyRowHistoryError();
+      }
+      if (
+        typeof insertedRow.rowId !== typeof targetRowId
+        || String(insertedRow.rowId) !== String(targetRowId)
+      ) {
+        throw new LegacyRowHistoryError();
+      }
+      await deleteRowHistorySnapshots(targetTable, [insertedRow]);
+      return;
+    case 'row_delete': {
+      if (!deletedRows || deletedRows.length === 0) throw new LegacyRowHistoryError();
+      await restoreRowHistorySnapshots(targetTable, deletedRows);
+      return;
+    }
+    case 'view_create':
+      if (viewDefAfter) {
+        await applyViewHistoryState(targetTable, viewDefAfter, null);
+      } else {
+        throw new Error('Cannot undo view_create: missing view definition');
+      }
+      return;
+    case 'view_edit':
+      if (viewDefBefore && viewDefAfter) {
+        await applyViewHistoryState(targetTable, viewDefAfter, viewDefBefore);
+      } else {
+        throw new Error('Cannot undo view_edit: missing view definition');
+      }
+      return;
+    case 'view_drop':
+      if (viewDefBefore) {
+        await applyViewHistoryState(targetTable, null, viewDefBefore);
+      } else {
+        throw new Error('Cannot undo view_drop: missing view definition');
+      }
+      return;
+    default:
+      // Reached only if a caller records a modification type this replay engine
+      // never claimed. The desktop host's BARRIER_METHODS set keeps the DDL
+      // operations (column_drop included) out of the replay stack entirely, so
+      // this is a contract breach, not a user-facing limit — hence "cannot",
+      // and no "Demo" branding: the desktop ships this same worker.
+      throw new Error(
+        `${String(modificationType)} cannot be undone: this operation is recorded as a ` +
+        'history barrier, not a replayable change'
+      );
+  }
+}
+
+async function redoModification(modification) {
+  const {
+    modificationType,
+    targetTable,
+    viewDefBefore,
+    viewDefAfter,
+    affectedCells,
+    targetRowId,
+    targetColumn,
+    newValue,
+    operation,
+    rowData,
+    affectedRowIds,
+    insertedRow,
+    deletedRows
+  } = modification;
+  if (!targetTable) return;
+  switch (modificationType) {
+    case 'cell_update':
+      await replayCellHistory(targetTable, modification, 'redo');
+      return;
+    case 'row_insert': {
+      if (modification.importedRows) {
+        // Insertion order, the mirror of the undo branch above.
+        await restoreRowHistorySnapshots(targetTable, expandImportedRows(modification.importedRows));
+        return;
+      }
+      if (!insertedRow) throw new LegacyRowHistoryError();
+      await restoreRowHistorySnapshots(targetTable, [insertedRow]);
+      return;
+    }
+    case 'row_delete':
+      if (!deletedRows || deletedRows.length === 0) throw new LegacyRowHistoryError();
+      await deleteRowHistorySnapshots(targetTable, deletedRows);
+      return;
+    case 'view_create':
+      if (viewDefAfter) {
+        await applyViewHistoryState(targetTable, null, viewDefAfter);
+      } else {
+        throw new Error('Cannot redo view_create: missing view definition');
+      }
+      return;
+    case 'view_edit':
+      if (viewDefBefore && viewDefAfter) {
+        await applyViewHistoryState(targetTable, viewDefBefore, viewDefAfter);
+      } else {
+        throw new Error('Cannot redo view_edit: missing view definition');
+      }
+      return;
+    case 'view_drop':
+      if (viewDefBefore) {
+        await applyViewHistoryState(targetTable, viewDefBefore, null);
+      } else {
+        throw new Error('Cannot redo view_drop: missing view definition');
+      }
+      return;
+    default:
+      // Mirror of undoModification's default — see the note there.
+      throw new Error(
+        `${String(modificationType)} cannot be redone: this operation is recorded as a ` +
+        'history barrier, not a replayable change'
+      );
+  }
+}
+
+function assertNoDuplicateBatchTargets(table, updates) {
+  const columnsByIdentity = new Map();
+  for (const update of updates) {
+    assertUsableSqlIdentifier(update.column, 'Column name');
+    let identityKey;
+    if (isPrimaryKeyRecordId(update.rowId)) {
+      // Decoding proves the opaque identity is canonical before it is used as
+      // a map key or any update preflight can touch SQLite.
+      decodePrimaryKeyRecordId(update.rowId);
+      identityKey = `primary-key:${update.rowId}`;
+    } else {
+      identityKey = `rowid:${String(validateRowId(update.rowId))}`;
+    }
+    const columns = columnsByIdentity.get(identityKey) ?? [];
+    if (columns.some(column => sqliteIdentifiersEqual(column, update.column))) {
+      throw new Error(
+        `Batch update for ${table} contains a duplicate row identity/column target: ` +
+        `${String(update.rowId)} / ${update.column}`
+      );
+    }
+    columns.push(update.column);
+    columnsByIdentity.set(identityKey, columns);
+  }
+}
+
+/**
+ * Refuse a batch whose prior values would not fit the undo memory left for its
+ * history entry, before any prior value is read (metadata-only aggregates over
+ * exactly the edited cells, src/core/batch-update.ts). The desktop host passes
+ * what maxUndoMemory leaves after everything else the entry holds; without a
+ * budget nothing is checked here.
+ */
+/**
+ * What a batch's history entry holds for the row identities the edit CHANGES,
+ * beyond the current identity the host reserves as every cell's newRowId
+ * (desktop-host.js cellBatchUndoBudget): a primary-key edit's new record id
+ * (URI-encoded JSON of the new key, up to 18 estimator bytes a character), or
+ * a rowid alias moved to another rowid. Every cell of such a row keeps its own
+ * copy. Only the worker can count it: it knows which columns are the key.
+ */
+function changedIdentityUndoBytes(updates, identity, rowIdAliasColumn) {
+  const byRow = new Map();
+  for (const update of updates) {
+    const rowUpdates = byRow.get(update.rowId) ?? [];
+    rowUpdates.push(update);
+    byRow.set(update.rowId, rowUpdates);
+  }
+  let bytes = 0;
+  for (const [rowId, rowUpdates] of byRow) {
+    let newRowIdBytes;
+    if (identity.kind === 'primaryKey') {
+      const replacements = rowUpdates
+        .filter(update => identity.columns.some(column => column.identifier === update.column))
+        .map(update => ({ column: update.column, value: update.value }));
+      if (replacements.length === 0) continue;
+      try {
+        newRowIdBytes = estimateUndoMemoryBytes(replacePrimaryKeyRecordIdValues(rowId, identity, replacements));
+      } catch {
+        // A key the edit itself will refuse; bound it instead: URI-encoded
+        // JSON spends at most 9 characters (18 bytes) per estimated byte pair.
+        newRowIdBytes = estimateUndoMemoryBytes(rowId) + 64
+          + 9 * estimateUndoMemoryBytes(replacements.map(replacement => replacement.value));
+      }
+    } else {
+      const moved = rowIdAliasColumn === undefined
+        ? undefined
+        : rowUpdates.find(update => sqliteIdentifiersEqual(update.column, rowIdAliasColumn));
+      if (moved === undefined) continue;
+      try {
+        newRowIdBytes = estimateUndoMemoryBytes(validateRowId(moved.value));
+      } catch {
+        newRowIdBytes = 40;   // the longest rowid, as a 20-character decimal string
+      }
+    }
+    bytes += rowUpdates.length * Math.max(0, newRowIdBytes - estimateUndoMemoryBytes(rowId));
+  }
+  return bytes;
+}
+
+function assertBatchPriorsFitUndoBudget(table, updates, identity, maxUndoSnapshotBytes, rowIdAliasColumn) {
+  const budget = resolveUndoBudget(maxUndoSnapshotBytes, 'Batch update');
+  if (budget === null) return;
+  const preflight = buildBatchHistorySizePreflight(table, updates, identity);
+  const resultRows = preflight.queries.map(query => db.exec(
+    query.sql,
+    normalizeBindParams(query.params),
+    { useBigInt: true }
+  )[0]?.values?.[0]);
+  if (budget.limit === null) {
+    assertBatchHistoryFitsUndoBudget({
+      table,
+      preflight,
+      resultRows,
+      maxPriorValueBytes: budget.availableBytes
+    });
+    return;
+  }
+  const projected = projectBatchHistoryBytes({ table, preflight, resultRows })
+    + changedIdentityUndoBytes(updates, identity, rowIdAliasColumn);
+  if (overUndoBudget(budget, projected)) {
+    throw undoMemoryRefusal(budget.limit,
+      `Editing ${updates.length === 1 ? 'a cell' : `${updates.length} cells`} in ${table}`,
+      projected, 'Edit fewer cells at a time', 'Nothing was changed.');
+  }
+}
+
+/**
+ * Batch update cells.
+ *
+ * @param {string} table - Table name
+ * @param {Array<Object>} updates - Array of {rowId, column, value}
+ * @param {unknown} _label - unread; the host keeps the label
+ * @param {number} [maxEditValueBytes]
+ * @param {symbol} [historyReplayToken]
+ * @param {symbol} [answerToken]
+ * @param {number | {limitBytes: number, reservedBytes: number}} [maxUndoSnapshotBytes] -
+ *   the entry's undo memory limit, checked against its prior values (resolveUndoBudget)
+ */
+async function updateCellBatch(
+  table,
+  updates,
+  _label,
+  maxEditValueBytes,
+  historyReplayToken,
+  answerToken,
+  maxUndoSnapshotBytes
+) {
+  updates.forEach(update => assertMutableRecordId(update.rowId));
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Batch cell updates');
+  // The native lane is JSON: an argument the host left out ahead of a later one
+  // crosses as null. Null is no limit anyone set, so it reads as absent, as it
+  // does over the WebAssembly worker's structured clone.
+  if (maxEditValueBytes === null) maxEditValueBytes = undefined;
+
+  if (updates.length === 0) return [];
+  assertNoDuplicateBatchTargets(table, updates);
+  const isHistoryReplay = historyReplayToken === HISTORY_REPLAY_EDIT_TOKEN;
+  const assertBatchAnswerFits = answerToken === ANSWER_STAYS_IN_WORKER
+    ? () => {}
+    : (results) => assertWriteAnswerFits(
+        `Editing ${updates.length === 1 ? 'a cell' : `${updates.length} cells`} in ${table}`,
+        results,
+        results.reduce((total, result) => total
+          + (result.newRowId === undefined ? copiedIdentityBytes('newRowId', result.rowId) : 0), 0)
+      );
+  if (!isHistoryReplay) updates = updates.map(update => ({ ...update, value: bindableIntegerValue(update.value) }));
+  const editLimitBytes = isHistoryReplay
+    ? 0
+    : assertCellValuesWithinEditLimit(
+        updates.map(update => update.value),
+        maxEditValueBytes
+      );
+  const textEncoding = getCellTextEncoding();
+
+  if (updates.some(update => isPrimaryKeyRecordId(update.rowId))) {
+    if (!updates.every(update => isPrimaryKeyRecordId(update.rowId))) {
+      throw new Error('Cannot mix rowid and primary-key row identities');
+    }
+    const identity = await resolveTableIdentity(table);
+    if (identity.kind !== 'primaryKey') {
+      throw new Error(`Primary-key identity cannot target rowid table ${table}`);
+    }
+
+    const savepointName = createViewSavepointName('sp_update_pk_batch');
+    runSingleStatement(`SAVEPOINT ${savepointName}`);
+    try {
+      assertUpdateHasNoTargetTableTriggerWrites(
+        table,
+        updates.map(update => update.column),
+        false
+      );
+      if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+        for (const update of updates) {
+          const metadata = await getCellMetadata({
+            table,
+            rowId: update.rowId,
+            column: update.column
+          });
+          if (
+            (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+            && metadata.byteLength > editLimitBytes
+          ) {
+            throw new OversizedCellReplacementRequiredError(
+              table,
+              update.column,
+              metadata.storageClass,
+              metadata.byteLength,
+              editLimitBytes
+            );
+          }
+        }
+      }
+      if (!isHistoryReplay) assertBatchPriorsFitUndoBudget(table, updates, identity, maxUndoSnapshotBytes);
+      const updatesByRow = new Map();
+      for (const update of updates) {
+        const rowUpdates = updatesByRow.get(update.rowId) ?? [];
+        rowUpdates.push(update);
+        updatesByRow.set(update.rowId, rowUpdates);
+      }
+
+      const results = [];
+      for (const [rowId, rowUpdates] of updatesByRow) {
+        const oldPredicate = buildRecordIdentityPredicate(rowId, identity);
+        const columns = [...new Set(rowUpdates.map(update => update.column))];
+        if (columns.length !== rowUpdates.length) {
+          throw new Error(`Batch update for ${table} contains the same column more than once`);
+        }
+        const current = db.exec(
+          `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+          `FROM ${escapeMainIdentifier(table)} WHERE ${oldPredicate.sql} LIMIT 2`,
+          normalizeBindParams(oldPredicate.params),
+          { useBigInt: true }
+        )[0];
+        if ((current?.values.length ?? 0) !== 1) {
+          throw new Error(`Cannot update ${table}: row identity no longer exists`);
+        }
+
+        const preparedUpdates = rowUpdates.map((update, index) => {
+          const priorState = parseStoredCellState(
+            current.values[0][index * 2],
+            current.values[0][index * 2 + 1],
+            `${table}.${update.column}`,
+            { textEncoding }
+          );
+          const priorValue = priorState.value;
+          const prepared = prepareCellUpdateForStorage(
+            update.value,
+            priorValue,
+            update.operation ?? 'set'
+          );
+          const storedValue = prepared.operation === 'json_patch'
+            ? applyJsonPatchValue(priorValue, prepared.value)
+            : prepared.value;
+          if (!isHistoryReplay && prepared.operation === 'json_patch') {
+            // The resulting JSON can exceed the limit even when the patch does not.
+            assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+          }
+          return { update, priorValue, priorState, prepared, storedValue };
+        });
+        const setClause = preparedUpdates.map(({ update, storedValue }) => (
+          `${escapeIdentifier(update.column)} = ${bindPlaceholder(storedValue)}`
+        )).join(', ');
+        db.run(
+          `UPDATE OR ABORT ${escapeMainIdentifier(table)} SET ${setClause} WHERE ${oldPredicate.sql}`,
+          normalizeBindParams([
+            ...preparedUpdates.map(update => update.storedValue),
+            ...oldPredicate.params
+          ])
+        );
+        if (readChangesCount() !== 1) {
+          throw new Error(`Cannot update ${table}: row identity no longer exists`);
+        }
+
+        const primaryKeyReplacements = [];
+        for (const preparedUpdate of preparedUpdates) {
+          const keyIndex = identity.columns.findIndex(
+            keyColumn => keyColumn.identifier === preparedUpdate.update.column
+          );
+          if (keyIndex >= 0) {
+            primaryKeyReplacements.push({
+              column: preparedUpdate.update.column,
+              value: preparedUpdate.storedValue
+            });
+          }
+        }
+        const candidateId = replacePrimaryKeyRecordIdValues(
+          rowId,
+          identity,
+          primaryKeyReplacements
+        );
+        const newRowId = readPrimaryKeyRecordId(
+          table,
+          identity,
+          buildRecordIdentityPredicate(
+            candidateId,
+            identity,
+            primaryKeyReplacements.map(replacement => replacement.column)
+          ),
+          unresolvableTriggeredPrimaryKeyUpdateError(table)
+        );
+        const newPredicate = buildRecordIdentityPredicate(newRowId, identity);
+        const post = db.exec(
+          `SELECT ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+          `FROM ${escapeMainIdentifier(table)} WHERE ${newPredicate.sql} LIMIT 2`,
+          normalizeBindParams(newPredicate.params),
+          { useBigInt: true }
+        )[0];
+        if ((post?.values.length ?? 0) !== 1) {
+          throw unresolvableTriggeredPrimaryKeyUpdateError(table);
+        }
+        for (const [index, preparedUpdate] of preparedUpdates.entries()) {
+          results.push({
+            rowId,
+            newRowId,
+            columnName: preparedUpdate.update.column,
+            priorValue: preparedUpdate.priorValue,
+            newValue: preparedUpdate.prepared.value,
+            priorState: preparedUpdate.priorState,
+            postState: parseStoredCellState(
+              post.values[0][index * 2],
+              post.values[0][index * 2 + 1],
+              `${table}.${preparedUpdate.update.column}`,
+              { textEncoding }
+            ),
+            operation: preparedUpdate.prepared.operation
+          });
+        }
+      }
+
+      assertBatchAnswerFits(results);
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return results;
+    } catch (error) {
+      safeRollbackSavepoint(savepointName, 'updatePrimaryKeyCellBatch');
+      throw error;
+    }
+  }
+
+  const rowIdIdentity = await resolveTableIdentity(table);
+  if (rowIdIdentity.kind !== 'rowid') {
+    throw new Error(`Rowid identity cannot target WITHOUT ROWID table ${table}`);
+  }
+
+  const savepointName = createViewSavepointName('sp_update_cell_batch');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    if (!isHistoryReplay && maxEditValueBytes !== undefined) {
+      for (const update of updates) {
+        const metadata = await getCellMetadata({
+          table,
+          rowId: update.rowId,
+          column: update.column
+        });
+        if (
+          (metadata.storageClass === 'text' || metadata.storageClass === 'blob')
+          && metadata.byteLength > editLimitBytes
+        ) {
+          throw new OversizedCellReplacementRequiredError(
+            table,
+            update.column,
+            metadata.storageClass,
+            metadata.byteLength,
+            editLimitBytes
+          );
+        }
+      }
+    }
+    const rowIdAliasColumn = readRowIdAliasColumn(table);
+    if (!isHistoryReplay) {
+      assertBatchPriorsFitUndoBudget(table, updates, rowIdIdentity, maxUndoSnapshotBytes, rowIdAliasColumn);
+    }
+    assertUpdateHasNoTargetTableTriggerWrites(
+      table,
+      updates.map(update => update.column)
+    );
+    if (
+      rowIdAliasColumn !== undefined
+      && updates.some(update => sqliteIdentifiersEqual(update.column, rowIdAliasColumn))
+    ) {
+      const results = updateRowIdAliasCellBatchWithinSavepoint(
+        table,
+        rowIdAliasColumn,
+        updates,
+        editLimitBytes,
+        isHistoryReplay
+      );
+      assertBatchAnswerFits(results);
+      runSingleStatement(`RELEASE ${savepointName}`);
+      return results;
+    }
+    const rowIds = [...new Set(updates.map(update => validateRowId(update.rowId)))];
+    const columns = [...new Set(updates.map(update => update.column))];
+    const escapedTable = escapeMainIdentifier(table);
+    const currentValues = new Map();
+    const predicates = buildRecordIdentityPredicateChunks(rowIds, { kind: 'rowid' });
+    for (const predicate of predicates) {
+      const currentResult = db.exec(
+        `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+        `FROM ${escapedTable} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params),
+        { useBigInt: true }
+      )[0];
+      for (const row of currentResult?.values ?? []) {
+        const values = new Map();
+        columns.forEach((column, index) => values.set(column, parseStoredCellState(
+          row[index * 2 + 1],
+          row[index * 2 + 2],
+          `${table}.${column}`,
+          { textEncoding }
+        )));
+        currentValues.set(String(validateRowId(row[0])), values);
+      }
+    }
+    const results = [];
+    const processedUpdates = updates.map(update => {
+      const rowId = validateRowId(update.rowId);
+      const row = currentValues.get(String(rowId));
+      if (!row) {
+        throw new Error(`Cannot update ${table}.${update.column}: row ${update.rowId} no longer exists`);
+      }
+      const priorState = row.get(update.column);
+      if (!priorState) {
+        throw new Error(`Cannot update ${table}.${update.column}: cell state is unavailable`);
+      }
+      const priorValue = priorState.value;
+      const prepared = prepareCellUpdateForStorage(
+        update.value,
+        priorValue,
+        update.operation ?? 'set'
+      );
+      if (!isHistoryReplay && prepared.operation === 'json_patch') {
+        const storedValue = applyJsonPatchValue(priorValue, prepared.value);
+        assertCellValueWithinEditLimit(storedValue, editLimitBytes);
+      }
+      results.push({
+        rowId,
+        columnName: update.column,
+        priorValue,
+        newValue: prepared.value,
+        priorState,
+        operation: prepared.operation
+      });
+      return { ...update, rowId, value: prepared.value, operation: prepared.operation };
+    });
+    for (const update of processedUpdates) {
+      const escapedColumn = escapeIdentifier(update.column);
+      const isJsonPatch = update.operation === 'json_patch';
+      const sql = isJsonPatch
+        ? `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = json_patch(COALESCE(${escapedColumn}, '{}'), ?) WHERE rowid = ?`
+        : `UPDATE OR ABORT ${escapedTable} SET ${escapedColumn} = ${bindPlaceholder(update.value)} WHERE rowid = ?`;
+      db.run(sql, normalizeBindParams([update.value, update.rowId]));
+    }
+    const remainingRowIds = new Set();
+    for (const predicate of predicates) {
+      const remaining = db.exec(
+        `SELECT CAST(rowid AS TEXT) FROM ${escapedTable} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params),
+        { useBigInt: true }
+      )[0];
+      for (const row of remaining?.values ?? []) {
+        remainingRowIds.add(String(validateRowId(row[0])));
+      }
+    }
+    if (rowIds.some(rowId => !remainingRowIds.has(String(rowId)))) {
+      throw unresolvableTriggeredRowIdUpdateError(table);
+    }
+    const postValues = new Map();
+    for (const predicate of predicates) {
+      const post = db.exec(
+        `SELECT CAST(rowid AS TEXT), ${columns.map(buildStoredCellStateProjection).join(', ')} ` +
+        `FROM ${escapedTable} WHERE ${predicate.sql}`,
+        normalizeBindParams(predicate.params),
+        { useBigInt: true }
+      )[0];
+      for (const row of post?.values ?? []) {
+        const values = new Map();
+        columns.forEach((column, index) => values.set(column, parseStoredCellState(
+          row[index * 2 + 1],
+          row[index * 2 + 2],
+          `${table}.${column}`,
+          { textEncoding }
+        )));
+        postValues.set(String(validateRowId(row[0])), values);
+      }
+    }
+    const completedResults = results.map(result => {
+      const postState = postValues.get(String(result.rowId))?.get(result.columnName);
+      if (!postState) throw unresolvableTriggeredRowIdUpdateError(table);
+      return { ...result, postState };
+    });
+    assertBatchAnswerFits(completedResults);
+    runSingleStatement(`RELEASE ${savepointName}`);
+    return completedResults;
+  } catch (e) {
+    safeRollbackSavepoint(savepointName, 'updateCellBatch');
+    throw e;
+  }
+}
+
+/**
+ * Add a column to a table.
+ *
+ * @param {string} table - Table name
+ * @param {string} column - Column name
+ * @param {string} type - Column type
+ * @param {string} [defaultValue] - Default value
+ */
+async function addColumn(table, column, type, defaultValue) {
+  assertUsableSqlIdentifier(table, 'Table name');
+  assertUsableSqlIdentifier(column, 'Column name');
+  if (!db) throw new Error('No database initialized');
+  assertWritableMutation('Column creation');
+
+  validateSqlType(type);
+
+  let sql = `ALTER TABLE ${escapeMainIdentifier(table)} ` +
+    `ADD COLUMN ${escapeIdentifier(column)} ${type}`;
+  if (defaultValue !== undefined && defaultValue !== null && defaultValue !== "") {
+    sql += ` DEFAULT ${formatDefaultValue(defaultValue)}`;
+  }
+
+  const savepointName = createViewSavepointName('sp_add_column');
+  runSingleStatement(`SAVEPOINT ${savepointName}`);
+  try {
+    const dependenciesBefore = await captureViewDependencySnapshot();
+    runSingleStatement(sql);
+    assertNoNewBrokenSchemaDependencies(
+      dependenciesBefore,
+      await captureViewDependencySnapshot()
+    );
+    runSingleStatement(`RELEASE ${savepointName}`);
+  } catch (error) {
+    safeRollbackSavepoint(savepointName, 'addColumn');
+    throw error;
+  }
+}
+
+/**
+ * Ping to check if database is responsive.
+ *
+ * @returns {Promise<boolean>} True if responsive
+ */
+async function ping() {
+  if (!db) return false;
+  try {
+    db.exec('SELECT 1');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reject worker-local reload requests. The demo host owns the original source,
+ * so only it can authoritatively replace the database with fresh source bytes.
+ *
+ * @returns {Promise<void>}
+ */
+async function refreshFile() {
+  throw new Error(
+    'Reload must be handled by the demo host so it can reinitialize from the original database source'
+  );
+}
+
+// ============================================================================
+// RPC Message Handler
+// ============================================================================
+
+/**
+ * Map of method names to handler functions.
+ */
+const methods = {
+  initializeDatabase,
+  runQuery,
+  runConsole,
+  executeReadQuery,
+  getCellMetadata,
+  openCellReadSession,
+  readCellChunk,
+  closeCellReadSession,
+  exportDatabase,
+  exportTable,
+  fetchTableData,
+  fetchTableCount,
+  fetchSchema,
+  getTableInfo,
+  getImportTarget,
+  getPragmas,
+  setPragma,
+  updateCell,
+  replaceOversizedCell,
+  insertRow,
+  insertRowWithHistory,
+  importRows,
+  deleteRows,
+  findDependentIndexes,
+  deleteColumns,
+  createTable,
+  getViewDefinition,
+  validateViewDefinition,
+  previewViewDefinition,
+  createView,
+  editView,
+  dropView,
+  undoModification,
+  redoModification,
+  updateCellBatch,
+  addColumn,
+  ping,
+  refreshFile
+};
+
+/**
+ * Handle incoming RPC messages from the main thread.
+ */
+self.onmessage = async (event) => {
+  const envelope = event.data;
+
+  // Validate message format
+  if (!envelope || envelope.channel !== 'rpc' || !envelope.content) {
+    // Never retain or print an attacker-controlled envelope: it may contain a
+    // complete database, cell values, or an intentionally huge object graph.
+    console.warn('[Worker] Invalid message format', {
+      valueType: envelope === null
+        ? 'null'
+        : Array.isArray(envelope)
+          ? 'array'
+          : typeof envelope,
+      hasRpcChannel: envelope?.channel === 'rpc',
+      hasContent: Boolean(envelope?.content)
+    });
+    return;
+  }
+
+  const { kind, messageId, targetMethod, payload } = envelope.content;
+
+  // Only handle invoke messages
+  if (kind !== 'invoke') {
+    return;
+  }
+
+  // Correlation IDs are reflected in the response. Keep that reflection
+  // bounded and typed so a malformed caller cannot make every response carry
+  // an attacker-sized object graph.
+  if (typeof messageId !== 'string' || messageId.length === 0 || messageId.length > 256) {
+    console.warn('[Worker] Invalid RPC correlation ID');
+    return;
+  }
+
+  // Find handler
+  const hasHandler = typeof targetMethod === 'string'
+    && Object.prototype.hasOwnProperty.call(methods, targetMethod);
+  const handler = hasHandler ? methods[targetMethod] : undefined;
+  if (typeof handler !== 'function') {
+    self.postMessage({
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId,
+        success: false,
+        errorMessage: `Unknown method: ${typeof targetMethod === 'string'
+          ? targetMethod.slice(0, 256)
+          : '<invalid>'}`
+      }
+    });
+    return;
+  }
+
+  if (!Array.isArray(payload)) {
+    self.postMessage({
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId,
+        success: false,
+        errorMessage: 'Worker RPC payload must be an array'
+      }
+    });
+    return;
+  }
+
+  // Execute handler
+  try {
+    assertCellReadSessionAllowsMethod(targetMethod);
+    const result = await handler(...payload);
+
+    const response = {
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId,
+        success: true,
+        data: result
+      }
+    };
+    // A merged database image is already a dedicated Uint8Array from sql.js.
+    // Transfer its buffer so the page does not retain a second structured-
+    // clone copy before constructing the download Blob.
+    if (targetMethod === 'exportDatabase' && result instanceof Uint8Array) {
+      const transferableResult = result.byteOffset === 0
+        && result.byteLength === result.buffer.byteLength
+        && result.buffer instanceof ArrayBuffer
+        ? result
+        : result.slice();
+      response.content.data = transferableResult;
+      self.postMessage(response, [transferableResult.buffer]);
+    } else {
+      self.postMessage(response);
+    }
+  } catch (error) {
+    const errorMessage = getErrorMessage(error);
+    console.error('[Worker] Method error:', targetMethod, errorMessage);
+
+    let errorData;
+    try {
+      errorData = toCellEditRpcErrorData(error);
+    } catch {
+      // Hostile rejection objects are reported as bounded scalar errors only.
+    }
+    self.postMessage({
+      channel: 'rpc',
+      content: {
+        kind: 'response',
+        messageId,
+        success: false,
+        errorMessage,
+        ...(errorData ? { error: errorData } : {})
+      }
+    });
+  }
+};
+
+// ============================================================================
+// Worker Ready
+// ============================================================================

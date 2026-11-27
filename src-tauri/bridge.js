@@ -1,6 +1,6 @@
 // Injected into the webview before any page script. Adapts the narrow
-// __SQLITE_DESKTOP__ bridge contract onto Tauri's global API so the upstream
-// viewer bundle never touches Tauri directly.
+// __SQLITE_DESKTOP__ bridge contract onto Tauri's global API so the viewer
+// bundle never touches Tauri directly.
 (function () {
   const invoke = (...args) => window.__TAURI__.core.invoke(...args);
   // Native menu accelerators do not reliably reach a focused Windows WebView,
@@ -46,7 +46,7 @@
   };
   const subscriptions = [];
   const listenBeforeReady = (name, handler) => {
-    // The upstream viewer registers listeners without awaiting them. Retain
+    // The viewer registers listeners without awaiting them. Retain
     // their completion here so viewerReady cannot flush a startup path into a
     // listener that Tauri has not installed yet. Capture failures immediately;
     // viewerReady propagates them through the viewer's visible error path.
@@ -93,7 +93,7 @@
         headers: { 'x-default-name': encodePathHeader(defaultName), 'x-adopt': '1' }
       });
     },
-    // CSV/JSON import (upstream import-data.js). Two calls, both dialog-mediated
+    // CSV/JSON import (viewer/core/ui/modules/import-data.js). Two calls, both dialog-mediated
     // and both READ-ONLY on the shell side: the pick shows the native open dialog
     // filtered to .csv/.json and puts the chosen path on the shell's IMPORT
     // allowlist — a separate list from the database session allowlist, so an

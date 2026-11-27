@@ -1,0 +1,172 @@
+import './vscode_mock_setup';
+
+import { afterEach, it } from 'node:test';
+import assert from 'node:assert';
+
+const stateModulePath = '../../core/ui/modules/state.js';
+const clipboardModulePath = '../../core/ui/modules/clipboard.js';
+
+let navigatorDescriptor: PropertyDescriptor | undefined;
+
+afterEach(async () => {
+    if (navigatorDescriptor) {
+        Object.defineProperty(globalThis, 'navigator', navigatorDescriptor);
+    } else {
+        delete (globalThis as any).navigator;
+    }
+    navigatorDescriptor = undefined;
+    delete (globalThis as any).document;
+
+    const { state } = await import(stateModulePath);
+    state.selectedTableType = null;
+    state.tableColumns = [];
+    state.gridData = [];
+    state.gridExactIntegerTexts = {};
+    state.gridOversizedCells = {};
+    state.selectedCells = [];
+    state.selectedRowIds.clear();
+    state.pinnedColumns.clear();
+    state.pinnedRowIds.clear();
+});
+
+it('copies exact numeric sidecar text for single cells, ranges, and selected rows', async () => {
+    const writes: string[] = [];
+    navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { clipboard: { writeText: async (text: string) => writes.push(text) } }
+    });
+    (globalThis as any).document = {
+        getElementById() { return null; }
+    };
+
+    const { state } = await import(stateModulePath);
+    const {
+        copyCellsToClipboard,
+        copySelectedRowsToClipboard
+    } = await import(clipboardModulePath);
+    state.selectedTableType = 'table';
+    state.tableColumns = [{ name: 'value', type: 'INTEGER' }];
+    state.gridData = [
+        [1, 9007199254740992],
+        [2, 9007199254740996]
+    ];
+    state.gridExactIntegerTexts = {
+        0: { 1: '9007199254740993' },
+        1: { 1: '9007199254740995' }
+    };
+
+    state.selectedCells = [
+        { rowIdx: 0, colIdx: 0, rowId: 1, value: 9007199254740992 }
+    ];
+    await copyCellsToClipboard();
+
+    state.selectedCells = [
+        { rowIdx: 0, colIdx: 0, rowId: 1, value: 9007199254740992 },
+        { rowIdx: 1, colIdx: 0, rowId: 2, value: 9007199254740996 }
+    ];
+    await copyCellsToClipboard();
+
+    state.selectedRowIds.add(1);
+    state.selectedRowIds.add(2);
+    await copySelectedRowsToClipboard();
+
+    assert.deepStrictEqual(writes, [
+        '9007199254740993',
+        '9007199254740993\n9007199254740995',
+        'value\n9007199254740993\n9007199254740995'
+    ]);
+});
+
+it('refuses cell, range, and row copies containing a truncated grid value', async () => {
+    const writes: string[] = [];
+    const status = { textContent: '' };
+    navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { clipboard: { writeText: async (text: string) => writes.push(text) } }
+    });
+    (globalThis as any).document = {
+        getElementById(id: string) { return id === 'statusText' ? status : null; }
+    };
+
+    const { state } = await import(stateModulePath);
+    const {
+        copyCellsToClipboard,
+        copySelectedRowsToClipboard
+    } = await import(clipboardModulePath);
+    state.selectedTableType = 'table';
+    state.tableColumns = [
+        { name: 'truncated_text', type: 'TEXT' },
+        { name: 'ordinary_text', type: 'TEXT' }
+    ];
+    state.gridData = [[1, 'bounded prefix', 'complete']];
+    state.gridOversizedCells = {
+        0: { 1: { storageClass: 'text', byteLength: 32 * 1024 * 1024 } }
+    };
+
+    state.selectedCells = [
+        { rowIdx: 0, colIdx: 0, rowId: 1, value: 'bounded prefix' }
+    ];
+    await copyCellsToClipboard();
+    assert.match(status.textContent, /truncated.*Open Full Content.*[Ee]xport/);
+
+    state.selectedCells = [
+        { rowIdx: 0, colIdx: 0, rowId: 1, value: 'bounded prefix' },
+        { rowIdx: 0, colIdx: 1, rowId: 1, value: 'complete' }
+    ];
+    await copyCellsToClipboard();
+
+    state.selectedCells = [];
+    state.selectedRowIds.add(1);
+    await copySelectedRowsToClipboard();
+
+    assert.deepStrictEqual(writes, []);
+});
+
+it('copies selected cells and rows in pinned-first visual order', async () => {
+    const writes: string[] = [];
+    navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+    Object.defineProperty(globalThis, 'navigator', {
+        configurable: true,
+        value: { clipboard: { writeText: async (text: string) => writes.push(text) } }
+    });
+    (globalThis as any).document = { getElementById() { return null; } };
+
+    const { state } = await import(stateModulePath);
+    const {
+        copyCellsToClipboard,
+        copySelectedRowsToClipboard
+    } = await import(clipboardModulePath);
+    state.selectedTableType = 'table';
+    state.tableColumns = [
+        { name: 'a', type: 'TEXT' },
+        { name: 'b', type: 'TEXT' },
+        { name: 'c', type: 'TEXT' }
+    ];
+    state.gridData = [
+        [1, '1a', '1b', '1c'],
+        [2, '2a', '2b', '2c'],
+        [3, '3a', '3b', '3c']
+    ];
+    state.pinnedColumns.add('c');
+    state.pinnedRowIds.add(3);
+    state.selectedCells = state.gridData.flatMap((row: any[], rowIdx: number) => (
+        state.tableColumns.map((_column: any, colIdx: number) => ({
+            rowIdx,
+            colIdx,
+            rowId: row[0],
+            value: row[colIdx + 1]
+        }))
+    ));
+
+    await copyCellsToClipboard();
+    state.selectedCells = [];
+    state.selectedRowIds = new Set([1, 2, 3]);
+    await copySelectedRowsToClipboard();
+
+    assert.deepStrictEqual(writes, [
+        '3c\t3a\t3b\n1c\t1a\t1b\n2c\t2a\t2b',
+        'c\ta\tb\n3c\t3a\t3b\n1c\t1a\t1b\n2c\t2a\t2b'
+    ]);
+});

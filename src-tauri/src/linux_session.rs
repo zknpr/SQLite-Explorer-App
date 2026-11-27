@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::DialogExt;
 
 use crate::{quit_decision_for, CloseDecision, Windows};
 
@@ -109,10 +108,13 @@ unsafe extern "C" fn interact_granted(connection: Connection, data: *mut c_void)
         // the session manager hostage; saving/discarding remains the user's choice.
         SmcInteractDone(connection, 1);
         SmcSaveYourselfDone(connection, 1);
-        client.app.dialog()
-            .message("Logout was cancelled because a database has unsaved changes. Save or discard them, then try again.")
-            .title("Unsaved changes")
-            .show(|_| {});
+        crate::inform(
+            &client.app,
+            crate::target_window(&client.app).as_deref(),
+            "Unsaved changes",
+            "Logout was cancelled because a database has unsaved changes. Save or discard them, then try again.".to_string(),
+            tauri_plugin_dialog::MessageDialogKind::Info,
+        );
     }));
     if result.is_err() { eprintln!("could not finish the X11 session-end interaction"); }
 }

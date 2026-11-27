@@ -1,0 +1,1779 @@
+/**
+ * A sql.js-shaped `Database` implemented over the fork's `tjs:sqlite` binding.
+ *
+ * The desktop native sidecar runs the EXISTING UI-method layer
+ * (`worker/worker.js`) unchanged; that layer talks to
+ * sql.js. This module is the adapter that lets it talk to real SQLite instead.
+ * It implements exactly the surface that layer uses -- `exec`, `run`,
+ * `prepare`, `iterateStatements`, `getRowsModified`, `export`, `close`,
+ * `progress_handler`, and the statement methods `step/get/getColumnNames/
+ * run/free/getSQL` -- and nothing else.
+ *
+ * The backing module is INJECTED (`deps.sqlite`) rather than imported, so the
+ * same file runs over real `tjs:sqlite` inside the sidecar and over a
+ * node:sqlite stand-in in CI. Everything below is written against the fork API
+ * facts established by probing the fork's binary, several of
+ * which contradict both stock txiki.js and node:sqlite:
+ *
+ *   - `Statement` is `{finalize, toString, all, run}`. There is NO `step()`,
+ *     no cursor, and no column metadata. Every statement therefore MATERIALISES
+ *     through `all()` on first use and the shim replays rows from an index.
+ *   - `prepare()` compiles but does NOT execute (probed), so prepare-then-step
+ *     runs a statement exactly once.
+ *   - `prepare()` on a multi-statement string silently compiles only the first
+ *     statement and exposes no tail pointer -- see `consumedSourceLength`.
+ *   - An empty result set carries NO column names, and duplicate column names
+ *     collapse in `all()`'s row objects (last one wins). Both are repaired via
+ *     a TEMP VIEW + `pragma_table_info` probe.
+ *   - int64 crosses as `number` below 2^53 and `BigInt` at or beyond it; BLOBs
+ *     are `Uint8Array`. Values are passed through, never coerced, except where
+ *     sql.js's own `useBigInt` contract requires a Number.
+ *   - SQLite errors carry the primary result code on a NON-ENUMERABLE
+ *     `err.errno`. Errors are propagated unwrapped wherever possible; where the
+ *     shim must construct one, `copyErrno` carries the code across.
+ */
+
+import { buildSqliteErrorMessage } from './sqlite-errors.js';
+
+/** Reserved-prefix-free name for the throwaway column-probe views. */
+let columnProbeCounter = 0;
+
+/**
+ * Matches an SQLite bound-parameter token: `?`, `?NNN`, `:name`, `@name`, `$name`.
+ *
+ * The name class mirrors SQLite's own IdChar: alphanumerics, `_`, `$`, and ANY
+ * byte at or above 0x80 — so `:café` is one token, not `:caf` followed by a
+ * misalignment. (Astral characters arrive as surrogate pairs, each of which
+ * falls inside \u0080-\uffff.)
+ */
+const PARAMETER_TOKEN = /^(?:\?\d*|[:@$][A-Za-z0-9_$\u0080-\uffff]+(?:\([^()]*\))?)/;
+
+/** Leading `EXPLAIN` / `EXPLAIN QUERY PLAN`, after any leading trivia is stripped. */
+const EXPLAIN_PREFIX = /^explain\b/i;
+
+/**
+ * Leading `ATTACH` / `DETACH`, after any leading trivia is stripped. Both are
+ * always the FIRST token of a standalone statement and cannot nest anywhere
+ * else in the grammar (see the reject site in `compileNext`), so matching the
+ * leading token is a complete test.
+ */
+const ATTACH_DETACH_PREFIX = /^(?:attach|detach)\b/i;
+
+/** Leading `VACUUM`, after leading trivia is stripped (in-place VACUUM or VACUUM INTO). */
+const VACUUM_PREFIX = /^vacuum\b/i;
+
+/**
+ * Statements whose column names a caller can actually be counting on: the ones
+ * a `CREATE VIEW ... AS` body may legally be. Everything else (DML, DDL,
+ * PRAGMA, EXPLAIN) is un-viewable BY DESIGN, so a probe failure on it is not a
+ * failure at all -- it is the ladder's documented "[]" rung.
+ *
+ * Used only to decide whether a probe refusal is worth escalating (see
+ * `withColumnProbeView`). Over-matching is harmless: `WITH ... INSERT` leads
+ * with WITH and is not viewable, but it is refused for its own reasons long
+ * before column names matter.
+ */
+const VIEWABLE_PREFIX = /^(?:select|values|with)\b/i;
+
+/**
+ * A bareword `into` anywhere in a SINGLE statement's own source. On a statement
+ * whose leading token is `VACUUM`, this can only be the `INTO` clause: the
+ * legitimate forms are `VACUUM`, `VACUUM main`, `VACUUM temp` (no schema alias
+ * beyond main/temp exists, because ATTACH is blocked), none of which contain
+ * `into`. Evasion-proof: a real `VACUUM ... INTO` always carries the literal
+ * `INTO` token in its source, whatever comments surround it, so this matches it.
+ */
+const INTO_WORD = /\binto\b/i;
+
+/**
+ * Cheap pre-filter for `db.run(sql)`'s no-param branch (the one path that skips
+ * `compileNext`): only when one of these path-authority keywords appears is the
+ * double-compiling scan worth running. A false hit (the word inside a string
+ * literal or comment) costs one extra parse of a script no real caller writes;
+ * a miss is impossible because none of these tokens can be spelled another way.
+ */
+const PATH_AUTHORITY_SCAN_WORD = /\b(?:attach|detach|vacuum)\b/i;
+
+/**
+ * Error codes stamped on the path-authority refusals. Distinct from the frame
+ * codec's `ERR_NATIVE_FRAME_*` family so a structured consumer can tell a SQL
+ * policy refusal from a transport failure, and distinct from each other so the
+ * two SQL→filesystem vectors are separable in logs.
+ */
+export const NATIVE_SQL_ATTACH_BLOCKED = 'ERR_NATIVE_SQL_ATTACH_BLOCKED';
+export const NATIVE_SQL_VACUUM_INTO_BLOCKED = 'ERR_NATIVE_SQL_VACUUM_INTO_BLOCKED';
+
+/**
+ * The refusal thrown for a leading ATTACH/DETACH. A plain message (no errno:
+ * this is a shim policy, not a SQLite result code) naming the reason, plus the
+ * distinct `code`.
+ */
+function attachDetachBlockedError(keyword) {
+    const error = new Error(
+        `${keyword.toUpperCase()} is blocked on the native engine: it can open or ` +
+        'create a database file outside the path this session is bound to, which ' +
+        'would defeat the desktop path sandbox. Only the bound database is reachable.'
+    );
+    error.code = NATIVE_SQL_ATTACH_BLOCKED;
+    return error;
+}
+
+/**
+ * The refusal thrown for a `VACUUM ... INTO`. In-place `VACUUM` is untouched;
+ * only the file-writing INTO variant is blocked (it writes a full copy of the
+ * bound database to an arbitrary path).
+ */
+function vacuumIntoBlockedError() {
+    const error = new Error(
+        'VACUUM ... INTO is blocked on the native engine: it writes a full copy of ' +
+        'the database to an arbitrary path outside the one this session is bound to, ' +
+        'defeating the desktop path sandbox. Plain VACUUM (in place) is allowed.'
+    );
+    error.code = NATIVE_SQL_VACUUM_INTO_BLOCKED;
+    return error;
+}
+
+/**
+ * Drop leading whitespace, empty statements and comments.
+ *
+ * `sqlite3_sql` keeps whatever trivia the parser consumed on its way into the
+ * statement, so the shim has to skip past it before it can either recognise a
+ * leading keyword or splice the text into a `CREATE VIEW ... AS` body.
+ */
+function stripLeadingTrivia(text) {
+    let index = 0;
+    for (;;) {
+        const before = index;
+        while (index < text.length && (/\s/.test(text[index]) || text[index] === ';')) index += 1;
+        if (text.startsWith('--', index)) {
+            const lineEnd = text.indexOf('\n', index);
+            index = lineEnd < 0 ? text.length : lineEnd + 1;
+        } else if (text.startsWith('/*', index)) {
+            const blockEnd = text.indexOf('*/', index + 2);
+            index = blockEnd < 0 ? text.length : blockEnd + 2;
+        }
+        if (index === before) return text.slice(index);
+    }
+}
+
+/** BigInt bounds for `toBindableValue`: the int32 range and SQLite's INTEGER range. */
+const INT32_MIN = -2147483648n;
+const INT32_MAX = 2147483647n;
+const INT64_MIN = -9223372036854775808n;
+const INT64_MAX = 9223372036854775807n;
+
+/** What `sqlite3_expanded_sql` renders for a parameter that was never bound. */
+const UNBOUND_PARAMETER_TEXT = 'NULL';
+
+/**
+ * Carry a SQLite error's non-enumerable `errno` onto a replacement error.
+ *
+ * `Object.keys(err)` is empty on fork errors and `errno` is non-enumerable, so
+ * spreading or re-throwing a fresh Error silently drops the only field that can
+ * classify the failure (messages are nonspecific -- syntax errors and missing
+ * tables are both "SQL logic error"/1).
+ */
+export function copyErrno(target, source) {
+    const errno = source?.errno;
+    if (errno !== undefined && target.errno === undefined) {
+        Object.defineProperty(target, 'errno', {
+            value: errno,
+            enumerable: false,
+            writable: true,
+            configurable: true
+        });
+    }
+    return target;
+}
+
+/** SQLite primary result code 8, `SQLITE_READONLY`. */
+const SQLITE_READONLY = 8;
+
+/** SQLite primary result code 5, `SQLITE_BUSY`: "database is locked". */
+const SQLITE_BUSY = 5;
+
+/** True when another connection's lock refused the statement. */
+function isLockRefusal(error) {
+    return (Number(error?.errno) & 0xff) === SQLITE_BUSY;
+}
+
+/**
+ * True for "attempt to write a readonly database".
+ *
+ * `errno` only: the fork reports `sqlite3_errstr(rc)`, so a message match would
+ * be matching text the shim itself already knows how to derive from the code,
+ * and every other classifier in this file keys off `errno` for the same reason.
+ */
+function isReadOnlyRefusal(error) {
+    return error?.errno === SQLITE_READONLY;
+}
+
+/**
+ * Replace a nonspecific engine error with one that says what SQLite meant.
+ *
+ * The fork surfaces `sqlite3_errstr(rc)` and never `sqlite3_errmsg(db)`, so
+ * "SQL logic error" is the answer to a typo, a missing table and a missing
+ * column alike. `buildSqliteErrorMessage` only rewrites a message that is
+ * byte-identical to its own result code's canonical text, so an engine that DOES
+ * report detail (the node:sqlite stand-in the unit suite runs this shim over, or
+ * a future fork rebuild) passes through untouched.
+ *
+ * Fails open in every direction: no errno, no describer, or a throwing describer
+ * all return the original error. A diagnostic must never replace the failure it
+ * is describing.
+ */
+function describeBackingError(error, sql, describe) {
+    if (typeof describe !== 'function' || error?.errno === undefined) return error;
+    let message;
+    try {
+        message = describe(error, sql);
+    } catch {
+        return error;
+    }
+    if (message === undefined || message === error.message) return error;
+    const replacement = new Error(message, { cause: error });
+    return copyErrno(replacement, error);
+}
+
+/**
+ * How many characters of `source` the binding consumed when it compiled
+ * `compiled` (the statement's own SQL text, as `Statement.toString()` reports
+ * it).
+ *
+ * This is the shim's replacement for `sqlite3_prepare_v2`'s `pzTail` -- the
+ * fork exposes no tail pointer, so the boundary between one statement and the
+ * next has to be recovered from the compiled statement's text. That text is
+ * SQLite's EXPANDED sql: byte-identical to the consumed source (leading
+ * trivia, comments and the terminating semicolon included) except that each
+ * bound parameter is replaced by its value. The shim always splits BEFORE
+ * binding, so the only possible substitution is `NULL`, which makes the walk
+ * below exact rather than heuristic.
+ *
+ * Returns -1 if the two texts cannot be aligned; callers must treat that as a
+ * hard failure rather than guessing a boundary (guessing would silently drop
+ * or duplicate a statement in a console script).
+ */
+export function consumedSourceLength(source, compiled) {
+    // Fast path: no parameters in the consumed statement, so the compiled text
+    // IS the prefix. This is every statement in practice.
+    if (source.startsWith(compiled)) return compiled.length;
+
+    let sourceIndex = 0;
+    let compiledIndex = 0;
+    while (compiledIndex < compiled.length) {
+        if (sourceIndex < source.length && source[sourceIndex] === compiled[compiledIndex]) {
+            sourceIndex += 1;
+            compiledIndex += 1;
+            continue;
+        }
+        // Divergence can only be a parameter site: expanded SQL copies every
+        // other byte verbatim. A parameter sigil is never `N`, so this branch
+        // cannot be entered by an accidental character match.
+        const token = PARAMETER_TOKEN.exec(source.slice(sourceIndex));
+        if (!token || !compiled.startsWith(UNBOUND_PARAMETER_TEXT, compiledIndex)) return -1;
+        sourceIndex += token[0].length;
+        compiledIndex += UNBOUND_PARAMETER_TEXT.length;
+    }
+    return sourceIndex;
+}
+
+/** Draws before parameterMarker gives up; each repeat needs a 64-bit collision. */
+const PARAMETER_MARKER_DRAWS = 4;
+
+/** Reported once: the marker fell back from crypto to Math.random. */
+let reportedMarkerFallback = false;
+
+/**
+ * Fill `words` from crypto.getRandomValues, or, where the runtime has none
+ * or it throws, from Math.random. The fallback costs only predictability,
+ * which matters only for a schema name built to look like a probe literal
+ * (its column would be headed by the parameter's spelling); the marker is
+ * still checked against the statement once per draw, so the cost stays one
+ * scan either way.
+ */
+function fillMarkerWords(words) {
+    try {
+        globalThis.crypto.getRandomValues(words);
+        return;
+    } catch (error) {
+        if (!reportedMarkerFallback) {
+            reportedMarkerFallback = true;
+            console.warn(`[sqljs-shim] crypto.getRandomValues is unavailable (${error?.message ?? error}); column-probe markers use Math.random`);
+        }
+    }
+    for (let index = 0; index < words.length; index++) words[index] = Math.floor(Math.random() * 0x100000000);
+}
+
+/**
+ * The marker of one probe's parameter literals: a fixed prefix and 64 random
+ * bits. Absent from the source (checked once per draw, so the cost is one
+ * scan whatever the statement holds), so only the probe puts it in the
+ * probed text, and unpredictable, so no name the schema supplies holds it
+ * either.
+ */
+function parameterMarker(source) {
+    const words = new Uint32Array(2);
+    for (let draw = 0; draw < PARAMETER_MARKER_DRAWS; draw++) {
+        fillMarkerWords(words);
+        const marker = `sqlite_explorer_parameter_${words[0].toString(16).padStart(8, '0')}${words[1].toString(16).padStart(8, '0')}_`;
+        if (!source.includes(marker)) return marker;
+    }
+    throw new Error(
+        `Could not choose a column-probe marker the statement does not already contain in ${PARAMETER_MARKER_DRAWS} draws`
+    );
+}
+
+/**
+ * The column probe's text for a parameterised statement, and how to read the
+ * probe's names back as the statement's own.
+ *
+ * The expansion names an unaliased `?` or `:x` column "NULL", since that is
+ * the text a view over it holds; SQLite names it by what was written. So each
+ * parameter is spelled here as a string literal instead -- a literal compiles
+ * wherever a parameter does -- one literal per distinct spelling, so `SELECT
+ * ?, ?` still holds two equal names and the view still disambiguates them
+ * (`?`, `?:1`) as the duplicate repair expects. Each literal in a probed name
+ * is then put back as its spelling -- inside a name too, since an unaliased
+ * expression is named by its text (`? + 1`). Null when the two texts do not
+ * align, the walk being `consumedSourceLength`'s.
+ */
+function spelledParameterProbe(source, expanded) {
+    const marker = parameterMarker(source);
+    const literals = new Map();
+    let text = '';
+    let copiedFrom = 0;
+    let sourceIndex = 0;
+    let compiledIndex = 0;
+    while (compiledIndex < expanded.length) {
+        if (sourceIndex < source.length && source[sourceIndex] === expanded[compiledIndex]) {
+            sourceIndex += 1;
+            compiledIndex += 1;
+            continue;
+        }
+        const token = PARAMETER_TOKEN.exec(source.slice(sourceIndex));
+        if (!token || !expanded.startsWith(UNBOUND_PARAMETER_TEXT, compiledIndex)) return null;
+        let literal = literals.get(token[0]);
+        if (literal === undefined) {
+            literal = `'${marker}${literals.size}'`;
+            literals.set(token[0], literal);
+        }
+        text += source.slice(copiedFrom, sourceIndex) + literal;
+        sourceIndex += token[0].length;
+        copiedFrom = sourceIndex;
+        compiledIndex += UNBOUND_PARAMETER_TEXT.length;
+    }
+    if (literals.size === 0) return null;
+    return {
+        text: text + source.slice(copiedFrom, sourceIndex),
+        restore: (names) => names.map((name) => {
+            let restored = name;
+            for (const [spelling, literal] of literals) restored = restored.split(literal).join(spelling);
+            return restored;
+        })
+    };
+}
+
+/**
+ * `sql` (one statement) as the body of a CTE with `count` renamed columns,
+ * selected whole. Trailing semicolons go; the body closes on a new line so a
+ * trailing `--` comment cannot swallow the parenthesis.
+ */
+function columnListRead(sql, count) {
+    const columns = Array.from({ length: count }, (_, index) => `"c${index}"`).join(', ');
+    const body = sql.replace(/[\s;]+$/u, '');
+    return `WITH "sqlite_explorer_rows"(${columns}) AS (${body}\n) SELECT * FROM "sqlite_explorer_rows"`;
+}
+
+/**
+ * Does this column list carry SQLite's own duplicate disambiguation?
+ *
+ * A view over `SELECT 1 AS x, 2 AS x` reports its columns as `x`, `x:1`, while
+ * the binding's row objects collapse both into a single `x` key. Spotting the
+ * `name`/`name:N` pair is how the shim knows, before executing anything, that
+ * the two would disagree on arity. A column genuinely named `q:1` with no `q`
+ * beside it is not a match.
+ */
+function hasDisambiguatedDuplicates(names) {
+    const present = new Set(names);
+    return names.some(name => {
+        const match = /^(.*):\d+$/.exec(name);
+        return match !== null && present.has(match[1]);
+    });
+}
+
+/**
+ * Converts one parameter so that tjs:sqlite stores the storage class sql.js
+ * would store for it.
+ *
+ * sql.js's binder picks INTEGER for a Number that satisfies
+ * `num === (num | 0)` and REAL for any other. tjs:sqlite instead looks at how
+ * QuickJS represents the Number: the small-integer representation binds
+ * INTEGER, the double one REAL. Every Number decoded from a request frame
+ * (JSON.parse) and many arithmetic results are doubles in QuickJS even when
+ * whole, so a 28 typed in the grid landed as 28.0, and in a TEXT column as
+ * the text '28.0'. `value | 0` yields the small-integer form of the same
+ * value.
+ *
+ * Whole Numbers beyond int32 fail sql.js's test as well, so they are left as
+ * doubles and both engines store REAL. Negative zero is excluded on purpose:
+ * left a double, a REAL -0.0 that the worker read and binds again keeps its
+ * sign and its class, where sql.js turns it into INTEGER 0.
+ *
+ * BigInts bind as exact INTEGERs. QuickJS has two BigInt representations,
+ * and tjs:sqlite's binder accepts only the one used beyond the int32 range:
+ * binding `5n` threw "Invalid bound parameter type". Inside int32 the value
+ * is handed over as the equivalent small-integer Number instead. Outside the
+ * int64 range the binder would silently wrap the value (2^63 is stored as
+ * -2^63), so such a BigInt is rejected here. sql.js binds every BigInt as
+ * decimal TEXT; the worker's normalizeBindParams converts BigInts before
+ * either engine sees them, which leaves raw runQuery parameters as the one
+ * place where the two engines store different classes.
+ *
+ * `label` names the parameter in that rejection: its position, or its name.
+ */
+function toBindableValue(value, label) {
+    if (typeof value === 'number') {
+        const integer = value | 0;
+        return integer === value && !Object.is(value, -0) ? integer : value;
+    }
+    if (typeof value === 'bigint') {
+        if (value >= INT32_MIN && value <= INT32_MAX) return Number(value) | 0;
+        if (value < INT64_MIN || value > INT64_MAX) {
+            throw new RangeError(`Bound parameter ${label} is outside SQLite's 64-bit integer range`);
+        }
+    }
+    return value;
+}
+
+/**
+ * `toBindableValue` over a positional array or a named-parameter object. A
+ * copy: the caller's array (often a worker-owned params list it reuses) is
+ * left as it was.
+ */
+function toBindableParameters(values) {
+    if (Array.isArray(values)) return values.map((value, index) => toBindableValue(value, index + 1));
+    if (values === null || typeof values !== 'object') return values;
+    const bindable = {};
+    for (const key of Object.keys(values)) {
+        // defineProperty, not assignment: a key named `__proto__` would
+        // otherwise run Object.prototype's setter and vanish from the copy.
+        Object.defineProperty(bindable, key, {
+            value: toBindableValue(values[key], key),
+            enumerable: true,
+            writable: true,
+            configurable: true
+        });
+    }
+    return bindable;
+}
+
+/**
+ * True for a name JavaScript enumerates ahead of an object's other own keys:
+ * an array index, the canonical decimal form of an integer from 0 to 2^32 - 2.
+ */
+function isArrayIndexName(name) {
+    return /^(?:0|[1-9][0-9]*)$/.test(name) && Number(name) <= 4294967294;
+}
+
+/**
+ * The keys of the fork's row objects, in the statement's column order.
+ *
+ * `all()` returns each row as an object, and an object enumerates its
+ * array-index keys ("1", "2") first, in ascending order, then every other key
+ * in the order it was added -- here, column order. So `SELECT "1", b, "2"`
+ * came back as "1", "2", b and the console showed b's value under "2".
+ * `columns`, the probe's names read from a view of the statement in SELECT
+ * order, puts them back: an array-index name is matched by name, and each
+ * other name takes the next remaining key in turn. By position rather than by
+ * name, because a parameterised statement may be probed through its expansion,
+ * where an unaliased `?` is named "NULL" and not "?". When `columns` does
+ * not fit the keys, the object's own order is all there is.
+ */
+function keysInColumnOrder(columns, keys) {
+    if (!columns || columns.length !== keys.length || !keys.some(isArrayIndexName)) return keys;
+    const indexKeys = new Set(keys.filter(isArrayIndexName));
+    const otherKeys = keys.filter(key => !indexKeys.has(key));
+    const ordered = [];
+    let next = 0;
+    for (const name of columns) {
+        if (indexKeys.has(name)) ordered.push(name);
+        else if (!isArrayIndexName(name) && next < otherKeys.length) ordered.push(otherKeys[next++]);
+        else return keys;
+    }
+    return next === otherKeys.length ? ordered : keys;
+}
+
+/** Normalise the fork's row values to sql.js's `get()` contract. */
+function toSqlJsValue(value, useBigInt) {
+    // sql.js reads INTEGER columns through sqlite3_column_double unless
+    // `useBigInt` is set, so an int64 beyond 2^53 arrives there as a lossy
+    // Number. Match that exactly; the fork would otherwise hand back a BigInt
+    // the caller never asked for.
+    if (typeof value === 'bigint' && !useBigInt) return Number(value);
+    return value;
+}
+
+/**
+ * Compile the next statement in `sql` starting at `from`.
+ *
+ * Returns null when only trivia (whitespace/comments/empty statements) remains
+ * -- the fork answers a trivia-only `prepare()` with an already-finalized
+ * statement whose text is empty, which is exactly `sqlite3_prepare_v2`
+ * yielding a NULL statement.
+ */
+function compileNext(backing, sql, from, describe) {
+    if (from >= sql.length) return null;
+    const rest = sql.slice(from);
+    // SECURITY: reject ATTACH/DETACH before it is ever compiled. `compileNext`
+    // is the chokepoint for exec/prepare/iterateStatements, so blocking here
+    // holds for every RPC that reaches raw SQL (runQuery, runConsole) on every
+    // session, engine-level -- NOT relying on the read-only wholesale block,
+    // which does not stop ATTACH reads (query_only blocks only attached-DB
+    // writes). ATTACH would otherwise open/create a file outside the bound
+    // path from inside SQL, defeating the desktop's path authority.
+    //
+    // Matching only the LEADING token is complete because ATTACH/DETACH is
+    // always the first token of a standalone statement and CANNOT nest: verified
+    // against the shipped fork binary that SQLite rejects `WITH x AS (ATTACH..)`,
+    // `SELECT (ATTACH..)`, `SELECT * FROM (ATTACH..)`, `ATTACH` in a CREATE
+    // TRIGGER body, a compound `... UNION ATTACH..`, and `VALUES (ATTACH..)` all
+    // at COMPILE. The `rest`'s leading token (after trivia) is this statement's
+    // leading token, so a later ATTACH in a multi-statement script is caught on
+    // the compileNext call that reaches it. Checked pre-compile because ATTACH's
+    // side effect lands at step, not prepare (also verified) -- but not compiling
+    // it at all is the cleaner guarantee.
+    const leading = stripLeadingTrivia(rest);
+    const attachDetach = ATTACH_DETACH_PREFIX.exec(leading);
+    if (attachDetach) throw attachDetachBlockedError(attachDetach[0]);
+    let compiled;
+    try {
+        compiled = backing.prepare(rest);
+    } catch (error) {
+        // A compile failure is where the fork's message loss hurts most: this
+        // is "no such table", "no such column" and "syntax error" all arriving
+        // as one string. `rest` is the whole remaining script; the describer
+        // reads only its leading statement's structure.
+        throw describeBackingError(error, rest, describe);
+    }
+    let text;
+    try {
+        text = String(compiled);
+    } catch (error) {
+        finalizeQuietly(compiled);
+        throw error;
+    }
+    if (text === '') {
+        finalizeQuietly(compiled);
+        return null;
+    }
+    const length = consumedSourceLength(rest, text);
+    if (length < 0) {
+        finalizeQuietly(compiled);
+        throw new Error(
+            'Unable to determine the SQL statement boundary: the compiled statement ' +
+            'text does not align with its source'
+        );
+    }
+    const source = rest.slice(0, length);
+    // SECURITY: reject `VACUUM ... INTO` (an arbitrary out-of-path file write --
+    // it copies the whole bound database to any path SQL names, the last
+    // SQL->filesystem vector after ATTACH). Unlike ATTACH, VACUUM is ALSO the
+    // leading token of the legitimate in-place `VACUUM`/`VACUUM main`, so the
+    // leading token alone is not enough -- the INTO clause has to be detected.
+    // The `into` bareword is tested against THIS statement's own `source` (not
+    // the whole remaining multi-statement string), so `VACUUM; SELECT ... INTO
+    // ...temp...` in a later statement cannot false-trip it. Soundness: with
+    // ATTACH blocked there is no schema alias beyond main/temp, so on a
+    // VACUUM-led statement the only source of a bareword `into` is the INTO
+    // clause itself (the accepted narrow exception is the word `into` written
+    // inside a comment on a plain VACUUM -- pathological, and fails loud, never
+    // silent). Rejected AFTER compile / BEFORE step because VACUUM INTO's file
+    // is created at step, not prepare (verified against the shipped binary), so
+    // the compiled-but-never-stepped statement writes nothing. The shim's own
+    // export goes through `backing.vacuumInto` (see `vacuumInto`), NOT through
+    // compileNext, so it is deliberately unaffected.
+    if (VACUUM_PREFIX.test(leading) && INTO_WORD.test(source)) {
+        finalizeQuietly(compiled);
+        throw vacuumIntoBlockedError();
+    }
+    // `text` is captured HERE, before any bind: it is the source with every
+    // parameter rendered as NULL. Read later it would inline the bound VALUES
+    // instead, which is both non-deterministic and user data in SQL text.
+    return { compiled, source, expanded: text, end: from + length };
+}
+
+function finalizeQuietly(statement) {
+    try {
+        statement?.finalize?.();
+    } catch {
+        // A statement that cannot be finalized is already gone; the caller is
+        // on an error path and has a more informative failure to report.
+    }
+}
+
+/**
+ * Walk every statement in a multi-statement script through `compileNext` purely
+ * to trip its path-authority rejects (ATTACH/DETACH and VACUUM ... INTO), then
+ * discard each compiled statement WITHOUT stepping it -- so nothing executes.
+ * Used only to guard `db.run(sql)`'s no-param `backing.exec` path, which does
+ * not itself pass through compileNext. Compiling here and again in
+ * `backing.exec` is redundant but harmless (compile has no side effects; both
+ * blocked vectors' effects land at step), and only runs at all when one of the
+ * scanned keywords is present.
+ */
+function rejectPathAuthorityViolationsInScript(backing, sql, describe) {
+    let cursor = 0;
+    for (;;) {
+        const next = compileNext(backing, sql, cursor, describe);
+        if (next === null) return;
+        cursor = next.end;
+        finalizeQuietly(next.compiled);
+    }
+}
+
+/**
+ * The backing connection, with every call that can meet another connection's
+ * lock reporting a refusal to `onRefused` before it is thrown on. The column
+ * probe and the error describer catch some failures on purpose, so a refusal
+ * is noticed where it happens rather than where it is caught.
+ */
+function watchLockRefusals(database, onRefused) {
+    const watch = (call) => {
+        try {
+            return call();
+        } catch (error) {
+            if (isLockRefusal(error)) onRefused();
+            throw error;
+        }
+    };
+    const watchStatement = (statement) => ({
+        all: (...args) => watch(() => statement.all(...args)),
+        run: (...args) => watch(() => statement.run(...args)),
+        finalize: () => statement.finalize(),
+        toString: () => statement.toString()
+    });
+    return {
+        prepare: (sql) => watchStatement(watch(() => database.prepare(sql))),
+        exec: (sql) => watch(() => database.exec(sql)),
+        vacuumInto: (target) => watch(() => database.vacuumInto(target)),
+        close: () => database.close(),
+        get inTransaction() {
+            return database.inTransaction;
+        },
+        setQueryDeadline: (ms) => database.setQueryDeadline?.(ms),
+        clearQueryDeadline: () => database.clearQueryDeadline?.(),
+        interrupt: () => database.interrupt?.()
+    };
+}
+
+/**
+ * The sql.js statement surface over a materialised result set.
+ *
+ * `context` carries the shared database plumbing: the backing connection, the
+ * live-statement registry, and the read-only escape hatch the column probe
+ * needs.
+ */
+function createShimStatement(context, compiled, source, expanded) {
+    let backingStatement = compiled;
+    let boundParameters;
+    /** Materialised result: `{ columns, values }`, or null before first use. */
+    let rows = null;
+    /** Column names resolved without executing, when the probe could answer. */
+    let probedColumns;
+    let resolvedColumns = null;
+    /** Index of the row `get()` returns; -1 means "no current row". */
+    let position = -1;
+
+    // A view body may not contain bound parameters, so a parameterised
+    // statement has to be probed through its EXPANDED text (parameters rendered
+    // as NULL at compile time), which compiles as a view and reports the same
+    // column names. Without this, every parameterised query fell through to the
+    // materialise fallback -- returning [] for a zero-row result, which the grid
+    // reports as "Primary-key column missing", and executing each filtered page
+    // twice. Probing the source when there are no parameters keeps sql.js's
+    // exact names for the unaliased-placeholder case. A parameterised one is
+    // probed with each parameter spelled as a literal first
+    // (spelledParameterProbe), for the same reason; this is its fallback.
+    const probeText = source === expanded ? source : expanded;
+
+    const assertLive = () => {
+        // Connection-level quarantine outranks statement-level liveness: if
+        // read-only enforcement was lost, "this statement is closed" is the
+        // wrong (and reassuring) thing to say.
+        context.assertUsable();
+        if (backingStatement === null) throw new Error('Statement closed');
+    };
+
+    /** Column names from a TEMP VIEW over this statement's own SQL, or null. */
+    const probeColumns = () => {
+        if (probedColumns !== undefined) return probedColumns;
+        let probed = null;
+        // Only where a view can hold the statement: elsewhere (DML with
+        // parameters) the spelled probe fails as the expansion does, and one
+        // failed compile is all the answer `[]` needs.
+        if (source !== expanded && VIEWABLE_PREFIX.test(stripLeadingTrivia(source))) {
+            const spelled = spelledParameterProbe(source, expanded);
+            const names = spelled === null ? null : context.probeColumnNames(spelled.text);
+            if (names) probed = spelled.restore(names);
+        }
+        // The expansion, where every parameter reads as NULL, is the probe a
+        // spelled one falls back to.
+        if (!probed) probed = context.probeColumnNames(probeText);
+        // The probe reports the view's disambiguated columns (`x`, `x:1`) while
+        // `all()` collapses the duplicates into one key. ensureRows() repairs
+        // that by re-reading: a parameter-free statement through the same view,
+        // a parameterised one through a CTE whose column list renames every
+        // column (a view body holds no parameters; a CTE does). Without a
+        // repair available, handing back the disambiguated list would promise
+        // more names than there will ever be values, so decline and let the
+        // caller fall through.
+        probedColumns = probed && source !== expanded && hasDisambiguatedDuplicates(probed)
+            && !context.canReadThroughColumnList(source, probed.length)
+            ? null
+            : probed;
+        return probedColumns;
+    };
+
+    const ensureRows = () => {
+        if (rows !== null) return rows;
+        let objectRows;
+        try {
+            objectRows = boundParameters === undefined
+                ? backingStatement.all()
+                : backingStatement.all(boundParameters);
+        } catch (error) {
+            // Execution-phase failures (constraint violations, datatype
+            // mismatches, interrupts) reach the user through here.
+            throw describeBackingError(error, source, context.describeError);
+        }
+        const keys = objectRows.length > 0 ? Object.keys(objectRows[0]) : [];
+        // Integer-like names need the probe's order (keysInColumnOrder), and
+        // duplicate names collapsed into one key show only in the probe's
+        // count. A statement stepped before its names were asked for (the
+        // console's order) has not been probed yet; the probe compiles a view
+        // and executes nothing, and its answer is kept for the statement.
+        if (probedColumns === undefined && objectRows.length > 0) {
+            // Opportunistic: a probe that cannot run here (a raw query_only the
+            // caller armed, a statement no view can hold) leaves the keys as
+            // they are. getColumnNames() still reports why when asked.
+            try { probeColumns(); } catch { probedColumns = null; }
+        }
+        const order = keysInColumnOrder(probedColumns, keys);
+        const values = objectRows.map(row => order.map(key => row[key]));
+
+        // Duplicate result names collapse into one object key, taking the value
+        // with them. When the probe already told us the true column count, read
+        // the rows back through the view instead -- SQLite disambiguates the
+        // view's own columns (`x`, `x:1`), so both values survive. If that
+        // repair is unavailable, keep the collapsed shape: names and values
+        // MUST come from the same materialisation or the grid mis-renders.
+        if (probedColumns && objectRows.length > 0 && probedColumns.length !== keys.length) {
+            // A parameterised statement's probe view holds no parameters, so
+            // re-reading rows from it would return values computed without the
+            // bound ones; it is re-read through a column-list CTE over its own
+            // text, with the parameters it was bound with.
+            const repaired = source === expanded
+                ? context.readRowsThroughView(probeText)
+                : context.readRowsThroughColumnList(source, probedColumns.length, boundParameters, (error) =>
+                    describeBackingError(error, source, context.describeError));
+            if (repaired) {
+                rows = source === expanded ? repaired : { columns: probedColumns, values: repaired };
+                return rows;
+            }
+            probedColumns = keys;
+            resolvedColumns = keys;
+        }
+        // The runtime's own names, in the probe's order: the probe of a
+        // parameterised statement may have read its params-as-NULL expansion
+        // (spelledParameterProbe's fallback), so its names can say NULL where
+        // SQLite says ? (or ?1), and it cannot know a zero-row result's keys.
+        rows = { columns: keys.length > 0 ? order : (probedColumns ?? order), values };
+        return rows;
+    };
+
+    /**
+     * Column names, WITHOUT executing the statement wherever that is possible.
+     *
+     * sql.js reads `sqlite3_column_count`/`_name` off the compiled statement and
+     * never runs anything; the fork exposes neither, so the shim works down a
+     * ladder and stops at the first rung that can answer without a side effect:
+     *
+     *   1. already materialised -> those columns (the only arity-safe answer,
+     *      whatever the probe would say);
+     *   2. the TEMP VIEW probe (CREATE VIEW compiles the body, never runs it);
+     *   3. EXPLAIN, which cannot be a view body but is by definition
+     *      side-effect-free -- it lists the bytecode of the statement it
+     *      describes and never executes it;
+     *   4. `[]`.
+     *
+     * Rung 4 is the deliberate stop: answering a metadata question by running a
+     * mutation is not a trade the shim makes. The visible cost is that a
+     * `DELETE ... RETURNING` in the console reports no result columns until it
+     * has been stepped, so its rows are treated as side-effect-only.
+     */
+    const ensureColumns = () => {
+        // Once rows exist their names win: they came from the same
+        // materialisation as the values, so the two always agree.
+        if (rows !== null && rows.values.length > 0) return rows.columns;
+        if (resolvedColumns !== null) return resolvedColumns;
+        if (rows !== null) {
+            resolvedColumns = rows.columns;
+            return resolvedColumns;
+        }
+        const probed = probeColumns();
+        if (probed) {
+            resolvedColumns = probed;
+            return resolvedColumns;
+        }
+        if (EXPLAIN_PREFIX.test(stripLeadingTrivia(probeText))) {
+            resolvedColumns = ensureRows().columns;
+            return resolvedColumns;
+        }
+        // Rung 4 is NOT memoised: it is an admission of ignorance, not an
+        // answer. Once the caller steps the statement the real columns become
+        // available, and asking again should get them.
+        return [];
+    };
+
+    const statement = {
+        /** Bind values; invalidates any previous materialisation, as sql.js's reset does. */
+        bind(values) {
+            assertLive();
+            boundParameters = values == null ? undefined : toBindableParameters(values);
+            rows = null;
+            position = -1;
+            return true;
+        },
+
+        step() {
+            assertLive();
+            ensureRows();
+            position += 1;
+            if (position < rows.values.length) return true;
+            // sqlite3_step implicitly resets after SQLITE_DONE, so the next
+            // step() replays the result set. Side effects are NOT replayed --
+            // re-running a DML statement because a caller over-stepped it is a
+            // footgun the shim declines to reproduce.
+            position = -1;
+            return false;
+        },
+
+        get(params, config) {
+            assertLive();
+            if (params != null) {
+                statement.bind(params);
+                statement.step();
+            }
+            // sql.js reads sqlite3_data_count, which is 0 until step() has
+            // produced a row -- so an un-stepped get() is empty and, crucially,
+            // executes NOTHING. Materialisation stays deferred to step().
+            if (rows === null || position < 0 || position >= rows.values.length) return [];
+            const useBigInt = config?.useBigInt === true;
+            return rows.values[position].map(value => toSqlJsValue(value, useBigInt));
+        },
+
+        getColumnNames() {
+            assertLive();
+            return ensureColumns().slice();
+        },
+
+        /** sql.js's shorthand for bind + step + reset. */
+        run(values) {
+            assertLive();
+            if (values != null) statement.bind(values);
+            statement.step();
+            return statement.reset();
+        },
+
+        reset() {
+            assertLive();
+            boundParameters = undefined;
+            rows = null;
+            position = -1;
+            return true;
+        },
+
+        /** The statement's own SQL text -- `sqlite3_sql`, not the expanded form. */
+        getSQL() {
+            return source;
+        },
+
+        free() {
+            if (backingStatement === null) return false;
+            const finalizing = backingStatement;
+            backingStatement = null;
+            context.forget(statement);
+            finalizeQuietly(finalizing);
+            return true;
+        }
+    };
+
+    context.register(statement);
+    return statement;
+}
+
+/**
+ * Create a sql.js-shaped database over an injected `tjs:sqlite`-shaped module.
+ *
+ * @param config `{ path, readOnly }` to open a file, `{}` for an in-memory
+ *   database. `{ content }` is accepted for signature parity with sql.js and
+ *   rejected: the fork has no deserialize entry point, and opening by path is
+ *   the entire point of the native engine. `lockWaitMs` (default 0, as in
+ *   SQLite and sql.js) is the busy timeout in milliseconds; see
+ *   `restoreLockWait`.
+ * @param deps `{ sqlite: { Database }, fs? }`. `fs` is only needed by
+ *   `export()`/`exportAsync()`.
+ */
+export function createShimDatabase(config = {}, deps = {}) {
+    const sqlite = deps.sqlite;
+    if (typeof sqlite?.Database !== 'function') {
+        throw new Error('createShimDatabase requires deps.sqlite.Database');
+    }
+    if (config.content !== undefined) {
+        throw new Error(
+            'createShimDatabase: opening from bytes is not supported by the native ' +
+            'engine; open by path ({ path, readOnly }) or use the WASM engine'
+        );
+    }
+
+    const lockWaitMs = config.lockWaitMs ?? 0;
+    if (!Number.isSafeInteger(lockWaitMs) || lockWaitMs < 0) {
+        throw new RangeError('createShimDatabase: lockWaitMs must be a non-negative integer');
+    }
+    // NOT const: `enforceReadOnly()` escalates an open writable session, and
+    // every read-only behaviour in this file keys off this flag.
+    let readOnly = config.readOnly === true;
+    // Passing ANY options object suppresses file creation on the fork -- even
+    // `{}` fails with errno 14 on a missing path, where a bare
+    // `new Database(path)` would have created it. `create` restores sql.js's
+    // create-on-open behaviour, and is MUTUALLY EXCLUSIVE with `readOnly`
+    // (together they raise SQLITE_MISUSE/21). Both probed.
+    const opened = config.path === undefined || config.path === null
+        ? new sqlite.Database(':memory:')
+        : new sqlite.Database(config.path, readOnly ? { readOnly: true } : { create: true });
+
+    /**
+     * busy_timeout currently set on the connection (a fresh connection has 0).
+     * It is `lockWaitMs` until the current request's first lock refusal and
+     * 0 after it, until `restoreLockWait`. The busy handler blocks this
+     * thread for the whole wait and the query deadline cannot cut it short,
+     * so without the drop every statement of a request paid the full wait
+     * again: measured, two waits for a grid page and five for getPragmas.
+     */
+    let appliedLockWaitMs = 0;
+    const applyLockWait = (ms, always = false) => {
+        if (ms === appliedLockWaitMs && !always) return;
+        opened.exec(`PRAGMA busy_timeout = ${ms}`);
+        appliedLockWaitMs = ms;
+    };
+    try {
+        applyLockWait(lockWaitMs);
+    } catch (error) {
+        opened.close();
+        throw error;
+    }
+    const backing = watchLockRefusals(opened, () => {
+        try {
+            applyLockWait(0);
+        } catch (error) {
+            // The refusal being thrown is the failure to report; a wait that
+            // stays armed costs time, not correctness.
+            reportCleanupFailure(error, 'drop the lock wait after a refusal');
+        }
+    });
+
+    let closed = false;
+    /** Live shim statements, freed together on close() (sql.js does the same). */
+    const liveStatements = new Set();
+    let changesStatement = null;
+    /**
+     * Set when read-only enforcement could not be restored after an internal
+     * lift. The connection is then in an unknown write state, so every
+     * subsequent operation fails rather than proceeding on a broken guarantee.
+     */
+    let poisoned = null;
+
+    const assertOpen = () => {
+        if (poisoned !== null) throw poisoned;
+        if (closed) throw new Error('Database closed');
+    };
+
+    /** Report a swallowed cleanup failure without turning it into the caller's error. */
+    const reportCleanupFailure = (error, context) => {
+        try {
+            deps.onCleanupFailure?.(error, context);
+        } catch {
+            // A reporting hook must never escalate a cleanup failure into a
+            // primary one.
+        }
+    };
+
+    const readScalar = (sql) => {
+        const statement = backing.prepare(sql);
+        try {
+            const result = statement.all();
+            const row = result[0];
+            return row === undefined ? undefined : row[Object.keys(row)[0]];
+        } finally {
+            finalizeQuietly(statement);
+        }
+    };
+
+    /**
+     * Arm SQLite-level read-only enforcement and PROVE it took.
+     *
+     * The fork's `readOnly` open flag is honoured, but a typo'd key is silently
+     * ignored (the shipped extension has exactly that bug), so the shim does not
+     * trust the flag at all: `query_only` blocks writes at the SQLite level
+     * regardless of how the connection was opened, and reading it back proves
+     * the guard is armed. This is a pure connection flag -- nothing is written
+     * to prove it.
+     */
+    const armReadOnly = () => {
+        try {
+            backing.exec('PRAGMA query_only = 1');
+        } catch (error) {
+            throw copyErrno(
+                new Error(`Unable to enforce read-only mode: ${error?.message ?? error}`),
+                error
+            );
+        }
+        if (Number(readScalar('PRAGMA query_only')) !== 1) {
+            throw new Error('Unable to enforce read-only mode: PRAGMA query_only did not take');
+        }
+    };
+
+    if (readOnly) {
+        try {
+            armReadOnly();
+        } catch (error) {
+            backing.close();
+            throw error;
+        }
+    }
+
+    /** True while `query_only` is lifted; see the re-entrancy note below. */
+    let writesLifted = false;
+    /**
+     * True while `readRefusingWrites` holds `query_only` on a writable
+     * session. The column-name probe lifts the flag around its own TEMP VIEW
+     * DDL then too, because the shim knows who armed it and restores it.
+     */
+    let readBoundary = false;
+
+    /**
+     * Run shim-authored DDL that must write on a connection pinned read-only.
+     *
+     * Exactly two operations need this and both are shim-authored: creating and
+     * dropping the column-probe TEMP VIEW, and `VACUUM INTO`, which writes only
+     * its own output file. Reading FROM the probe view does NOT need it
+     * (verified against the real binary: a SELECT from a temp view succeeds with
+     * `query_only = 1`), so the window is DDL-only -- no user SQL is ever
+     * executed inside it. `CREATE VIEW` compiles its body without running it, so
+     * even the view's own SELECT does not execute while writes are permitted.
+     *
+     * NOT re-entrant, and asserted so: a nested call would restore `query_only`
+     * at the inner exit and leave the outer body running unprotected. Callers
+     * keep the lifts sequential rather than nested.
+     */
+    const withInternalWrites = (operation) => {
+        if (!readOnly && !readBoundary) return operation();
+        // A poisoned connection is one whose query_only state is unknown, so
+        // lifting it again is precisely the thing not to do. Unreachable today
+        // -- every caller passes assertOpen/assertUsable first, and the probe
+        // re-throws before its DROP cleanup -- but this is THE choke point for
+        // "permit writes on a read-only connection", so it checks for itself
+        // rather than trusting each future caller to have checked.
+        if (poisoned !== null) throw poisoned;
+        if (writesLifted) {
+            throw new Error('Internal error: read-only write lift is not re-entrant');
+        }
+        backing.exec('PRAGMA query_only = 0');
+        writesLifted = true;
+
+        let failure = null;
+        let value;
+        try {
+            value = operation();
+        } catch (error) {
+            failure = error;
+        }
+
+        try {
+            backing.exec('PRAGMA query_only = 1');
+        } catch (restoreError) {
+            // Losing the restore means the connection may now accept writes.
+            // Poison it so nothing else runs, and ATTACH rather than mask: an
+            // error thrown from a finally would hide whatever the caller was
+            // actually trying to do.
+            poisoned = copyErrno(
+                new Error(
+                    'Read-only enforcement could not be restored (PRAGMA query_only); ' +
+                    'this connection is no longer trustworthy and has been disabled'
+                ),
+                restoreError
+            );
+            poisoned.cause = restoreError;
+            if (failure) {
+                if (failure.cause === undefined) failure.cause = restoreError;
+            } else {
+                failure = poisoned;
+            }
+        } finally {
+            writesLifted = false;
+        }
+
+        if (failure) throw failure;
+        return value;
+    };
+
+    /**
+     * Wrap `sql` in a TEMP VIEW and hand the view to `reader`.
+     *
+     * This is the only way to get column names for a zero-row result out of
+     * this binding, and it is simultaneously the only way to see columns that
+     * `all()`'s row objects collapse. Callers pass the statement's PARAMETER-FREE
+     * text -- each parameter spelled as a string literal (spelledParameterProbe),
+     * or its compile-time expansion, where every parameter reads as NULL --
+     * because a view body may not contain parameters; that is what lets a
+     * parameterised query be probed at all.
+     *
+     * Returns null when the statement cannot be expressed as a view (DML, DDL,
+     * PRAGMA, EXPLAIN). That is not a fallback to executing the statement: it is
+     * the signal for the caller's ladder to move to its next rung, which reports
+     * `[]` rather than run anything. See `ensureColumns`.
+     *
+     * The two `catch { return null }` arms below are deliberately blanket --
+     * "this statement is not viewable" is exactly what a failure here means --
+     * EXCEPT for a poisoned connection, which is re-thrown: degrading a lost
+     * read-only guarantee into "no columns" would hide it.
+     */
+    const withColumnProbeView = (sql, reader) => {
+        const body = stripLeadingTrivia(sql);
+        if (body === '') return null;
+        // Shim-generated, [A-Za-z0-9_] only: safe to embed as both an identifier
+        // and a string literal without escaping. `pragma_table_info` takes its
+        // argument as a STRING -- a double-quoted identifier there is only
+        // accepted under SQLite's legacy double-quoted-string misfeature, which
+        // is off on some builds.
+        const name = `_sqlx_shim_cols_${++columnProbeCounter}`;
+        const quoted = `"${name}"`;
+        const literal = `'${name}'`;
+        try {
+            withInternalWrites(() => {
+                // prepare+run rather than exec: `exec` would run EVERY statement
+                // in the string, so a mis-split (which `consumedSourceLength`
+                // reports rather than guesses at, but still) could not turn this
+                // into a second execution of something else. prepare compiles
+                // only the first statement, and CREATE VIEW never runs its body.
+                const creation = backing.prepare(`CREATE TEMP VIEW ${quoted} AS ${body}`);
+                try {
+                    creation.run();
+                } finally {
+                    finalizeQuietly(creation);
+                }
+            });
+        } catch (error) {
+            if (poisoned !== null) throw poisoned;
+            // A READ-ONLY refusal is not "this statement is not viewable". The
+            // statement being refused is the shim's OWN temp-schema DDL, which
+            // depends on nothing in the caller's SQL; SQLite can only be
+            // blocking it because `query_only` is armed and the lift above did
+            // not run -- i.e. this connection is read-only without the shim
+            // knowing. Swallowing that returns "no columns", which the caller
+            // turns into an internal invariant message with nothing in it that
+            // names the cause; every grid on such a connection died that way.
+            // Named here instead, once, for whatever set query_only.
+            //
+            // Only for a VIEWABLE statement, and that guard is load-bearing
+            // rather than tidiness: SQLite refuses the CREATE for being a write
+            // BEFORE it looks at the body, so a PRAGMA gets errno 8 here too --
+            // and throwing on that would take `PRAGMA query_only = OFF` down
+            // with it, which is the one statement that can undo the state being
+            // complained about. A probe refusal on a statement that was never
+            // viewable costs nothing to swallow, because `[]` was always its
+            // correct answer.
+            if (isReadOnlyRefusal(error) && VIEWABLE_PREFIX.test(body)) {
+                // The recovery named here is the one that was VERIFIED to work
+                // against the shipped binary. Turning the pragma back off from
+                // SQL does NOT: getting there runs statements that are
+                // themselves probed, and they hit this same refusal first.
+                throw copyErrno(
+                    new Error(
+                        'Column names are unavailable: this connection refuses writes (PRAGMA '
+                        + 'query_only is armed) but was not opened read-only, so the probe cannot '
+                        + 'create the temporary view it reads them from. Close and reopen the '
+                        + 'database to clear it. (A session made read-only after opening must be '
+                        + 'escalated through enforceReadOnly(), which is what lets the probe lift '
+                        + `query_only. SQLite: ${error?.message ?? error})`
+                    ),
+                    error
+                );
+            }
+            // Nor is a lock refusal, for the same statements: SQLite could
+            // not read the schema the view compiles against, and the statement
+            // itself meets the same lock. Swallowed, it became "no columns",
+            // which the grid reported as "Cell containment requires a positive
+            // column count, got 0".
+            if (isLockRefusal(error) && VIEWABLE_PREFIX.test(body)) {
+                throw describeBackingError(error, body, describeError);
+            }
+            return null;
+        }
+        try {
+            // Deliberately OUTSIDE the write lift: reading a temp view needs no
+            // write permission, so nothing that touches user SQL runs while
+            // query_only is down.
+            return reader({ quoted, literal });
+        } catch (error) {
+            if (poisoned !== null) throw poisoned;
+            if (isLockRefusal(error)) throw describeBackingError(error, body, describeError);
+            return null;
+        } finally {
+            try {
+                withInternalWrites(() => backing.exec(`DROP VIEW IF EXISTS temp.${quoted}`));
+            } catch (error) {
+                // Leaving a temp view behind is harmless (it dies with the
+                // connection) and must not mask the caller's result.
+                reportCleanupFailure(error, 'drop column-probe view');
+            }
+        }
+    };
+
+    /**
+     * Ask SQLite itself whether a name resolves as a table.
+     *
+     * COMPILE ONLY: `prepare` never steps, and `WHERE 0` means even a caller
+     * that somehow stepped it would read nothing. Deliberately NOT routed
+     * through `compileNext` — this is shim-authored SQL over one quoted
+     * identifier, so the path-authority scan has nothing to find, and going
+     * through `compileNext` would recurse straight back into this describer.
+     */
+    const resolvesAsTable = (name) => {
+        let statement;
+        try {
+            statement = backing.prepare(`SELECT 1 FROM "${String(name).replace(/"/g, '""')}" WHERE 0`);
+        } catch {
+            return false;
+        }
+        finalizeQuietly(statement);
+        return true;
+    };
+
+    /**
+     * True when a name has a row in either catalog. Errs toward TRUE on any
+     * failure, because `inCatalog` is the veto half of the missing-table proof:
+     * an unanswerable catalog is a reason to stay silent, not to accuse.
+     */
+    const nameInCatalog = (name) => {
+        let statement;
+        try {
+            statement = backing.prepare(
+                'SELECT count(*) AS c FROM ('
+                + 'SELECT name FROM sqlite_schema UNION ALL SELECT name FROM sqlite_temp_schema'
+                + ') WHERE name = ? COLLATE NOCASE'
+            );
+        } catch {
+            return true;
+        }
+        try {
+            return Number(statement.all([String(name)])[0]?.c ?? 1) > 0;
+        } catch {
+            return true;
+        } finally {
+            finalizeQuietly(statement);
+        }
+    };
+
+    /**
+     * The stored definition of a view by name, so the missing-table proof can
+     * walk into a broken view's body (see findUnresolvedTableNames). Quiet on
+     * any failure: no definition means no walk, never an accusation.
+     */
+    const storedViewSql = (name) => {
+        let statement;
+        try {
+            statement = backing.prepare(
+                'SELECT sql FROM ('
+                + 'SELECT name, type, sql FROM sqlite_schema '
+                + 'UNION ALL SELECT name, type, sql FROM sqlite_temp_schema'
+                + ") WHERE type = 'view' AND name = ? COLLATE NOCASE LIMIT 1"
+            );
+        } catch {
+            return undefined;
+        }
+        try {
+            const sql = statement.all([String(name)])[0]?.sql;
+            return typeof sql === 'string' ? sql : undefined;
+        } catch {
+            return undefined;
+        } finally {
+            finalizeQuietly(statement);
+        }
+    };
+
+    /** See describeBackingError. Bound to THIS connection's catalogs. */
+    const describeError = (error, sql) => buildSqliteErrorMessage(
+        error.errno,
+        error.message,
+        sql,
+        { resolves: resolvesAsTable, inCatalog: nameInCatalog, viewSql: storedViewSql }
+    );
+
+    /** A probe view's column names, in column order. */
+    const viewColumnNames = (literal) => {
+        const statement = backing.prepare(`SELECT name FROM pragma_table_info(${literal})`);
+        try {
+            return statement.all().map(row => row.name);
+        } finally {
+            finalizeQuietly(statement);
+        }
+    };
+
+    const statementContext = {
+        /** Statements share the connection's quarantine, not just its handle. */
+        assertUsable: () => {
+            if (poisoned !== null) throw poisoned;
+        },
+        describeError,
+        register: (statement) => liveStatements.add(statement),
+        forget: (statement) => liveStatements.delete(statement),
+        probeColumnNames: (sql) => withColumnProbeView(sql, ({ literal }) => {
+            const names = viewColumnNames(literal);
+            return names.length > 0 ? names : null;
+        }),
+        /**
+         * Whether `sql` compiles as the body of a CTE with `count` renamed
+         * columns. Compiles only; nothing is executed.
+         */
+        canReadThroughColumnList: (sql, count) => {
+            let statement = null;
+            try {
+                statement = backing.prepare(columnListRead(sql, count));
+                return true;
+            } catch {
+                return false;
+            } finally {
+                if (statement !== null) finalizeQuietly(statement);
+            }
+        },
+        /**
+         * The rows of a parameterised statement read through a CTE whose
+         * column list names every column `c0`, `c1`, ...: SQLite applies the
+         * list by position, so duplicate result names no longer collapse into
+         * one object key, and the statement's own placeholders bind as they
+         * would on their own. Null when the text does not compile that way.
+         */
+        readRowsThroughColumnList: (sql, count, parameters, describe) => {
+            let statement;
+            try {
+                statement = backing.prepare(columnListRead(sql, count));
+            } catch {
+                return null;
+            }
+            try {
+                const objectRows = parameters === undefined ? statement.all() : statement.all(parameters);
+                return objectRows.map(row => Array.from({ length: count }, (_, index) => row[`c${index}`]));
+            } catch (error) {
+                throw describe(error);
+            } finally {
+                finalizeQuietly(statement);
+            }
+        },
+        readRowsThroughView: (sql) => withColumnProbeView(sql, ({ quoted, literal }) => {
+            const names = viewColumnNames(literal);
+            const statement = backing.prepare(`SELECT * FROM ${quoted}`);
+            try {
+                const objectRows = statement.all();
+                if (objectRows.length === 0) return null;
+                const columns = keysInColumnOrder(names, Object.keys(objectRows[0]));
+                return { columns, values: objectRows.map(row => columns.map(key => row[key])) };
+            } finally {
+                finalizeQuietly(statement);
+            }
+        })
+    };
+
+    const prepareInternal = (sql) => {
+        const next = compileNext(backing, sql, 0, describeError);
+        if (next === null) throw new Error('Nothing to prepare');
+        return createShimStatement(statementContext, next.compiled, next.source, next.expanded);
+    };
+
+    const requireFs = () => {
+        const fs = deps.fs;
+        if (!fs || typeof fs.makeTempDir !== 'function' || typeof fs.readFile !== 'function'
+            || typeof fs.remove !== 'function') {
+            throw new Error('export() requires deps.fs with makeTempDir/readFile/remove');
+        }
+        return fs;
+    };
+
+    let progressHandler = null;
+
+    // The runtime refuses SQL-level VACUUM INTO: its authorizer denies the
+    // ATTACH that VACUUM performs on the destination. backing.vacuumInto is
+    // the one exception, scoped to that single statement.
+    const vacuumInto = (target) => withInternalWrites(() => {
+        backing.vacuumInto(target);
+    });
+
+    const database = {
+        /** `[{columns, values}]`, one entry per statement that produced rows. */
+        exec(sql, params, config) {
+            assertOpen();
+            const results = [];
+            let cursor = 0;
+            for (;;) {
+                const next = compileNext(backing, sql, cursor, describeError);
+                if (next === null) break;
+                cursor = next.end;
+                const statement = createShimStatement(statementContext, next.compiled, next.source, next.expanded);
+                try {
+                    if (params != null) statement.bind(params);
+                    // Resolve the columns BEFORE the first step, even though the
+                    // loop below asks again. The probe is what tells ensureRows()
+                    // the statement's TRUE arity, and ensureRows() can only repair
+                    // `all()`'s collapsed duplicate keys when the probe has already
+                    // run. sql.js's exec() steps first, and copying that order here
+                    // meant `SELECT * FROM a JOIN b` silently came back one column
+                    // short with its values shifted left. The probe compiles a temp
+                    // view and never executes anything, so this costs a compile on
+                    // statements that are viewable and one failed compile on the
+                    // ones that are not.
+                    statement.getColumnNames();
+                    let columns = null;
+                    const values = [];
+                    while (statement.step()) {
+                        if (columns === null) columns = statement.getColumnNames();
+                        values.push(statement.get(null, config));
+                    }
+                    if (columns !== null) results.push({ columns, values });
+                } finally {
+                    statement.free();
+                }
+            }
+            return results;
+        },
+
+        /** Execute, discarding rows. Without params this runs EVERY statement in `sql`. */
+        run(sql, params) {
+            assertOpen();
+            if (params != null) {
+                const statement = prepareInternal(sql);
+                try {
+                    statement.bind(params);
+                    statement.step();
+                } finally {
+                    statement.free();
+                }
+            } else {
+                // The one path that does NOT flow through compileNext: a
+                // no-param `run()` hands the whole string to `backing.exec`,
+                // which compiles and steps every statement natively. Worker.js
+                // only reaches this with shim-built DDL/DML (escaped
+                // identifiers, never a leading ATTACH or VACUUM INTO), so it is
+                // not a reachable bypass today -- but the shim is the security
+                // boundary, not worker.js, so close it unconditionally. Fast
+                // path: skip the scan entirely unless a scanned keyword appears.
+                if (PATH_AUTHORITY_SCAN_WORD.test(sql)) {
+                    rejectPathAuthorityViolationsInScript(backing, sql, describeError);
+                }
+                try {
+                    backing.exec(sql);
+                } catch (error) {
+                    throw describeBackingError(error, sql, describeError);
+                }
+            }
+            return database;
+        },
+
+        /** Compile the FIRST statement in `sql`; `getSQL()` reports just that statement. */
+        prepare(sql, params) {
+            assertOpen();
+            const statement = prepareInternal(sql);
+            if (params != null) statement.bind(params);
+            return statement;
+        },
+
+        /** sql.js's StatementIterator: one statement per next(), tail via getRemainingSQL(). */
+        iterateStatements(sql) {
+            assertOpen();
+            let cursor = 0;
+            let active = null;
+            let finished = false;
+            return {
+                next() {
+                    if (active !== null) {
+                        active.free();
+                        active = null;
+                    }
+                    if (finished) return { done: true };
+                    assertOpen();
+                    let next;
+                    try {
+                        next = compileNext(backing, sql, cursor, describeError);
+                    } catch (error) {
+                        // Leave the cursor where it is so getRemainingSQL()
+                        // reports the text that failed to compile, as sql.js does.
+                        finished = true;
+                        throw error;
+                    }
+                    if (next === null) {
+                        finished = true;
+                        return { done: true };
+                    }
+                    cursor = next.end;
+                    active = createShimStatement(statementContext, next.compiled, next.source, next.expanded);
+                    return { value: active, done: false };
+                },
+                getRemainingSQL() {
+                    return sql.slice(cursor);
+                },
+                [Symbol.iterator]() {
+                    return this;
+                }
+            };
+        },
+
+        /** Rows changed by the most recent statement (`sqlite3_changes`). */
+        getRowsModified() {
+            assertOpen();
+            changesStatement ??= backing.prepare('SELECT changes() AS c');
+            return Number(changesStatement.all()[0].c);
+        },
+
+        /**
+         * Snapshot the database as bytes.
+         *
+         * `VACUUM INTO` a fresh 0700 temp directory, read it, delete it. The
+         * image is vacuumed rather than a byte copy -- unavoidable, and
+         * equivalent for every consumer (they hand it to the file writer).
+         */
+        export() {
+            assertOpen();
+            const fs = requireFs();
+            const directory = fs.makeTempDir();
+            if (typeof directory?.then === 'function') {
+                throw new Error(
+                    'export() requires a synchronous deps.fs; use exportAsync() on runtimes ' +
+                    'whose filesystem API is promise-based (tjs)'
+                );
+            }
+            try {
+                const target = `${directory}/export.sqlite`;
+                vacuumInto(target);
+                const bytes = fs.readFile(target);
+                if (typeof bytes?.then === 'function') {
+                    throw new Error(
+                        'export() requires a synchronous deps.fs.readFile; use exportAsync()'
+                    );
+                }
+                return bytes;
+            } finally {
+                try {
+                    fs.remove(directory);
+                } catch (error) {
+                    // A leaked temp directory must not fail an otherwise good
+                    // export -- but it holds a full copy of the database, so it
+                    // is reported rather than silently dropped.
+                    reportCleanupFailure(error, 'remove export temp directory');
+                }
+            }
+        },
+
+        /** `export()` for runtimes with a promise-based filesystem (tjs). */
+        async exportAsync() {
+            assertOpen();
+            const fs = requireFs();
+            const directory = await fs.makeTempDir();
+            try {
+                const target = `${directory}/export.sqlite`;
+                vacuumInto(target);
+                return await fs.readFile(target);
+            } finally {
+                try {
+                    await fs.remove(directory);
+                } catch (error) {
+                    // As above: cleanup failure is not an export failure, but a
+                    // leaked directory holding a database copy is worth hearing about.
+                    reportCleanupFailure(error, 'remove export temp directory');
+                }
+            }
+        },
+
+        /**
+         * Write a vacuumed image of the database directly to `target` -- the
+         * out-of-band export route. Unlike `export()`/`exportAsync()` there is
+         * NO read-back and NO image in memory: `VACUUM INTO` streams the copy
+         * to disk and this resolves once it commits. `target` must live
+         * somewhere only the caller can write -- the desktop shell hands in a
+         * path inside its own 0700 temp directory, and THAT is the boundary
+         * that makes planting impossible. Do NOT rely on VACUUM INTO to refuse
+         * a planted target: SQLite refuses only a NON-EMPTY existing file; a
+         * zero-byte file is written into, and (no `O_NOFOLLOW`) a symlink is
+         * followed. No `deps.fs` needed: nothing is read back.
+         *
+         * SECURITY: this is the shim's own privileged `VACUUM INTO` (the same
+         * `vacuumInto` behind `export()`), deliberately bypassing the
+         * compileNext path-authority guard. It is reachable ONLY from the
+         * sidecar's shell-originated export handler in native-host.js -- it is
+         * never exposed as a worker method, so the webview can neither invoke
+         * it nor choose `target`.
+         */
+        async exportToPath(target) {
+            assertOpen();
+            if (typeof target !== 'string' || target.length === 0) {
+                throw new Error('exportToPath requires a non-empty target path');
+            }
+            vacuumInto(target);
+        },
+
+        /**
+         * sql.js's row-callback cancellation hook. The fork's binding has no
+         * per-row callback, so this records the handler and does nothing else;
+         * cancellation on the native engine runs through `setQueryDeadline` /
+         * `interrupt` below, which the sidecar wires to the same timeout.
+         */
+        progress_handler(interval, callback) {
+            assertOpen();
+            progressHandler = callback == null ? null : { interval, callback };
+            return undefined;
+        },
+
+        /** The handler last installed by `progress_handler`, for the sidecar to inspect. */
+        get progressHandler() {
+            return progressHandler;
+        },
+
+        /** Fork cancellation primitives, passed through for the sidecar to drive. */
+        setQueryDeadline(ms) {
+            assertOpen();
+            backing.setQueryDeadline?.(ms);
+        },
+        clearQueryDeadline() {
+            assertOpen();
+            backing.clearQueryDeadline?.();
+        },
+        interrupt() {
+            assertOpen();
+            backing.interrupt?.();
+        },
+
+        /**
+         * Give the next statement the full `lockWaitMs` again. Not part of
+         * the sql.js surface: the sidecar calls it as each request arrives,
+         * so a request waits for another connection's lock once and every
+         * later statement of the same request fails at once (see
+         * `appliedLockWaitMs`). Set every time, so a `PRAGMA busy_timeout`
+         * run from the SQL console lasts until the end of its own request.
+         * Nothing to restore on a closed connection.
+         */
+        restoreLockWait() {
+            if (closed || poisoned !== null) return;
+            applyLockWait(lockWaitMs, true);
+        },
+
+        /** True while an explicit transaction is open on this connection. */
+        get inTransaction() {
+            assertOpen();
+            return backing.inTransaction === true;
+        },
+
+        /**
+         * Escalate an already-open writable session to read-only.
+         *
+         * Not part of the sql.js surface: sql.js has no read-only state of its
+         * own, so a caller there arms `PRAGMA query_only` directly and that is
+         * the whole of it. Here it is NOT -- the shim's `readOnly` flag decides
+         * whether `withInternalWrites` lifts `query_only` around the TEMP VIEW
+         * that reads column names without executing anything. Arming the pragma
+         * behind the shim's back leaves the two disagreeing: the lift becomes a
+         * no-op, SQLite refuses the probe's `CREATE TEMP VIEW` as a write, and
+         * the probe's "this statement is not viewable" catch turns that into
+         * "no columns" -- which the grid reports as an internal invariant
+         * violation instead of rows. That is exactly what happened to every
+         * database the open-time write probe found unwritable (a 0444 file, a
+         * read-only mount, a read-only DIRECTORY).
+         *
+         * Idempotent, and refused mid-lift: escalating while `query_only` is
+         * lifted would be undone by that lift's own restore.
+         *
+         * On failure the connection is POISONED rather than left running: a
+         * session that believes it is read-only and is not is the one state
+         * worse than a dead one.
+         */
+        enforceReadOnly() {
+            assertOpen();
+            if (readOnly) return true;
+            if (writesLifted) {
+                throw new Error(
+                    'Internal error: cannot escalate to read-only while an internal write lift is open'
+                );
+            }
+            try {
+                armReadOnly();
+            } catch (error) {
+                poisoned = copyErrno(
+                    new Error(
+                        `Read-only enforcement could not be armed (${error?.message ?? error}); `
+                        + 'this connection is no longer trustworthy and has been disabled'
+                    ),
+                    error
+                );
+                poisoned.cause = error;
+                throw poisoned;
+            }
+            readOnly = true;
+            return true;
+        },
+
+        /**
+         * Run `read` while SQLite refuses every write on this connection: the
+         * worker's read boundary (worker.js `readRefusingWrites`), which on
+         * sql.js toggles `PRAGMA query_only` itself. It comes through here
+         * for the same reason as `enforceReadOnly`: the column-name probe
+         * writes a TEMP VIEW, and `withInternalWrites` lifts `query_only`
+         * for that shim-authored DDL only when the shim armed it. No user SQL
+         * steps inside that lift.
+         *
+         * A read-only session, a nested call, and a connection whose
+         * `query_only` something else armed keep their state, as on sql.js.
+         * `read` is synchronous, so no other request sees the flag.
+         */
+        readRefusingWrites(read) {
+            assertOpen();
+            if (readOnly || readBoundary) return read();
+            if (Number(readScalar('PRAGMA query_only')) === 1) return read();
+            if (writesLifted) {
+                throw new Error('Internal error: cannot hold the read boundary while an internal write lift is open');
+            }
+            backing.exec('PRAGMA query_only = 1');
+            readBoundary = true;
+            try {
+                return read();
+            } finally {
+                readBoundary = false;
+                // A session escalated to read-only during the read keeps the flag.
+                if (!readOnly) backing.exec('PRAGMA query_only = 0');
+            }
+        },
+
+        close() {
+            if (closed) return;
+            closed = true;
+            for (const statement of [...liveStatements]) statement.free();
+            liveStatements.clear();
+            finalizeQuietly(changesStatement);
+            changesStatement = null;
+            backing.close();
+        },
+
+        /** Escape hatch for the sidecar entry; NOT part of the sql.js surface. */
+        get backingDatabase() {
+            return opened;
+        }
+    };
+
+    return database;
+}

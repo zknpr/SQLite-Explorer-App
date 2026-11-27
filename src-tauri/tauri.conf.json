@@ -1,10 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "SQLite Explorer",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "identifier": "xyz.zknpr.sqlite-explorer",
   "build": {
-    "frontendDist": "../viewer-dist"
+    "frontendDist": "../viewer-dist/web"
   },
   "app": {
     "withGlobalTauri": true,
@@ -36,6 +36,9 @@
     }
   },
   "bundle": {
+    "publisher": "zknpr",
+    "copyright": "Copyright (c) 2026 SQLite Explorer Contributors",
+    "homepage": "https://github.com/zknpr/SQLite-Explorer-App",
     "active": true,
     "shortDescription": "Browse and edit SQLite databases",
     "longDescription": "A desktop SQLite browser and editor: browse tables and views, edit cells with undo and explicit save, run SQL with parameters and query plans, and import or export CSV and JSON.",

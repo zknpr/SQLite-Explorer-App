@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { readVersions, resolveVersion } from './version.mjs';
 import { crateUrl, fetchVerified, parseLockChecksums, requiresMpl, selectMplPackages } from './mpl-sources.mjs';
+import { PACKAGE_NAME, TAURI_NAME, renameControl } from './deb-control.mjs';
 
 const CRATES_IO = 'registry+https://github.com/rust-lang/crates.io-index';
 const sha = (text) => createHash('sha256').update(text).digest('hex');
@@ -168,7 +169,7 @@ test('the bundled notices name no specific release and point at every release fo
 
 test('a prerelease version drafts a prerelease, and the manifest states the DMG is unsigned', async () => {
   const { buildManifest } = await import('./assemble.mjs');
-  const base = { tag: 'v', commit: 'c'.repeat(40), runUrl: 'u', viewerRef: 'r', assets: [] };
+  const base = { tag: 'v', commit: 'c'.repeat(40), runUrl: 'u', assets: [] };
   assert.equal(buildManifest({ ...base, version: '0.3.0-beta.1' }).prerelease, true);
   assert.equal(buildManifest({ ...base, version: '0.3.0' }).prerelease, false);
   assert.match(buildManifest({ ...base, version: '0.3.0' }).signing.macos, /disk image is unsigned/);
@@ -176,7 +177,7 @@ test('a prerelease version drafts a prerelease, and the manifest states the DMG 
 
 test('the release notes give a checksum command that exists on each platform', async () => {
   const { releaseNotes } = await import('./assemble.mjs');
-  const notes = releaseNotes({ version: '0.3.0', commit: 'c'.repeat(40), runUrl: 'u', viewerRef: 'r' });
+  const notes = releaseNotes({ version: '0.3.0', commit: 'c'.repeat(40), runUrl: 'u' });
   assert.match(notes, /shasum -a 256 --check --ignore-missing SHA256SUMS/, 'macOS');
   assert.match(notes, /Get-FileHash/, 'Windows');
   assert.match(notes, /sha256sum --check --ignore-missing SHA256SUMS/, 'Linux');
@@ -195,17 +196,60 @@ test('notice drift is caught in every direction', async () => {
   };
   const releasePackages = releaseCargoPackages(metadata);
   assert.deepEqual([...releasePackages], ['serde 1.0.0'], 'the workspace crate and unresolved packages are excluded');
-  const inventory = { viewerSource: 'pin', components: [{ component: 'serde 1.0.0', ecosystem: 'Cargo' }, { component: 'sql.js 1.14.1' }] };
-  const noticesText = 'serde 1.0.0\n...\nsql.js 1.14.1\n';
-  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText, viewerRef: 'pin' }), []);
+  const inventory = { components: [
+    { component: 'serde 1.0.0', ecosystem: 'Cargo' },
+    { component: 'crelt 1.0.7', ecosystem: 'viewer npm' },
+    { component: 'sql.js 1.14.1' }
+  ] };
+  const noticesText = 'serde 1.0.0\n...\ncrelt 1.0.7\n...\nsql.js 1.14.1\n';
+  const viewerPackages = new Set(['crelt 1.0.7']);
+  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText, viewerPackages }), []);
 
   const bumped = new Set(['serde 1.0.1']);
-  assert.deepEqual(checkNotices({ releasePackages: bumped, inventory, noticesText, viewerRef: 'pin' }), [
+  assert.deepEqual(checkNotices({ releasePackages: bumped, inventory, noticesText, viewerPackages }), [
     'release ships serde 1.0.1, which the inventory and notices omit',
     'inventory lists serde 1.0.0, which a release no longer ships'
   ]);
-  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText, viewerRef: 'newpin' }),
-    ['inventory was built for viewer pin, but viewer-dist is pinned to newpin']);
-  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText: 'serde 1.0.0\n', viewerRef: 'pin' }),
+  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText, viewerPackages: new Set(['crelt 1.0.8']) }), [
+    'the viewer bundles crelt 1.0.8, which the inventory and notices omit',
+    'inventory lists crelt 1.0.7, which the viewer no longer bundles'
+  ]);
+  assert.deepEqual(checkNotices({ releasePackages, inventory, noticesText: 'serde 1.0.0\ncrelt 1.0.7\n', viewerPackages }),
     ['THIRD_PARTY_NOTICES.txt has no section for sql.js 1.14.1']);
+});
+
+// A control file as Tauri writes it: the description continues on indented lines.
+const TAURI_CONTROL = [
+  'Package: sq-lite-explorer',
+  'Version: 0.4.0',
+  'Architecture: amd64',
+  'Installed-Size: 31000',
+  'Maintainer: zknpr',
+  'Priority: optional',
+  'Depends: libsm6, libice6, libc6 (>= 2.39), libwebkit2gtk-4.1-0, libgtk-3-0',
+  'Description: Browse and edit SQLite databases',
+  ' Browse and edit SQLite databases',
+  ''
+].join('\n');
+
+test('the Debian package is renamed and takes over the old name', () => {
+  const renamed = renameControl(TAURI_CONTROL);
+  assert.equal(typeof renamed, 'string', String(renamed));
+  const lines = renamed.split('\n');
+  assert.equal(lines[0], `Package: ${PACKAGE_NAME}`);
+  assert.equal(PACKAGE_NAME, 'sqlite-explorer');
+  // The new fields follow the description's continuation line, inside the one
+  // paragraph a control file holds, and the file ends with a single newline.
+  assert.deepEqual(lines.slice(-5), [
+    ' Browse and edit SQLite databases',
+    `Provides: ${TAURI_NAME}`, `Conflicts: ${TAURI_NAME}`, `Replaces: ${TAURI_NAME}`, ''
+  ]);
+  assert.ok(!renamed.includes('\n\n'), 'no blank line splits the paragraph');
+  assert.equal(renameControl(TAURI_CONTROL + '\n\n'), renamed, 'trailing blank lines do not matter');
+});
+
+test('the Debian rename refuses a control file it does not expect', () => {
+  assert.ok(renameControl(TAURI_CONTROL.replace('Package: sq-lite-explorer', 'Package: other')) instanceof Error);
+  assert.ok(renameControl(renameControl(TAURI_CONTROL)) instanceof Error, 'a renamed file is not renamed twice');
+  assert.ok(renameControl(TAURI_CONTROL.replace('Priority: optional', 'Priority: optional\nReplaces: x')) instanceof Error);
 });
