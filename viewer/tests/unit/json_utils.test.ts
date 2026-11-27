@@ -1,0 +1,679 @@
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import {
+    generateMergePatch,
+    applyMergePatch,
+    computeJsonPatchUndo,
+    planJsonPatchHistoryReplay,
+    prepareCellUpdateForStorage
+} from '../../src/core/json-utils';
+
+// generateMergePatch/applyMergePatch build their results on null-prototype
+// objects so keys like "__proto__" stay ordinary own data. deepStrictEqual is
+// prototype-sensitive, and every production consumer JSON.stringifys these
+// results, so tests compare the serialized shape.
+const asPlain = (value: unknown) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+
+describe('JSON Merge Patch (RFC 7396)', () => {
+    describe('generateMergePatch', () => {
+        it('should return undefined if objects are identical', () => {
+            const original = { a: 1 };
+            const modified = { a: 1 };
+            assert.strictEqual(generateMergePatch(original, modified), undefined);
+        });
+
+        it('should detect added keys', () => {
+            const original = { a: 1 };
+            const modified = { a: 1, b: 2 };
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { b: 2 });
+        });
+
+        it('should detect modified keys', () => {
+            const original = { a: 1 };
+            const modified = { a: 2 };
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { a: 2 });
+        });
+
+        it('should detect deleted keys', () => {
+            const original = { a: 1, b: 2 };
+            const modified = { a: 1 };
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { b: null });
+        });
+
+        it('should handle nested objects', () => {
+            const original = { a: { x: 1, y: 2 } };
+            const modified = { a: { x: 1, y: 3 } };
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { a: { y: 3 } });
+        });
+
+        it('should replace arrays entirely', () => {
+            const original = { a: [1, 2] };
+            const modified = { a: [1, 3] };
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), { a: [1, 3] });
+        });
+
+        it('should handle complex nesting', () => {
+            const original = { a: { b: { c: 1 } }, d: 2 };
+            const modified = { a: { b: { c: 2 } } }; // d deleted, c modified
+            assert.deepStrictEqual(asPlain(generateMergePatch(original, modified)), {
+                a: { b: { c: 2 } },
+                d: null
+            });
+        });
+    });
+
+    describe('applyMergePatch', () => {
+        it('should return null if patch is null at root level', () => {
+            const target = { a: 1 };
+            const patch = null;
+            const result = applyMergePatch(target, patch);
+            assert.strictEqual(result, null);
+        });
+
+        it('should modify property', () => {
+            const target = { a: 1, b: 2 };
+            const patch = { a: 3 };
+            const result = applyMergePatch(target, patch);
+            assert.deepStrictEqual(asPlain(result), { a: 3, b: 2 });
+        });
+
+        it('should add property', () => {
+            const target = { a: 1 };
+            const patch = { b: 2 };
+            const result = applyMergePatch(target, patch);
+            assert.deepStrictEqual(asPlain(result), { a: 1, b: 2 });
+        });
+
+        it('should remove property', () => {
+            const target = { a: 1, b: 2 };
+            const patch = { b: null };
+            const result = applyMergePatch(target, patch);
+            assert.deepStrictEqual(asPlain(result), { a: 1 });
+        });
+
+        it('should handle nested patches', () => {
+            const target = { a: { x: 1, y: 2 } };
+            const patch = { a: { y: 3 } };
+            const result = applyMergePatch(target, patch);
+            assert.deepStrictEqual(asPlain(result), { a: { x: 1, y: 3 } });
+        });
+
+        it('should replace arrays', () => {
+            const target = { a: [1, 2] };
+            const patch = { a: [3, 4] };
+            const result = applyMergePatch(target, patch);
+            assert.deepStrictEqual(asPlain(result), { a: [3, 4] });
+        });
+
+        it('should not mutate original object deeply', () => {
+            const target = { a: { x: 1 } };
+            const patch = { a: { y: 2 } };
+            const result = applyMergePatch(target, patch);
+
+            // Result should have both
+            assert.deepStrictEqual(asPlain(result), { a: { x: 1, y: 2 } });
+        });
+
+        it('should throw error if depth limit is exceeded', () => {
+            const patch = { a: { b: { c: 1 } } };
+            assert.throws(() => applyMergePatch({}, patch, 1001), /JSON apply merge patch depth limit exceeded/);
+        });
+
+        it('should replace target if patch is primitive or array', () => {
+            assert.strictEqual(applyMergePatch({ a: 1 }, 'test'), 'test');
+            assert.deepStrictEqual(applyMergePatch({ a: 1 }, [1, 2]), [1, 2]);
+        });
+
+        it('should treat target as empty object if it is primitive, null, or array', () => {
+            assert.deepStrictEqual(asPlain(applyMergePatch(null, { a: 1 })), { a: 1 });
+            assert.deepStrictEqual(asPlain(applyMergePatch('str', { a: 1 })), { a: 1 });
+            assert.deepStrictEqual(asPlain(applyMergePatch([1, 2], { a: 1 })), { a: 1 });
+        });
+
+        it('should handle deletion of non-existent property', () => {
+            assert.deepStrictEqual(asPlain(applyMergePatch({ a: 1 }, { b: null })), { a: 1 });
+        });
+
+        it('should correctly apply nested patch when target property is not an object', () => {
+            assert.deepStrictEqual(asPlain(applyMergePatch({ a: 1 }, { a: { b: 2 } })), { a: { b: 2 } });
+        });
+
+        it('should only process patch own properties', () => {
+            const proto = { inherited: 1 };
+            const patch = Object.create(proto);
+            patch.own = 2;
+            assert.deepStrictEqual(asPlain(applyMergePatch({ a: 1 }, patch)), { a: 1, own: 2 });
+        });
+    });
+});
+
+describe('guarded JSON patch history replay', () => {
+    const writeValue = (plan: ReturnType<typeof planJsonPatchHistoryReplay>) => {
+        assert.strictEqual(plan.kind, 'write');
+        return (plan as { kind: 'write'; value: string }).value;
+    };
+
+    for (const direction of ['undo', 'redo'] as const) {
+        it(`${direction} restores recorded JSON text exactly when no concurrent change exists`, () => {
+            const prior = '{ "keep": 1, "nested": {"old":2}, "remove":true, "literal":null, "escaped":"\\u0041" }';
+            const post = '{ "keep":1,"nested":{"old":2,"new":7},"literal":null,"escaped":"\\u0041" }';
+            const patch = '{"nested":{"new":7},"remove":null}';
+            assert.strictEqual(writeValue(planJsonPatchHistoryReplay(
+                direction === 'undo' ? post : prior, patch, prior, post, direction
+            )), direction === 'undo' ? prior : post);
+        });
+    }
+
+    it('undo rejects drift on a touched path but allows untouched siblings', () => {
+        const prior = '{"status":"draft","owner":"ada"}';
+        const patch = '{"status":"published"}';
+        const post = '{"status":"published","owner":"ada"}';
+
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"status":"archived","owner":"ada","reviewer":"grace"}',
+                patch,
+                prior,
+                post,
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(writeValue(planJsonPatchHistoryReplay(
+                '{"status":"published","owner":"ada","reviewer":"grace"}',
+                patch,
+                prior,
+                post,
+                'undo'
+            ))),
+            { status: 'draft', owner: 'ada', reviewer: 'grace' }
+        );
+    });
+
+    it('redo validates touched paths against prior and preserves untouched siblings', () => {
+        const prior = '{"status":"draft","owner":"ada"}';
+        const patch = '{"status":"published"}';
+        const post = '{"status":"published","owner":"ada"}';
+
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"status":"archived","owner":"ada"}',
+                patch,
+                prior,
+                post,
+                'redo'
+            ),
+            { kind: 'conflict' }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(writeValue(planJsonPatchHistoryReplay(
+                '{"status":"draft","owner":"ada","reviewer":"grace"}',
+                patch,
+                prior,
+                post,
+                'redo'
+            ))),
+            { status: 'published', owner: 'ada', reviewer: 'grace' }
+        );
+    });
+
+    it('distinguishes a missing touched key from explicit JSON null', () => {
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"removed":null,"keep":2}',
+                '{"removed":null}',
+                '{"removed":1,"keep":2}',
+                '{"keep":2}',
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('treats arrays and scalars at patch leaves as atomic values', () => {
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"items":[1,2,3],"mode":"ready"}',
+                '{"items":[1,2],"mode":"ready"}',
+                '{"items":[0],"mode":"draft"}',
+                '{"items":[1,2],"mode":"ready"}',
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('treats an object patch onto a missing branch as an atomic branch', () => {
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"keep":1,"meta":{"reviewed":true,"external":"sibling"}}',
+                '{"meta":{"reviewed":true}}',
+                '{"keep":1}',
+                '{"keep":1,"meta":{"reviewed":true}}',
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('handles __proto__ as an own JSON key without changing object prototypes', () => {
+        const plan = planJsonPatchHistoryReplay(
+            '{"__proto__":{"value":2},"keep":3}',
+            '{"__proto__":{"value":2}}',
+            '{"__proto__":{"value":1}}',
+            '{"__proto__":{"value":2}}',
+            'undo'
+        );
+        assert.deepStrictEqual(
+            JSON.parse(writeValue(plan)),
+            JSON.parse('{"__proto__":{"value":1},"keep":3}')
+        );
+        assert.strictEqual(({} as Record<string, unknown>).value, undefined);
+    });
+
+    it('falls back to exact whole-cell comparison for precision-risky JSON', () => {
+        const prior = '{"exact":9007199254740993,"status":"draft"}';
+        const post = '{"exact":9007199254740993,"status":"published"}';
+        const patch = '{"status":"published"}';
+
+        assert.strictEqual(
+            writeValue(planJsonPatchHistoryReplay(post, patch, prior, post, 'undo')),
+            prior
+        );
+        assert.deepStrictEqual(
+            planJsonPatchHistoryReplay(
+                '{"exact":9007199254740993,"status":"published","sibling":1}',
+                patch,
+                prior,
+                post,
+                'undo'
+            ),
+            { kind: 'conflict' }
+        );
+    });
+
+    it('rejects patch structures deeper than the replay limit', () => {
+        let prior: unknown = 0;
+        let post: unknown = 1;
+        let patch: unknown = 1;
+        for (let depth = 0; depth < 1002; depth++) {
+            prior = { child: prior };
+            post = { child: post };
+            patch = { child: patch };
+        }
+        const priorRaw = JSON.stringify(prior);
+        const postRaw = JSON.stringify(post);
+        const patchRaw = JSON.stringify(patch);
+
+        assert.throws(
+            () => planJsonPatchHistoryReplay(postRaw, patchRaw, priorRaw, postRaw, 'undo'),
+            /depth limit/i
+        );
+    });
+});
+
+describe('literal prototype-member JSON keys ("__proto__", "constructor")', () => {
+    // JSON.parse creates OWN properties for these keys, but on plain objects a
+    // patch["__proto__"] assignment hits the inherited setter (no own key ->
+    // empty patch -> silently dropped edit), and reads of an ABSENT key fall
+    // back to Object.prototype members instead of undefined (masking
+    // additions/deletions). These tests pin the own-property semantics.
+
+    it('generateMergePatch emits a __proto__ key modification instead of an empty patch', () => {
+        const original = JSON.parse('{"__proto__":{"a":1},"k":1}');
+        const modified = JSON.parse('{"__proto__":{"a":2},"k":1}');
+        const patch = generateMergePatch(original, modified);
+        assert.strictEqual(JSON.stringify(patch), '{"__proto__":{"a":2}}');
+        // No pollution of the global Object prototype.
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('generateMergePatch emits a __proto__ key addition', () => {
+        const patch = generateMergePatch(JSON.parse('{"k":1}'), JSON.parse('{"k":1,"__proto__":{"a":1}}'));
+        assert.strictEqual(JSON.stringify(patch), '{"__proto__":{"a":1}}');
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('generateMergePatch emits a deletion marker for a removed constructor key', () => {
+        // Pre-fix, modified["constructor"] returned the inherited Object
+        // constructor (never undefined), so the deletion was silently missed.
+        const patch = generateMergePatch(
+            JSON.parse('{"constructor":{"x":1},"k":1}'),
+            JSON.parse('{"k":2}')
+        );
+        assert.strictEqual(JSON.stringify(patch), '{"k":2,"constructor":null}');
+    });
+
+    it('applyMergePatch adds a __proto__ data key without touching prototypes', () => {
+        const result = applyMergePatch(JSON.parse('{"k":1}'), JSON.parse('{"__proto__":{"a":1}}'));
+        assert.strictEqual(JSON.stringify(result), '{"k":1,"__proto__":{"a":1}}');
+        assert.strictEqual(
+            Object.prototype.hasOwnProperty.call(result, '__proto__'),
+            true
+        );
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('prepareCellUpdateForStorage round-trips a __proto__ key edit', () => {
+        const prior = '{"__proto__":{"a":1},"k":1}';
+        const next = '{"__proto__":{"a":2},"k":1}';
+        const prepared = prepareCellUpdateForStorage(next, prior);
+        // Either representation is acceptable, but applying it must yield
+        // `next` — the pre-fix defect emitted an EMPTY json_patch here, so the
+        // edit was silently discarded while the UI reported success.
+        if (prepared.operation === 'json_patch') {
+            const applied = applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string));
+            assert.deepStrictEqual(asPlain(applied), JSON.parse(next));
+        } else {
+            assert.strictEqual(prepared.value, next);
+        }
+        assert.strictEqual(({} as Record<string, unknown>).a, undefined);
+    });
+
+    it('prepareCellUpdateForStorage falls back to set when a __proto__ key is deleted', () => {
+        // The patch would carry "__proto__": null, and null members always
+        // force the full-value set path.
+        const prepared = prepareCellUpdateForStorage('{"k":1}', '{"__proto__":{"a":1},"k":1}');
+        assert.deepStrictEqual(prepared, { value: '{"k":1}', operation: 'set' });
+    });
+});
+
+describe('prepareCellUpdateForStorage', () => {
+    it('emits a merge patch for a plain object edit that round-trips through apply', () => {
+        const prior = '{"a":1,"b":2}';
+        const next = '{"a":5,"b":2}';
+        const prepared = prepareCellUpdateForStorage(next, prior);
+        assert.strictEqual(prepared.operation, 'json_patch');
+        assert.deepStrictEqual(JSON.parse(prepared.value as string), { a: 5 });
+        assert.deepStrictEqual(
+            asPlain(applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string))),
+            JSON.parse(next)
+        );
+    });
+
+    it('stores the full value when the edit sets a key to null', () => {
+        // The patch would be {"a":null}, which applies as a key DELETION
+        // (RFC 7396) — the user's explicit null must survive as a set.
+        const prepared = prepareCellUpdateForStorage('{"a":null,"b":2}', '{"a":1,"b":2}');
+        assert.deepStrictEqual(prepared, { value: '{"a":null,"b":2}', operation: 'set' });
+    });
+
+    it('stores the full value when a key becomes null at any depth', () => {
+        const next = '{"a":{"b":{"c":null}},"d":1}';
+        const prepared = prepareCellUpdateForStorage(next, '{"a":{"b":{"c":1}},"d":1}');
+        assert.deepStrictEqual(prepared, { value: next, operation: 'set' });
+    });
+
+    it('stores the full value when an added subtree contains null', () => {
+        // Merge-patch application strips nulls even inside newly added objects.
+        const next = '{"a":1,"b":{"c":null,"d":2}}';
+        const prepared = prepareCellUpdateForStorage(next, '{"a":1}');
+        assert.deepStrictEqual(prepared, { value: next, operation: 'set' });
+    });
+
+    it('stores the full value when the edit deletes a key', () => {
+        // The patch would be the ambiguous {"b":null}; correctness beats the
+        // optimization.
+        const prepared = prepareCellUpdateForStorage('{"a":1}', '{"a":1,"b":2}');
+        assert.deepStrictEqual(prepared, { value: '{"a":1}', operation: 'set' });
+    });
+
+    it('stores the typed text when an untouched array holds an integer past 2^53', () => {
+        // A patch carries every array whole and is printed from parsed numbers,
+        // so it would write 9007199254740992 over an element nobody edited.
+        const prior = '{"ids":[9007199254740993],"name":"a"}';
+        const next = '{"ids":[9007199254740993],"name":"b"}';
+        assert.deepStrictEqual(prepareCellUpdateForStorage(next, prior), { value: next, operation: 'set' });
+    });
+
+    it('stores the typed text when the new value holds a number JSON cannot round-trip', () => {
+        const next = '{"n":9007199254740995}';
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage(next, '{"n":1}'),
+            { value: next, operation: 'set' }
+        );
+        const decimal = '{"price":0.1000000000000000055511151231257827}';
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage(decimal, '{"price":1}'),
+            { value: decimal, operation: 'set' }
+        );
+    });
+
+    it('stores the typed text when two integers past 2^53 differ only below double precision', () => {
+        // Parsed, both are 9007199254740992: a patch would hold only {"a":2}
+        // and drop the change to n.
+        const next = '{"a":2,"n":9007199254740992}';
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage(next, '{"a":1,"n":9007199254740993}'),
+            { value: next, operation: 'set' }
+        );
+    });
+
+    it('still patches when digits past 2^53 appear only inside a string', () => {
+        const prepared = prepareCellUpdateForStorage(
+            '{"id":"9007199254740993","name":"b"}',
+            '{"id":"9007199254740993","name":"a"}'
+        );
+        assert.deepStrictEqual(prepared, { value: '{"name":"b"}', operation: 'json_patch' });
+    });
+
+    it('still patches when null appears only inside an array', () => {
+        // Merge patch copies arrays verbatim, so nulls inside them are data,
+        // not delete markers — the optimization stays safe here.
+        const prior = '{"a":[1,2],"b":1}';
+        const next = '{"a":[1,null,{"c":null}],"b":1}';
+        const prepared = prepareCellUpdateForStorage(next, prior);
+        assert.strictEqual(prepared.operation, 'json_patch');
+        assert.deepStrictEqual(
+            asPlain(applyMergePatch(JSON.parse(prior), JSON.parse(prepared.value as string))),
+            JSON.parse(next)
+        );
+    });
+
+    it('keeps pre-built history-replay patches verbatim, including nulls', () => {
+        const prepared = prepareCellUpdateForStorage('{"a":null}', '{"a":1}', 'json_patch');
+        assert.deepStrictEqual(prepared, { value: '{"a":null}', operation: 'json_patch' });
+    });
+
+    it('falls back to set for non-object or unparseable values', () => {
+        assert.deepStrictEqual(prepareCellUpdateForStorage(5, 4), { value: 5, operation: 'set' });
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('plain', '{"a":1}'),
+            { value: 'plain', operation: 'set' }
+        );
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('[1,2]', '[1]'),
+            { value: '[1,2]', operation: 'set' }
+        );
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('{"a":}', '{"a":1}'),
+            { value: '{"a":}', operation: 'set' }
+        );
+    });
+
+    it('falls back to set when nothing changed', () => {
+        assert.deepStrictEqual(
+            prepareCellUpdateForStorage('{"a":1}', '{ "a" : 1 }'),
+            { value: '{"a":1}', operation: 'set' }
+        );
+    });
+});
+
+describe('computeJsonPatchUndo (RMW undo decision)', () => {
+    const j = (v: unknown) => JSON.stringify(v);
+    const expectRestore = (plan: ReturnType<typeof computeJsonPatchUndo>, expected: unknown) => {
+        assert.strictEqual(plan.kind, 'restore');
+        assert.deepStrictEqual(JSON.parse((plan as { kind: 'restore'; value: string }).value), expected);
+    };
+    const expectReplace = (plan: ReturnType<typeof computeJsonPatchUndo>) =>
+        assert.strictEqual(plan.kind, 'replace');
+
+    it('s1: restores the edited key and preserves a concurrent sibling key', () => {
+        expectRestore(
+            computeJsonPatchUndo(
+                j({ status: 'published', owner: 'ada', reviewer: 'grace' }), // current (forward + concurrent)
+                j({ status: 'published' }),                                   // forward patch (newValue)
+                j({ status: 'draft', owner: 'ada' })                          // prior
+            ),
+            { status: 'draft', owner: 'ada', reviewer: 'grace' }
+        );
+    });
+
+    it('s2: removes a wholly-added object key (empty-object collapse)', () => {
+        expectRestore(
+            computeJsonPatchUndo(j({ meta: { reviewed: true } }), j({ meta: { reviewed: true } }), j({})),
+            {}
+        );
+    });
+
+    it('s3: removes only the added nested leaf, keeping a concurrent nested sibling', () => {
+        expectRestore(
+            computeJsonPatchUndo(j({ meta: { reviewed: true, note: 'keep' } }), j({ meta: { reviewed: true } }), j({})),
+            { meta: { note: 'keep' } }
+        );
+    });
+
+    it('s4: restores an explicit null at the edited key while preserving a concurrently added sibling', () => {
+        // c exists in current but not prior — added concurrently after the tracked edit.
+        // Blind value-replacement to prior would drop c; RMW restores a=null and keeps c.
+        expectRestore(
+            computeJsonPatchUndo(j({ a: 2, b: 1, c: 3 }), j({ a: 2 }), j({ a: null, b: 1 })),
+            { a: null, b: 1, c: 3 }
+        );
+    });
+
+    it('s5: restores a nested explicit null while preserving a concurrently added nested sibling', () => {
+        // meta.c was added concurrently; RMW restores meta.a=null and keeps meta.c.
+        expectRestore(
+            computeJsonPatchUndo(
+                j({ meta: { a: 2, keep: 1, c: 3 } }),
+                j({ meta: { a: 2 } }),
+                j({ meta: { a: null, keep: 1 } })
+            ),
+            { meta: { a: null, keep: 1, c: 3 } }
+        );
+    });
+
+    it('s6: value-replaces when the current cell is not a JSON object', () => {
+        for (const current of ['plain text', null, '5', '[1,2]']) {
+            expectReplace(computeJsonPatchUndo(current, j({ status: 'published' }), j({ status: 'draft' })));
+        }
+    });
+
+    it('s7: value-replaces when the forward patch was a scalar/array whole-doc replacement', () => {
+        expectReplace(computeJsonPatchUndo(j({ a: 1 }), '5', j({ a: 1 })));
+        expectReplace(computeJsonPatchUndo(j({ a: 1 }), '[1,2]', j({ a: 1 })));
+    });
+
+    it('s8: value-replaces when the prior cell was SQL NULL / non-object', () => {
+        expectReplace(computeJsonPatchUndo(j({ added: true }), j({ added: true }), null));
+        expectReplace(computeJsonPatchUndo(j({ added: true }), j({ added: true }), '5'));
+    });
+
+    it('restores literal __proto__ keys as data without mutating prototypes', () => {
+        const priorRaw = '{"a":1,"__proto__":{"x":9}}';
+        const forwardRaw = '{"__proto__":{"x":10}}';
+        const currentRaw = '{"a":1,"b":2}';
+
+        const beforePrototype = ({} as Record<string, unknown>).x;
+        const plan = computeJsonPatchUndo(currentRaw, forwardRaw, priorRaw);
+
+        assert.strictEqual(plan.kind, 'restore');
+        const restoredRaw = (plan as { kind: 'restore'; value: string }).value;
+        assert.strictEqual(restoredRaw, '{"a":1,"b":2,"__proto__":{"x":9}}');
+        const restored = JSON.parse(restoredRaw);
+        assert.deepStrictEqual(restored.__proto__, { x: 9 });
+        assert.strictEqual(({} as Record<string, unknown>).x, beforePrototype);
+    });
+
+    it('preserves literal __proto__ and constructor keys already present on the current cell', () => {
+        const priorRaw = '{"a":1,"constructor":{"safe":1,"owner":"ada"}}';
+        const forwardRaw = '{"b":2,"constructor":{"safe":2}}';
+        const currentRaw = '{"a":1,"b":2,"__proto__":{"x":9},"constructor":{"safe":2,"owner":"ada","keep":3}}';
+
+        const plan = computeJsonPatchUndo(currentRaw, forwardRaw, priorRaw);
+
+        assert.strictEqual(plan.kind, 'restore');
+        const restoredRaw = (plan as { kind: 'restore'; value: string }).value;
+        assert.strictEqual(restoredRaw.includes('"__proto__":{"x":9}'), true);
+        expectRestore(
+            plan,
+            JSON.parse('{"a":1,"__proto__":{"x":9},"constructor":{"safe":1,"owner":"ada","keep":3}}')
+        );
+        assert.strictEqual(({} as Record<string, unknown>).x, undefined);
+    });
+
+    it('restores the full prior subtree when the current nested value is no longer an object', () => {
+        expectRestore(
+            computeJsonPatchUndo(
+                j({ meta: 'archived' }),
+                j({ meta: { reviewed: true } }),
+                j({ meta: { reviewed: false, owner: 'ada' } })
+            ),
+            { meta: { reviewed: false, owner: 'ada' } }
+        );
+    });
+
+    it('value-replaces when untouched integer tokens cannot survive JSON parse/stringify exactly', () => {
+        expectReplace(
+            computeJsonPatchUndo(
+                '{"id":9007199254740993,"a":2}',
+                j({ a: 2 }),
+                '{"id":9007199254740993,"a":1}'
+            )
+        );
+    });
+
+    it('value-replaces when untouched exponent tokens overflow JSON number parsing', () => {
+        expectReplace(
+            computeJsonPatchUndo(
+                '{"huge":1e999,"a":2}',
+                j({ a: 2 }),
+                '{"huge":1e999,"a":1}'
+            )
+        );
+    });
+
+    it('value-replaces when an untouched high-precision decimal cannot round-trip', () => {
+        // The decimal carries more precision than a JS double; JSON.parse/stringify
+        // would round it, so undo must value-replace to keep it byte-exact.
+        expectReplace(
+            computeJsonPatchUndo(
+                '{"precise":0.1234567890123456789012345,"a":2}',
+                j({ a: 2 }),
+                '{"precise":0.1234567890123456789012345,"a":1}'
+            )
+        );
+    });
+
+    it('still performs a surgical restore when object cells have no precision-risky integers', () => {
+        expectRestore(
+            computeJsonPatchUndo(
+                j({ id: 42, a: 2, untouched: 'keep' }),
+                j({ a: 2 }),
+                j({ id: 42, a: 1 })
+            ),
+            { id: 42, a: 1, untouched: 'keep' }
+        );
+    });
+
+    it('invariant: round-trips an object edit (no concurrent change) back to prior', () => {
+        const prior = { status: 'draft', meta: { reviewed: false, owner: 'ada' } };
+        const forward = generateMergePatch(prior, { status: 'published', meta: { reviewed: true, owner: 'ada' } });
+        const current = applyMergePatch(prior, forward);
+        expectRestore(computeJsonPatchUndo(j(current), j(forward), j(prior)), prior);
+    });
+
+    it('invariant: never touches keys outside the forward patch structure', () => {
+        expectRestore(
+            computeJsonPatchUndo(
+                j({ a: 'forward-changed', untouched: { deep: 1 }, sibling: 2 }),
+                j({ a: 'forward-changed' }),
+                j({ a: 'orig' })
+            ),
+            { a: 'orig', untouched: { deep: 1 }, sibling: 2 }
+        );
+    });
+});

@@ -1,0 +1,61 @@
+name: Bug report
+description: Something in the app does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report security vulnerabilities privately, as SECURITY.md describes, never here.
+        Please do not attach a database with private data; a small synthetic one is best.
+  - type: input
+    id: version
+    attributes:
+      label: App version
+      description: Shown in About SQLite Explorer, or in the installer's name.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version and desktop
+      placeholder: "macOS 15.2, Windows 11 24H2, Ubuntu 24.04 with GNOME on Wayland..."
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Database engine
+      description: The badge in the status bar.
+      options:
+        - Native
+        - WASM
+        - Not sure
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a database with ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Error messages, screenshots, the schema of the tables involved.

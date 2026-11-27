@@ -19,7 +19,11 @@ mod native;
 mod linux_session;
 #[cfg(windows)]
 mod request_pin;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
+mod shell_keys;
+#[cfg(target_os = "linux")]
+mod gtk_dialog;
+#[cfg(any(windows, test))]
 mod windows_file_info;
 #[cfg(windows)]
 mod windows_session;
@@ -76,12 +80,12 @@ const DB_EXTENSIONS: [&str; 7] = ["db", "sqlite", "sqlite3", "db3", "sdb", "s3db
 /// of formats the viewer's `parseImport` will be handed.
 const IMPORT_EXTENSIONS: [&str; 2] = ["csv", "json"];
 
-/// The largest import source the shell will read, in bytes. Mirrors upstream
-/// `IMPORT_MAX_BYTES` in `src/core/bulk-import.ts` (64 MiB), whose parser refuses
+/// The largest import source the shell will read, in bytes. Mirrors
+/// `IMPORT_MAX_BYTES` in `viewer/src/core/bulk-import.ts` (64 MiB), whose parser refuses
 /// the same size in the page — two identical gates, and this one comes first so a
 /// 64 MiB + 1 file is refused from its `fstat` size before a byte of it is
 /// allocated here or crosses IPC. `the_import_cap_matches_the_viewer_parser` pins
-/// the two together through the synced bundle.
+/// the two together through the built bundle (viewer-dist/).
 const IMPORT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Request header that turns `save_file_as` from an EXPORT into a SAVE AS — the one
@@ -140,7 +144,8 @@ fn served_origin() -> tauri::Url {
 /// compromised page can otherwise exfiltrate by navigating — `location`, a meta
 /// refresh, or a form post put data in a URL, and CSP's `connect-src` covers none of
 /// them — and a navigation would also move the page, with its IPC grant, to a
-/// remote origin. Same-origin navigations (a reload, a query string) stay allowed.
+/// remote origin. Same-origin navigations (a reload, a query string) stay allowed,
+/// except a reload of a window with unsaved work: see `navigation_refusal`.
 ///
 /// `blob:` is judged by the origin it embeds: a blob the page minted itself
 /// (`blob:tauri://localhost/<uuid>`, the viewer's web-mode cell download) holds
@@ -202,6 +207,41 @@ fn origin_for_log(target: &str) -> String {
     }
 }
 
+/// Why the navigation pin refuses a top-level navigation.
+#[derive(Debug, PartialEq, Eq)]
+enum NavigationRefusal {
+    /// Off the served origin: see `is_app_navigation`.
+    OffOrigin,
+    /// A document load in a window whose page reports unsaved work.
+    UnsavedChanges,
+}
+
+/// The navigation pin's whole decision: `None` lets the navigation through.
+///
+/// A document load on the app's own origin is a reload (F5 or Ctrl+R in
+/// WebView2, a context menu's Reload, `location.reload()`), and it replaces the
+/// document whose heap holds every pending edit: the shell then reaps the
+/// window's sidecars (`PageLoadEvent::Started`) and the new page forgets the
+/// work was ever unsaved, so it was gone without a prompt (measured on the
+/// Windows guest). While the window's page reports unsaved work it is refused,
+/// on the same report the close and quit prompts read. Refused rather than
+/// asked: reloading is no feature of the app (Refresh From Disk reopens in
+/// place). A `blob:` URL is the page's own data on its way to a download, not
+/// a document.
+fn navigation_refusal(
+    target: &tauri::Url,
+    allowed: &[tauri::Url],
+    unsaved: UnsavedState,
+) -> Option<NavigationRefusal> {
+    if !is_app_navigation(target, allowed) {
+        return Some(NavigationRefusal::OffOrigin);
+    }
+    if target.scheme() != "blob" && close_decision(unsaved) != CloseDecision::Proceed {
+        return Some(NavigationRefusal::UnsavedChanges);
+    }
+    None
+}
+
 /// Installs `is_app_navigation` on EVERY webview, the config-declared window and
 /// the `db-<n>` windows alike: a plugin's navigation hook runs for each webview
 /// the app creates, so no window can be built without it. In a `tauri dev` build
@@ -224,17 +264,27 @@ fn navigation_pin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
             if tauri::is_dev() {
                 allowed.extend(webview.config().build.dev_url.clone());
             }
-            let permitted = is_app_navigation(url, &allowed);
-            if !permitted {
-                // Origin only: the rest of a refused URL is whatever the page
-                // tried to smuggle out, and it does not belong in a log.
-                eprintln!(
-                    "refused a navigation away from the app to {}://{}",
-                    url.scheme(),
-                    url.host_str().unwrap_or("")
-                );
+            let label = webview.window().label().to_string();
+            let unsaved = webview
+                .try_state::<Windows>()
+                .map_or_else(UnsavedState::default, |windows| reported_unsaved(&windows, &label));
+            match navigation_refusal(url, &allowed, unsaved) {
+                None => true,
+                Some(NavigationRefusal::OffOrigin) => {
+                    // Origin only: the rest of a refused URL is whatever the page
+                    // tried to smuggle out, and it does not belong in a log.
+                    eprintln!(
+                        "refused a navigation away from the app to {}://{}",
+                        url.scheme(),
+                        url.host_str().unwrap_or("")
+                    );
+                    false
+                }
+                Some(NavigationRefusal::UnsavedChanges) => {
+                    eprintln!("refused a reload of window {label}: it has unsaved changes");
+                    false
+                }
             }
-            permitted
         })
         .build()
 }
@@ -630,6 +680,12 @@ fn read_regular_file(path: &Path) -> Result<Vec<u8>, String> {
 /// by `read_database_bytes` (from the descriptor it read) and by the Save As adoption,
 /// compared by `save_database` immediately before the write, re-recorded after it. Same
 /// rule as the VS Code host's WASM save guard (atomicDatabaseWrite.ts `FileFingerprint`).
+/// Residual on FAT32 and exFAT (Windows): the volume keeps no change time (it reads 0);
+/// it records the last write to 2 seconds on FAT32 and to 10 ms on exFAT; and its file
+/// index belongs to a folder entry, which a file created after a delete can take over
+/// (`windows_file_info::identity_from`). So a rewrite that keeps the size within that
+/// resolution of the recorded generation, or a delete and re-create of the same size
+/// that lands in the freed entry within it, is not seen there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WasmGeneration {
     dev: u64,
@@ -720,12 +776,274 @@ fn read_regular_file_bounded(
     Ok((bytes, generation))
 }
 
+/// What `fs::canonicalize` answered for a path a guard is keyed by: the canonical path,
+/// no file there at all (NotFound: whatever needs the file then fails on its own), or
+/// the sentence the user is told when the volume would not say. The guards that key a
+/// file by its canonical path (one editable copy per file, the WebAssembly save's
+/// stale-image check) cannot hold for such a file, so it is refused, by name, rather
+/// than let through unguarded. Some Windows volumes never answer (a RAM disk says
+/// "Incorrect function"); on Unix a folder that cannot be searched stops it too.
+pub(crate) enum Resolved {
+    Canonical(PathBuf),
+    Missing,
+    Unresolvable(String),
+}
+
+pub(crate) fn resolved_for_guard(
+    path: &Path,
+    answer: std::io::Result<PathBuf>,
+    entry: impl FnOnce() -> std::io::Result<bool>,
+) -> Resolved {
+    resolved_saying(
+        path,
+        answer,
+        entry,
+        "cannot guard it against being opened twice or saved over another program's changes. Open it \
+         from another drive.",
+    )
+}
+
+/// `resolved_for_guard`, whose refusal ends with `then`. `entry` looks the name up
+/// without following it and says whether it is a link.
+fn resolved_saying(
+    path: &Path,
+    answer: std::io::Result<PathBuf>,
+    entry: impl FnOnce() -> std::io::Result<bool>,
+    then: &str,
+) -> Resolved {
+    // `canonicalize` can answer NotFound for a name that is there: for a link whose
+    // target is gone (Unix and Windows), and on Windows wherever
+    // GetFinalPathNameByHandleW cannot name the volume with a drive letter. (Measured
+    // on Windows 11 26200: a volume mounted in a folder on C: canonicalizes fine, as
+    // \\?\C:\mount\x.db.) So only a name that is not there at all is missing; a
+    // link is said to point to nothing only when its target is gone too (the
+    // `entry` lookup checks both); anything else is "cannot resolve".
+    let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match answer {
+        Ok(canonical) => Resolved::Canonical(canonical),
+        Err(e) if missing(&e) => match entry() {
+            Err(gone) if missing(&gone) => Resolved::Missing,
+            Ok(true) => Resolved::Unresolvable(format!(
+                "ERR_FILE_MISSING: \"{}\" is a link to a file that no longer exists.",
+                path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+            )),
+            Ok(false) | Err(_) => Resolved::Unresolvable(unresolvable_sentence(path, &e, then)),
+        },
+        Err(e) => Resolved::Unresolvable(unresolvable_sentence(path, &e, then)),
+    }
+}
+
+/// Whether `path` is a link, looked up without following it.
+fn is_link(path: &Path) -> std::io::Result<bool> {
+    fs::symlink_metadata(path).map(|meta| meta.file_type().is_symlink())
+}
+
+/// Whether `path` is a link whose target is gone: a link, looked up without
+/// following it, that a lookup following it reports as not there.
+fn is_dangling_link(path: &Path) -> std::io::Result<bool> {
+    Ok(is_link(path)? && fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
+}
+
+/// `resolved_for_guard` for `path` as it is on disk now.
+pub(crate) fn resolve_for_guard(path: &Path) -> Resolved {
+    resolved_for_guard(path, fs::canonicalize(path), || is_dangling_link(path))
+}
+
+/// `resolved_for_guard`'s refusal for `path`, with what follows from it.
+fn unresolvable_sentence(path: &Path, error: &std::io::Error, then: &str) -> String {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    format!("ERR_FILE_UNRESOLVABLE: SQLite Explorer cannot resolve the location of \"{name}\" ({error}), so it {then}")
+}
+
+/// A path as a person reads it. On Windows `canonicalize` gives the verbatim
+/// form (`\\?\C:\…`, `\\?\UNC\server\share\…`), and the recents store keeps
+/// it; Explorer never shows that prefix, so a message does not either.
+fn path_for_people(path: &Path) -> String {
+    let text = path.display().to_string();
+    if cfg!(windows) {
+        strip_verbatim(&text)
+    } else {
+        text
+    }
+}
+
+/// `text` without a verbatim prefix that has a plain spelling: a drive path or
+/// a UNC path. Anything else (`\\?\Volume{…}\`) has none and is left alone.
+fn strip_verbatim(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let drive = rest.as_bytes();
+        if drive.len() >= 2 && drive[0].is_ascii_alphabetic() && drive[1] == b':' {
+            return rest.to_string();
+        }
+    }
+    text.to_string()
+}
+
+/// A file dialog for `window`, the one that asked. On Windows the panel is
+/// owned by it: unowned, it came up at the screen's top-left corner and could
+/// fall behind the app (measured on a Windows test machine). On Linux the chooser is
+/// transient for and modal to it (`gtk_dialog::choose_file`): rfd's GTK chooser
+/// has no parent at all. On macOS it stays as it was: a parented panel becomes
+/// a sheet.
+pub(crate) fn file_dialog<'a>(app: &'a AppHandle, window: &'a tauri::Window) -> FileDialog<'a> {
+    FileDialog { app, window, title: None, filter: None, file_name: None }
+}
+
+/// What a file dialog asks for: built by `file_dialog`, shown by its blocking calls.
+pub(crate) struct FileDialog<'a> {
+    app: &'a AppHandle,
+    window: &'a tauri::Window,
+    title: Option<&'a str>,
+    filter: Option<(&'a str, &'a [&'a str])>,
+    file_name: Option<&'a str>,
+}
+
+impl<'a> FileDialog<'a> {
+    pub(crate) fn set_title(mut self, title: &'a str) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    pub(crate) fn add_filter(mut self, name: &'a str, extensions: &'a [&'a str]) -> Self {
+        self.filter = Some((name, extensions));
+        self
+    }
+
+    pub(crate) fn set_file_name(mut self, name: &'a str) -> Self {
+        self.file_name = Some(name);
+        self
+    }
+
+    /// The file the user picked to open, or `None` if they cancelled.
+    pub(crate) fn blocking_pick_file(self) -> Result<Option<PathBuf>, String> {
+        self.show(false)
+    }
+
+    /// Where the user chose to save, or `None` if they cancelled.
+    pub(crate) fn blocking_save_file(self) -> Result<Option<PathBuf>, String> {
+        self.show(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn show(self, save: bool) -> Result<Option<PathBuf>, String> {
+        let _ = self.app;
+        let action = if save { gtk_dialog::FileAction::Save } else { gtk_dialog::FileAction::Open };
+        gtk_dialog::choose_file(self.window, action, self.title, self.filter, self.file_name)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn show(self, save: bool) -> Result<Option<PathBuf>, String> {
+        let mut dialog = self.app.dialog().file();
+        #[cfg(windows)]
+        {
+            dialog = dialog.set_parent(self.window);
+        }
+        #[cfg(not(windows))]
+        let _ = self.window;
+        if let Some(title) = self.title {
+            dialog = dialog.set_title(title);
+        }
+        if let Some((name, extensions)) = self.filter {
+            dialog = dialog.add_filter(name, extensions);
+        }
+        if let Some(name) = self.file_name {
+            dialog = dialog.set_file_name(name);
+        }
+        let picked = if save { dialog.blocking_save_file() } else { dialog.blocking_pick_file() };
+        picked.map(|picked| picked.into_path().map_err(|e| e.to_string())).transpose()
+    }
+}
+
+/// The text a person reads for one or more refusals: each without the code prefix,
+/// which is for pages, not people.
+fn for_people(sentences: &[String]) -> String {
+    sentences
+        .iter()
+        .map(|sentence| sentence.strip_prefix("ERR_").and_then(|s| s.split_once(": ")).map_or(sentence.as_str(), |(_, rest)| rest))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Tells the user, without blocking, about files that were not opened or are not
+/// guarded where no page can say it (a launch before any page exists, a push the
+/// page sends in the background), on window `parent`.
+fn tell_user(app: &AppHandle, parent: Option<&str>, title: &str, sentences: &[String]) {
+    inform(app, parent, title, for_people(sentences), tauri_plugin_dialog::MessageDialogKind::Warning);
+}
+
+/// Shows a message with only an OK button, attached to window `parent`: its
+/// sheet on macOS, a box it owns on Windows, a dialog transient for it on Linux
+/// (`answer_on`). Unattached, rfd hands a macOS message to UserNotificationCenter,
+/// which the keyboard never reaches and which outlives the app. With no window
+/// left to attach to, that is the fallback. Returns at once: the dialog waits on
+/// a thread of its own in the blocking form, which is the shape the unsaved-
+/// changes prompts use (`confirm_then_close`), since a caller may be on the main
+/// thread.
+fn inform(
+    app: &AppHandle,
+    parent: Option<&str>,
+    title: &str,
+    message: String,
+    kind: tauri_plugin_dialog::MessageDialogKind,
+) {
+    let window = parent.and_then(|label| app.get_webview_window(label));
+    let app = app.clone();
+    let title = title.to_string();
+    std::thread::spawn(move || {
+        let attached = window.as_ref().map(|window| window.as_ref().window());
+        let warning = kind == tauri_plugin_dialog::MessageDialogKind::Warning;
+        answer_on(attached.as_ref(), &title, &message, warning, None, || {
+            let mut dialog = app.dialog().message(message.clone()).title(title.clone()).kind(kind);
+            if let Some(window) = &window {
+                dialog = dialog.parent(window);
+            }
+            dialog.blocking_show()
+        });
+    });
+}
+
+/// Asks on `window` and waits for the answer: `true` only for the OK button.
+/// On Linux the dialog is the shell's own GTK one (`gtk_dialog`), transient for
+/// the window, because rfd's GTK backend attaches nothing there; everywhere
+/// else, and on Linux when that one cannot be shown, `rfd_dialog` asks, attached
+/// as it attaches. Blocks: called off the main thread only.
+fn answer_on(
+    window: Option<&tauri::Window>,
+    title: &str,
+    message: &str,
+    warning: bool,
+    buttons: Option<(&str, &str)>,
+    rfd_dialog: impl FnOnce() -> bool,
+) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(window) = window {
+        match gtk_dialog::ask(window, title, message, warning, buttons) {
+            Ok(answer) => return answer,
+            Err(e) => eprintln!(
+                "could not show \"{title}\" on window {}: {e}; asking unattached",
+                window.label()
+            ),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (window, title, message, warning, buttons);
+    rfd_dialog()
+}
+
 /// Records what this window just read (or wrote) at `path`. Keyed by the canonical path,
 /// like every other per-file registry here; a path that cannot be resolved any more
 /// (raced by a delete) records nothing, and the next in-place save then fails closed.
 fn record_generation(state: &WindowState, path: &Path, generation: Option<WasmGeneration>) {
-    let Ok(canonical) = fs::canonicalize(path) else {
-        return;
+    // The next in-place save then says why it is refused (`assert_generation_current`).
+    let canonical = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            eprintln!("no generation recorded for {}: {e}", path.display());
+            return;
+        }
     };
     let mut generations = state.generations.lock().unwrap();
     match generation {
@@ -743,7 +1061,27 @@ fn record_generation(state: &WindowState, path: &Path, generation: Option<WasmGe
 /// body as the write that follows it, so check and rename share one turn; the remaining
 /// race between them is the deferred F3 residue, not something this adds.
 fn assert_generation_current(state: &WindowState, path: &Path) -> Result<(), String> {
-    let canonical = fs::canonicalize(path).map_err(|_| file_changed_error())?;
+    // A file gone from its name has changed; one whose location the volume will not
+    // give is not known to have, and is said as that.
+    let canonical = match fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        // Gone from its name, or the link there now points to nothing.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && is_link(path).unwrap_or_else(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Err(file_changed_error())
+        }
+        // Reached mid-session (the read refuses such a file), with edits in hand.
+        Err(e) => {
+            return Err(unresolvable_sentence(
+                path,
+                &e,
+                "cannot check that the file is unchanged before writing over it. Your unsaved changes remain \
+                 available: use File > Export Database to save them to a different file.",
+            ))
+        }
+    };
     let recorded = state.generations.lock().unwrap().get(&canonical).copied();
     let Some(recorded) = recorded else {
         // No record means this window never read the file (or the record was dropped
@@ -829,17 +1167,14 @@ fn read_import_snapshot(mut file: File, path: &Path, meta: fs::Metadata, cap: u6
 // See `blocking` for why every command here is an `async fn` whose body is
 // handed straight to the blocking pool.
 #[tauri::command]
-async fn pick_database(app: AppHandle) -> Result<Option<PickedFile>, String> {
+async fn pick_database(app: AppHandle, window: tauri::Window) -> Result<Option<PickedFile>, String> {
     crate::blocking(move || {
-        let picked = app
-            .dialog()
-            .file()
+        let Some(path) = file_dialog(&app, &window)
             .add_filter("SQLite Database", &DB_EXTENSIONS)
-            .blocking_pick_file();
-        let Some(picked) = picked else {
+            .blocking_pick_file()?
+        else {
             return Ok(None);
         };
-        let path = picked.into_path().map_err(|e| e.to_string())?;
         let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
         let name = path
             .file_name()
@@ -875,18 +1210,15 @@ async fn pick_database(app: AppHandle) -> Result<Option<PickedFile>, String> {
 /// the recents. The result carries the picked path back to the page, which hands it
 /// to `read_import_text` verbatim; that path is the only thing the page ever names.
 #[tauri::command]
-async fn pick_import_source(app: AppHandle) -> Result<Option<PickedFile>, String> {
+async fn pick_import_source(app: AppHandle, window: tauri::Window) -> Result<Option<PickedFile>, String> {
     crate::blocking(move || {
-        let picked = app
-            .dialog()
-            .file()
+        let Some(path) = file_dialog(&app, &window)
             .set_title("Choose a CSV or JSON file to import (64 MiB maximum)")
             .add_filter("CSV or JSON", &IMPORT_EXTENSIONS)
-            .blocking_pick_file();
-        let Some(picked) = picked else {
+            .blocking_pick_file()?
+        else {
             return Ok(None);
         };
-        let path = picked.into_path().map_err(|e| e.to_string())?;
         let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
         let name = path
             .file_name()
@@ -924,6 +1256,484 @@ async fn read_import_text(app: AppHandle, path: String) -> Result<tauri::ipc::Re
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// SQLite's rollback-journal header magic. A journal whose header holds it is
+/// a write in progress, or one a crash interrupted; PERSIST zeroes the header
+/// and TRUNCATE empties the file when a transaction ends.
+const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+/// A WAL file's own header: what follows it are frames, committed changes.
+const WAL_HEADER_BYTES: u64 = 32;
+
+/// A log SQLite would read as part of a database file on its next open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogBeside {
+    /// A `-wal` holding frames.
+    Wal,
+    /// A connection in another process holds the file in WAL mode, whatever
+    /// its `-wal` holds now: its next write goes into that log.
+    LiveWal,
+    /// A `-journal` whose header still carries the magic.
+    Journal,
+}
+
+/// The log beside `path` that SQLite would apply to it on its next open: a `-wal`
+/// holding frames, a connection in another process holding the file in WAL mode, or a
+/// rollback journal whose header still carries the magic (a write in progress, or one a
+/// crash interrupted). A WAL header alone, a TRUNCATE journal (empty) and a PERSIST
+/// journal (header zeroed) are not logs. A WAL whose frames were all checkpointed still
+/// counts: while another connection has the file open the WAL keeps them, and that
+/// connection's next write goes on into the same `-wal`, so a new image written beside
+/// it would be read mixed with those pages. A TRUNCATE checkpoint empties the `-wal` of
+/// a connection that stays open, so its lock on the `-shm` is what shows it, or, in
+/// EXCLUSIVE locking mode, which keeps no `-shm`, its EXCLUSIVE lock on the file itself.
+///
+/// SQLite names the logs after the path it names the file by. On Unix that resolves
+/// links (unixFullPathname), so they are looked for beside the canonical path, or beside
+/// the canonical folder for a file not yet created: a leftover log applies to whatever
+/// file is created under its name. On Windows it does not (`absolute_location`), so a
+/// read through a link looks beside the link and beside its target
+/// (`windows_read_log_locations`).
+///
+/// Only a name that does not exist means no log. Anything there that cannot be looked
+/// at, where SQLite would read it, is an `Err`: what it holds is unknown.
+pub(crate) fn log_beside(path: &Path) -> Result<Option<LogBeside>, LogUnchecked> {
+    #[cfg(windows)]
+    let files = match absolute_location(path)? {
+        Some(given) => windows_read_log_locations(
+            given,
+            fs::symlink_metadata(path).map(|meta| meta.file_type().is_symlink()),
+            || fs::canonicalize(path),
+        )?,
+        None => Vec::new(),
+    };
+    #[cfg(unix)]
+    let files: Vec<PathBuf> = match fs::canonicalize(path) {
+        Ok(canonical) => Some(canonical),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => beside_canonical_folder(path)?,
+        Err(error) => return Err(LogUnchecked::of(path, error)),
+    }
+    .into_iter()
+    .collect();
+    for file in files {
+        if let Some(log) = log_beside_at(&file, MainFile::Follow)? {
+            return Ok(Some(log));
+        }
+    }
+    Ok(None)
+}
+
+/// Where a read on Windows looks for a database's logs: beside `given` (its absolute
+/// path), where SQLite opened by that path names them, and, when its final component
+/// is a link (`final_link`), beside the link's target (`target`) as well, where a
+/// program that opened the target by its own name keeps them; the read takes the
+/// target's bytes either way. Only a final-component link changes the logs' names:
+/// through a linked folder they are the same files. Nothing at the path is no link,
+/// and a dangling link has no target's logs to read with it; any other failure to
+/// look is unchecked.
+#[cfg(any(windows, test))]
+fn windows_read_log_locations(
+    given: PathBuf,
+    final_link: std::io::Result<bool>,
+    target: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, LogUnchecked> {
+    let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    match final_link {
+        Ok(false) => Ok(vec![given]),
+        Err(e) if not_found(&e) => Ok(vec![given]),
+        Err(error) => Err(LogUnchecked::of(&given, error)),
+        Ok(true) => match target() {
+            Ok(target) => Ok(vec![given, target]),
+            Err(e) if not_found(&e) => Ok(vec![given]),
+            Err(error) => Err(LogUnchecked::of(&given, error)),
+        },
+    }
+}
+
+/// `log_beside` for a file about to be written over: the write replaces a link at the
+/// name rather than follow it, so the new file's logs are the ones beside the name, and
+/// a link there is not the file whose lock is probed.
+pub(crate) fn log_beside_destination(path: &Path) -> Result<Option<LogBeside>, LogUnchecked> {
+    #[cfg(windows)]
+    let file = absolute_location(path)?;
+    #[cfg(unix)]
+    let file = beside_canonical_folder(path)?;
+    match file {
+        Some(file) => log_beside_at(&file, MainFile::NoFollow),
+        None => Ok(None),
+    }
+}
+
+/// Where SQLite on Windows names `path`'s logs: its absolute path as given.
+/// winFullPathname is GetFullPathNameW, which resolves no link and does not touch the
+/// volume, and so is `std::path::absolute` there. `fs::canonicalize` is not: it fails
+/// outright on some volumes (`Incorrect function` on RAM disks, rust-lang/rust#74327).
+/// Built for tests on every platform, where `absolute` likewise resolves nothing.
+#[cfg(any(windows, test))]
+fn absolute_location(path: &Path) -> Result<Option<PathBuf>, LogUnchecked> {
+    if path.file_name().is_none() {
+        return Ok(None);
+    }
+    std::path::absolute(path).map(Some).map_err(|error| LogUnchecked::of(path, error))
+}
+
+/// A file beside a database (or its folder) that SQLite would read with it and that
+/// could not be looked at: its name, never its path, and why.
+#[derive(Debug)]
+pub(crate) struct LogUnchecked {
+    name: String,
+    error: std::io::Error,
+}
+
+impl LogUnchecked {
+    fn of(path: &Path, error: std::io::Error) -> Self {
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        Self { name, error }
+    }
+}
+
+impl std::fmt::Display for LogUnchecked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "\"{}\": {}", self.name, self.error)
+    }
+}
+
+/// How `log_beside_at` opens the main file for its lock probe.
+#[derive(Clone, Copy)]
+enum MainFile {
+    /// A read's path: the open follows a link, as SQLite's does (on Unix the path is
+    /// already canonical).
+    Follow,
+    /// A destination: the write replaces a link at the name, so a link there is
+    /// skipped (O_NOFOLLOW, or FILE_FLAG_OPEN_REPARSE_POINT on Windows).
+    NoFollow,
+}
+
+/// `path`'s name in its canonical folder. A folder that does not exist holds no log,
+/// and no file can be made in it; any other failure to resolve it is an `Err`.
+#[cfg(unix)]
+fn beside_canonical_folder(path: &Path) -> Result<Option<PathBuf>, LogUnchecked> {
+    let folder = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Some(name) = path.file_name() else { return Ok(None) };
+    match fs::canonicalize(folder) {
+        Ok(canonical) => Ok(Some(canonical.join(name))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LogUnchecked::of(folder, error)),
+    }
+}
+
+/// What a name beside (or of) a database holds, from an open made without blocking and
+/// judged by its descriptor: a FIFO or device swapped in at a log's name must not park
+/// the command.
+enum AtName {
+    /// Nothing, or something other than a regular file (a FIFO or a device is not a log).
+    Nothing,
+    Opened(File, u64),
+    /// A regular file this process cannot open: its length (`stat` needs no read
+    /// permission) and the open's error.
+    Unopenable(u64, std::io::Error),
+}
+
+fn at_name(path: &Path, opened: std::io::Result<File>) -> std::io::Result<AtName> {
+    match opened {
+        Ok(file) => {
+            let meta = file.metadata()?;
+            Ok(if meta.is_file() { AtName::Opened(file, meta.len()) } else { AtName::Nothing })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AtName::Nothing),
+        Err(e) => match fs::metadata(path) {
+            Ok(meta) if meta.is_file() => Ok(AtName::Unopenable(meta.len(), e)),
+            Ok(_) => Ok(AtName::Nothing),
+            Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => Ok(AtName::Nothing),
+            Err(_) => Err(e),
+        },
+    }
+}
+
+fn log_beside_at(file: &Path, main_file: MainFile) -> Result<Option<LogBeside>, LogUnchecked> {
+    use std::io::Read;
+    let Some(name) = file.file_name().map(|n| n.to_string_lossy().into_owned()) else { return Ok(None) };
+    let sibling = |suffix: &str| file.with_file_name(format!("{name}{suffix}"));
+    let look = |suffix: &str| {
+        let path = sibling(suffix);
+        at_name(&path, regular_read_options().open(&path)).map_err(|e| LogUnchecked::of(&path, e))
+    };
+    let wal = look("-wal")?;
+    if matches!(wal, AtName::Opened(_, len) if len > WAL_HEADER_BYTES) {
+        return Ok(Some(LogBeside::Wal));
+    }
+    let shm = look("-shm")?;
+    if let AtName::Opened(shm, _) = &shm {
+        if wal_connection_holds(shm) {
+            return Ok(Some(LogBeside::LiveWal));
+        }
+    }
+    // A connection in EXCLUSIVE locking mode keeps its wal-index in its own memory: no
+    // -shm lock to see, and its -wal can be empty, or not yet created. It holds SQLite's
+    // EXCLUSIVE lock on the file for as long as it is open, which a rollback-mode
+    // connection in EXCLUSIVE mode holds too; the header tells them apart, and that
+    // one's file is whole between its transactions.
+    let main = match main_file {
+        MainFile::Follow => at_name(file, regular_read_options().open(file)),
+        MainFile::NoFollow => {
+            let mut options = regular_read_options();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
+                options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            }
+            // A link opens as the link (Windows) or not at all (ELOOP): either way
+            // it is not a regular file, and nothing is probed.
+            match options.open(file) {
+                #[cfg(unix)]
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Ok(AtName::Nothing),
+                opened => at_name(file, opened),
+            }
+        }
+    }
+    .map_err(|e| LogUnchecked::of(file, e))?;
+    // Whether the header says rollback mode; a file with no header is not known to be.
+    let mut rollback = false;
+    match main {
+        AtName::Opened(mut main, _) => {
+            rollback = rollback_header(&mut main);
+            if exclusive_lock_held(&main) && !rollback {
+                return Ok(Some(LogBeside::LiveWal));
+            }
+        }
+        // Its lock cannot be probed.
+        AtName::Unopenable(_, error) => return Err(LogUnchecked { name, error }),
+        AtName::Nothing => {}
+    }
+    // A log this process cannot open is one SQLite cannot open either, and SQLite then
+    // refuses the database wherever it would read that log: a -wal that is not empty, or
+    // any -wal under a WAL header; a -shm whenever it reads the file in WAL mode (a WAL
+    // header, or a -wal that is not empty); a -journal that is not empty. An empty -wal
+    // or -journal under a rollback header, and a -shm there beside no -wal with anything
+    // in it, it ignores (measured with sqlite3 3.54.1, read-write and read-only). Those
+    // pass; the rest are refused as unchecked, as is any of them beside a name with no
+    // file yet, whose header is unknown.
+    let wal_len = match &wal {
+        AtName::Nothing => 0,
+        AtName::Opened(_, len) | AtName::Unopenable(len, _) => *len,
+    };
+    if let AtName::Unopenable(len, error) = wal {
+        if len > 0 || !rollback {
+            return Err(LogUnchecked { name: format!("{name}-wal"), error });
+        }
+    }
+    if let AtName::Unopenable(_, error) = shm {
+        if wal_len > 0 || !rollback {
+            return Err(LogUnchecked { name: format!("{name}-shm"), error });
+        }
+    }
+    match look("-journal")? {
+        AtName::Opened(mut journal, len) if len >= JOURNAL_MAGIC.len() as u64 => {
+            let mut header = [0u8; 8];
+            let live = journal
+                .read_exact(&mut header)
+                .map(|()| header == JOURNAL_MAGIC)
+                // An unreadable journal is not known to be finished.
+                .unwrap_or(true);
+            if live {
+                return Ok(Some(LogBeside::Journal));
+            }
+        }
+        AtName::Unopenable(len, error) if len > 0 => {
+            return Err(LogUnchecked { name: format!("{name}-journal"), error });
+        }
+        _ => {}
+    }
+    Ok(None)
+}
+
+/// The byte of a `-shm` file every WAL-mode connection keeps a shared lock on for as
+/// long as it is open (SQLite's DMS lock, `UNIX_SHM_DMS` / `WIN_SHM_DMS`: 120 + 8).
+const SHM_DMS_LOCK_BYTE: u64 = 128;
+
+/// Whether a connection in another process has the database open in WAL mode: it
+/// holds a shared lock on the `-shm` file's DMS byte. A `-shm` left after the last
+/// connection closed holds no lock.
+#[cfg(unix)]
+fn wal_connection_holds(shm: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `flock` is plain data, and F_GETLK only fills it in; it takes no lock.
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_WRLCK as _;
+    probe.l_whence = libc::SEEK_SET as _;
+    probe.l_start = SHM_DMS_LOCK_BYTE as _;
+    probe.l_len = 1;
+    // SAFETY: a valid descriptor and a valid flock for the call's duration.
+    let rc = unsafe { libc::fcntl(shm.as_raw_fd(), libc::F_GETLK, &mut probe) };
+    // A volume that cannot answer lock queries cannot host a WAL database either:
+    // SQLite needs these locks to run one.
+    rc == 0 && probe.l_type != libc::F_UNLCK as libc::c_short
+}
+
+/// ERROR_LOCK_VIOLATION, Windows' error for a byte-range lock that conflicts with one
+/// another handle holds (pinned to windows-sys below; that a LOCKFILE_FAIL_IMMEDIATELY
+/// try reports exactly this code is not stated on the LockFileEx page and was not
+/// observed on a Windows host here).
+#[cfg(any(windows, test))]
+const ERROR_LOCK_VIOLATION_CODE: u32 = 33;
+#[cfg(windows)]
+const _: () = assert!(ERROR_LOCK_VIOLATION_CODE == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION);
+
+/// Whether a failed LockFileEx try (LOCKFILE_FAIL_IMMEDIATELY, synchronous handle)
+/// means another handle holds a conflicting lock. Only a lock violation does. Any other
+/// failure means this volume could not take the lock at all, and the probes read it as
+/// the Unix arm reads a failed F_GETLK: a volume that cannot lock cannot host a live
+/// SQLite connection either, which needs these same locks. ERROR_IO_PENDING is not a
+/// conflict here: LockFileEx reports it only for an asynchronous handle without
+/// LOCKFILE_FAIL_IMMEDIATELY, and the probes use neither.
+#[cfg(any(windows, test))]
+fn lock_try_failure_means_held(error: u32) -> bool {
+    error == ERROR_LOCK_VIOLATION_CODE
+}
+
+/// `lock_try_failure_means_held` for the error the failed try just left, read before
+/// anything else can overwrite it. A failure that is not a conflict is logged: it turns
+/// the probe into "no lock held", which must not happen silently.
+#[cfg(windows)]
+fn failed_lock_try_is_held(what: &str) -> bool {
+    let error = std::io::Error::last_os_error();
+    let code = error.raw_os_error().unwrap_or(0) as u32;
+    if lock_try_failure_means_held(code) {
+        return true;
+    }
+    eprintln!("[log-check] LockFileEx on {what} failed without a lock conflict ({error}); read as no lock held");
+    false
+}
+
+/// Windows has no lock query, so this tries the exclusive lock a connection itself
+/// tries when it opens the `-shm` (and releases it at once): it fails exactly while
+/// another connection holds its shared lock.
+#[cfg(windows)]
+fn wal_connection_holds(shm: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, UnlockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let handle = shm.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: OVERLAPPED is plain data; only its offset is set.
+    let mut at: OVERLAPPED = unsafe { std::mem::zeroed() };
+    at.Anonymous.Anonymous.Offset = SHM_DMS_LOCK_BYTE as u32;
+    // SAFETY: a valid handle and OVERLAPPED for the calls' duration.
+    unsafe {
+        if LockFileEx(handle, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &mut at) != 0 {
+            UnlockFileEx(handle, 0, 1, 0, &mut at);
+            false
+        } else {
+            failed_lock_try_is_held("a -shm DMS byte")
+        }
+    }
+}
+
+/// SQLite's lock bytes in a database file, the same in its Unix and Windows VFS: after
+/// PENDING_BYTE (1 GiB) and RESERVED_BYTE, the SHARED_SIZE bytes from SHARED_FIRST. A
+/// reader holds a shared lock over that range; the EXCLUSIVE lock is an exclusive one
+/// over it.
+const SHARED_FIRST: u64 = 0x4000_0002;
+const SHARED_SIZE: u64 = 510;
+
+/// Whether a connection in another process holds the database's EXCLUSIVE lock. Asked
+/// with F_GETLK for a READ lock over the shared range, which only a write lock
+/// conflicts with, so readers' shared locks never answer; it takes no lock.
+#[cfg(unix)]
+fn exclusive_lock_held(main: &File) -> bool {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `flock` is plain data, and F_GETLK only fills it in; it takes no lock.
+    let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+    probe.l_type = libc::F_RDLCK as _;
+    probe.l_whence = libc::SEEK_SET as _;
+    probe.l_start = SHARED_FIRST as _;
+    probe.l_len = SHARED_SIZE as _;
+    // SAFETY: a valid descriptor and a valid flock for the call's duration.
+    let rc = unsafe { libc::fcntl(main.as_raw_fd(), libc::F_GETLK, &mut probe) };
+    rc == 0 && probe.l_type != libc::F_UNLCK as libc::c_short
+}
+
+/// Windows has no lock query, so this tries a SHARED lock over the range, which only
+/// another handle's exclusive lock refuses, and releases it at once. Readers never
+/// refuse it. It is not quite a reader to a writer, though: a SQLite reader takes the
+/// PENDING byte before its shared lock and this probe does not, so a writer already
+/// holding PENDING while it waits for readers to leave can see the probe as one more,
+/// transient reader, and its EXCLUSIVE try then fails once and its busy handler retries.
+#[cfg(windows)]
+fn exclusive_lock_held(main: &File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, UnlockFileEx, LOCKFILE_FAIL_IMMEDIATELY};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let handle = main.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    // SAFETY: OVERLAPPED is plain data; only its offset is set.
+    let mut at: OVERLAPPED = unsafe { std::mem::zeroed() };
+    at.Anonymous.Anonymous.Offset = SHARED_FIRST as u32;
+    at.Anonymous.Anonymous.OffsetHigh = (SHARED_FIRST >> 32) as u32;
+    // SAFETY: a valid handle and OVERLAPPED for the calls' duration.
+    unsafe {
+        if LockFileEx(handle, LOCKFILE_FAIL_IMMEDIATELY, 0, SHARED_SIZE as u32, 0, &mut at) != 0 {
+            UnlockFileEx(handle, 0, SHARED_SIZE as u32, 0, &mut at);
+            false
+        } else {
+            failed_lock_try_is_held("a database's shared lock range")
+        }
+    }
+}
+
+/// Whether the database header says rollback-journal mode: the file format's write and
+/// read versions (bytes 18 and 19) are both 1, where WAL mode makes them 2. A header
+/// that cannot be read is not known to be rollback.
+fn rollback_header(main: &mut File) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 20];
+    main.read_exact(&mut header).is_ok() && header[18] == 1 && header[19] == 1
+}
+
+/// Why the WebAssembly engine must not take a copy of `path`, or write one back over
+/// it, now. It reads and saves the main file's bytes only, so with a log beside the file
+/// it would show a state no SQLite connection sees, and a Save would put an image under
+/// a log SQLite then applies to it. The advice cannot be "use the native engine": this
+/// lane is also where an open lands when the native engine could not serve the file.
+pub(crate) fn snapshot_refusal(path: &Path) -> Option<String> {
+    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+    let log = match log_beside(path) {
+        Ok(log) => log?,
+        Err(unchecked) => {
+            return Some(format!(
+                "ERR_DATABASE_LOG_UNCHECKED: SQLite Explorer could not check \"{name}\" for a log SQLite \
+                 would read with it ({unchecked}). The WebAssembly engine reads and saves only the file \
+                 itself, so it does not go ahead without knowing. Make what is named there readable, or close \
+                 the program that holds it, and try again."
+            ))
+        }
+    };
+    Some(match log {
+        LogBeside::Wal => format!(
+            "ERR_DATABASE_HAS_WAL: \"{name}\" has a -wal file holding frames beside it: a program has it \
+             open in WAL mode, or one closed without folding that log into the file. The WebAssembly \
+             engine reads and saves only the file itself, which cannot be combined with the log. Close \
+             the program that has it open and try again; if none does, opening the file once with the \
+             native engine or the sqlite3 tool folds the log in."
+        ),
+        LogBeside::LiveWal => format!(
+            "ERR_DATABASE_HAS_WAL: \"{name}\" is open in WAL mode in another program. The WebAssembly \
+             engine reads and saves only the file itself, and that program's next writes go into a log a \
+             saved file would be read with. Close the program that has it open and try again."
+        ),
+        LogBeside::Journal => format!(
+            "ERR_DATABASE_HAS_JOURNAL: \"{name}\" has a rollback journal beside it: a program is writing \
+             it, or a write was interrupted. The WebAssembly engine reads and saves only the file itself \
+             and cannot apply the journal. Close the program that is writing it and try again; if none is, \
+             opening the file once with the native engine or the sqlite3 tool rolls the interrupted write back."
+        ),
+    })
+}
+
 /// The WASM lane's open/refresh read. `max_bytes` is the page's configured maxFileSize
 /// (0/absent = unlimited), refused on the open descriptor BEFORE any allocation — the
 /// same bound `native_open` applies before spawning. The generation of the descriptor
@@ -951,8 +1761,9 @@ async fn read_database_bytes(
         // the WASM engine's save writes the whole image; an unguarded
         // fallback would hand the user exactly the silent-overwrite pair the
         // refusal was for. Same window is fine: that is a refresh, or a
-        // re-open the host dedupes.
-        native::hold_for_read(&app.state::<OpenFiles>(), &path, &label)?;
+        // re-open the host dedupes. The gate also refuses a file with a log
+        // beside it, which this engine cannot read with the file.
+        native::admit_wasm_read(&app.state::<OpenFiles>(), &path, &label)?;
         let (bytes, generation) = read_regular_file_bounded(&path, max_bytes)?;
         record_generation(&state, &path, Some(generation));
         Ok(bytes)
@@ -990,6 +1801,11 @@ async fn save_database(
     let bytes = bytes.clone();
     crate::blocking(move || {
         assert_generation_current(&state, &path)?;
+        // A WAL writer changes only its -wal until it checkpoints, so the
+        // generation above cannot see one; the log beside the file can.
+        if let Some(refusal) = snapshot_refusal(&path) {
+            return Err(refusal);
+        }
         write_atomically(&path, &bytes)?;
         // The rename made a new inode at the path: what is there NOW is what this
         // window's image describes. An unverifiable post-write stat drops the record, so
@@ -1046,15 +1862,17 @@ async fn save_file_as(
     // Owned for the same reason as `save_database`'s copy.
     let bytes = bytes.clone();
     crate::blocking(move || {
-        let picked = app
-            .dialog()
-            .file()
-            .set_file_name(&default_name)
-            .blocking_save_file();
-        let Some(picked) = picked else {
+        let Some(path) = file_dialog(&app, &window).set_file_name(&default_name).blocking_save_file()? else {
             return Ok(None);
         };
-        let path = picked.into_path().map_err(|e| e.to_string())?;
+        if let Some(refusal) = native::destination_refusal(&app.state::<OpenFiles>(), &path) {
+            return Err(refusal);
+        }
+        if adopt {
+            if let Some(refusal) = adoption_refusal(&path) {
+                return Err(refusal);
+            }
+        }
         write_atomically(&path, &bytes)?;
         if adopt {
             app.state::<SessionAllowlist>()
@@ -1069,6 +1887,31 @@ async fn save_file_as(
         Ok(Some(path.to_string_lossy().into_owned()))
     })
     .await
+}
+
+/// Why a Save As must not adopt `dest` as the open database's file: one whose location
+/// cannot be resolved could not be guarded once it is open (`resolved_for_guard`).
+/// Asked before the write, so the refusal leaves nothing behind. A folder that does not
+/// exist adds nothing: the write fails on its own.
+fn adoption_refusal(dest: &Path) -> Option<String> {
+    let folder = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = dest.file_name()?;
+    // Someone saving edits as a new file: the remedy is a copy there, not another drive.
+    let then = "cannot guard the database once it is kept there, so it did not save there. Your unsaved \
+                changes remain available: use File > Export Database to write a copy there instead.";
+    // The file if it is there; else, or where a link is there (the write replaces the
+    // link rather than follow it), the folder the new file is about to be made in.
+    let resolved = match is_link(dest) {
+        Ok(true) => resolved_saying(dest, fs::canonicalize(folder).map(|folder| folder.join(name)), || is_link(folder), then),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            resolved_saying(dest, fs::canonicalize(folder).map(|folder| folder.join(name)), || is_link(folder), then)
+        }
+        _ => resolved_saying(dest, fs::canonicalize(dest), || is_dangling_link(dest), then),
+    };
+    match resolved {
+        Resolved::Unresolvable(sentence) => Some(sentence),
+        Resolved::Canonical(_) | Resolved::Missing => None,
+    }
 }
 
 /// Percent-decoding without another dependency (paths travel in an HTTP header).
@@ -1100,9 +1943,9 @@ fn urlencoding_decode(s: &str) -> Result<String, String> {
 /// `a = {...defaults, ...await bridge.loadSettings()}` — awaited, unguarded, before
 /// anything else. A rejection there aborts boot and leaves a half-rendered UI, and the
 /// settings file is not something a user can reasonably be asked to repair by hand.
-/// `viewer-dist/` is synced upstream and cannot be patched here, so the guarantee is
-/// made entirely on this side: `load_settings` returns a value, not a `Result`, so the
-/// IPC promise can only ever resolve.
+/// The guarantee is made entirely on this side, whatever the page does:
+/// `load_settings` returns a value, not a `Result`, so the IPC promise can only ever
+/// resolve.
 fn parse_settings(bytes: &[u8]) -> serde_json::Value {
     let text = String::from_utf8_lossy(bytes);
     match serde_json::from_str::<serde_json::Value>(&text) {
@@ -1155,7 +1998,7 @@ fn set_title(window: tauri::Window, title: String) -> Result<(), String> {
 /// shell can refuse a second window opening one of them — see
 /// `native::OpenFiles`).
 ///
-/// One command for both because upstream raises one signal for both:
+/// One command for both because the viewer raises one signal for both:
 /// `notifyDatabasesChanged` runs on every registry and dirty-state transition,
 /// which is exactly the set of moments either answer can change. Two commands
 /// would be two IPC messages that could land out of order and disagree.
@@ -1202,8 +2045,17 @@ fn set_unsaved_state(
     // shipped bundle from actually being that old.
     let Some(open_paths) = open_paths else { return };
     let reported = allowlisted_open_paths(&app.state::<SessionAllowlist>(), &open_paths);
-    if let Err(e) = native::sync_reported(&app.state::<OpenFiles>(), window.label(), &reported) {
-        eprintln!("open-file push from {} ignored: {e}", window.label());
+    match native::sync_reported(&app.state::<OpenFiles>(), window.label(), &reported) {
+        // A file the page has open that the shell cannot key is not guarded: said once.
+        Ok(synced) => {
+            let state = window_state(&windows, window.label());
+            for (path, sentence) in synced.unresolvable {
+                if state.unguarded_told.lock().unwrap().insert(path) {
+                    tell_user(&app, Some(window.label()), "Database Not Guarded", &[sentence]);
+                }
+            }
+        }
+        Err(e) => eprintln!("open-file push from {} ignored: {e}", window.label()),
     }
 }
 
@@ -1214,7 +2066,7 @@ fn set_unsaved_state(
 /// an OS/Finder open, Open Recent, a Save As adoption — puts its path on the
 /// allowlist first, and both engines refuse a path that is not on it. A
 /// path-less database (the boot `untitled.db`, a dropped file) reports `null`
-/// and is skipped upstream.
+/// and is skipped by the page.
 ///
 /// What it buys: a compromised page can otherwise name ANY path as "open" and
 /// so deny every other window the ability to open it. This bounds that to
@@ -1277,17 +2129,27 @@ fn confirm_then_close(window: &tauri::Window, databases: u32) {
     // thread); this now matches it. Blocking on the main thread would deadlock,
     // which is what the spawn is for.
     std::thread::spawn(move || {
-        let confirmed = window
-            .clone()
-            .dialog()
-            .message(unsaved_prompt(databases))
-            .title("Unsaved Changes")
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Close Anyway".into(),
-                "Cancel".into(),
-            ))
-            .blocking_show();
+        // Attached to the window being closed, the prompt is that window's
+        // sheet: the keyboard reaches it (Return = Close Anyway, Escape =
+        // Cancel) and it goes away with the app. Unattached, rfd hands it to
+        // UserNotificationCenter, which the keyboard never reaches, whose first
+        // click only focuses it, and which stays on screen after a crash.
+        let text = unsaved_prompt(databases);
+        let buttons = Some(("Close Anyway", "Cancel"));
+        let confirmed = answer_on(Some(&window), "Unsaved Changes", &text, true, buttons, || {
+            window
+                .clone()
+                .dialog()
+                .message(text.clone())
+                .parent(&window)
+                .title("Unsaved Changes")
+                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                    "Close Anyway".into(),
+                    "Cancel".into(),
+                ))
+                .blocking_show()
+        });
         if !confirmed {
             return;
         }
@@ -1344,6 +2206,11 @@ fn confirm_then_quit(app: &AppHandle, databases: u32) {
         eprintln!("quit: the unsaved-changes prompt is already open; not asking twice");
         return;
     };
+    // The window the question is asked on: the focused one, else any live one
+    // (`target_window`). Its sheet is what the keyboard reaches; see
+    // `confirm_then_close`. With no window left there is nothing to attach to,
+    // and rfd's unattached alert is the fallback.
+    let parent = target_window(app).and_then(|label| app.get_webview_window(&label));
     let app = app.clone();
     // Same shape, and the same reason, as `confirm_then_close`: the non-blocking
     // form presented nothing from this menu-event handler, so Quit with unsaved
@@ -1351,17 +2218,33 @@ fn confirm_then_quit(app: &AppHandle, databases: u32) {
     // menu: Quit on a CLEAN document exits immediately, Quit on a dirty one used
     // to hang silently; both now prompt.
     std::thread::spawn(move || {
-        let confirmed = app
-            .clone()
-            .dialog()
-            .message(unsaved_prompt(databases).replace("Close anyway?", "Quit anyway?"))
-            .title("Unsaved Changes")
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Quit Anyway".into(),
-                "Cancel".into(),
-            ))
-            .blocking_show();
+        let text = unsaved_prompt(databases).replace("Close anyway?", "Quit anyway?");
+        if let Some(window) = &parent {
+            // An OS quit (Dock, logout) can arrive while another app is in
+            // front, and a sheet on a background window takes no keys: the
+            // window comes forward to ask, as a document app's does.
+            if let Err(e) = bring_forward(window) {
+                eprintln!("quit: could not bring {} forward to ask: {e}", window.label());
+            }
+        }
+        let attached = parent.as_ref().map(|window| window.as_ref().window());
+        let buttons = Some(("Quit Anyway", "Cancel"));
+        let confirmed = answer_on(attached.as_ref(), "Unsaved Changes", &text, true, buttons, || {
+            let mut prompt = app
+                .clone()
+                .dialog()
+                .message(text.clone())
+                .title("Unsaved Changes")
+                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                    "Quit Anyway".into(),
+                    "Cancel".into(),
+                ));
+            if let Some(window) = &parent {
+                prompt = prompt.parent(window);
+            }
+            prompt.blocking_show()
+        });
         // The dialog has returned, so the slot is free again — on BOTH buttons,
         // and before the exit. Cancel has to leave a later ⌘Q able to ask, and
         // `app.exit(0)` is the call after which nothing on this thread is
@@ -1376,8 +2259,26 @@ fn confirm_then_quit(app: &AppHandle, databases: u32) {
     });
 }
 
+/// Restores `window` if it is minimized, then makes it the key window of the
+/// active app. Called off the main thread (the quit prompt's thread).
+///
+/// tao's `set_focus` does nothing while the window is still miniaturized
+/// (macOS), and restoring it animates: focusing straight after `unminimize`
+/// was measured to leave the restored window, with its sheet, behind the app
+/// that was in front. So the restore is waited for, within a bound.
+fn bring_forward(window: &tauri::WebviewWindow) -> tauri::Result<()> {
+    if window.is_minimized()? {
+        window.unminimize()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while window.is_minimized()? && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    window.set_focus()
+}
+
 /// The theme ids the viewer understands, in menu order. Kept in lockstep with the
-/// upstream viewer's theme list — an id the viewer does not know would render a menu
+/// viewer's theme list — an id the viewer does not know would render a menu
 /// item that silently does nothing.
 const THEME_MENU: [(&str, &str); 6] = [
     ("system", "System"),
@@ -1465,7 +2366,7 @@ pub struct RecentMenu(Mutex<RecentItems>);
 /// in another), `RecentsStore` (one MRU, shell-written only), `settings.json`, and
 /// the theme.
 pub(crate) struct WindowState {
-    /// This window's sidecar registry — the whole point of Task 5. Every native
+    /// This window's sidecar registry. Every native
     /// command resolves it from the calling window's label, so window 2's opens,
     /// closes and page-load reaps cannot touch window 1's live databases.
     pub(crate) sidecars: native::NativeSidecar,
@@ -1482,6 +2383,9 @@ pub(crate) struct WindowState {
     /// `save_database` compares against before writing an image back. Shell-owned:
     /// the page never sees or names a generation, it only reads and saves paths.
     generations: Mutex<HashMap<PathBuf, WasmGeneration>>,
+    /// The paths this window's page reported open that could not be resolved, and so
+    /// are not guarded, which the user has been told about (once per path).
+    unguarded_told: Mutex<HashSet<PathBuf>>,
 }
 
 /// How many of a window's open databases have unsaved changes, as last pushed by
@@ -1584,6 +2488,7 @@ impl Default for WindowState {
             pending_open: Mutex::new(PendingOpenState::default()),
             unsaved: Mutex::new(UnsavedState::default()),
             generations: Mutex::new(HashMap::new()),
+            unguarded_told: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -1624,6 +2529,14 @@ pub(crate) fn window_state(windows: &Windows, label: &str) -> Arc<WindowState> {
 /// they get a structured error rather than a hang.
 fn forget_window(windows: &Windows, label: &str) -> Option<Arc<WindowState>> {
     windows.states.lock().unwrap().remove(label)
+}
+
+/// What window `label`'s page last reported, without creating its state: the
+/// navigation pin asks this for a window's very first load too.
+fn reported_unsaved(windows: &Windows, label: &str) -> UnsavedState {
+    // The map's lock is released before the state's is taken.
+    let state = windows.states.lock().unwrap().get(label).cloned();
+    state.map_or_else(UnsavedState::default, |state| *state.unsaved.lock().unwrap())
 }
 
 fn all_window_states(windows: &Windows) -> Vec<Arc<WindowState>> {
@@ -1730,6 +2643,15 @@ fn fit_window_to_work_area(window: &tauri::WebviewWindow) -> tauri::Result<()> {
 /// webview-reachable command for this, and the capability set grants the page
 /// neither `core:window:allow-create` nor `core:webview:allow-create-webview-window`
 /// (see `MAX_NATIVE_SIDECARS`, whose per-window bound rests on that).
+/// Quit as the menu item asks for it: at once when nothing is unsaved, otherwise
+/// through the prompt. The Windows Ctrl+Q hook (`shell_keys`) comes here too.
+fn request_quit(app: &AppHandle) {
+    match quit_decision_for(&app.state::<Windows>()) {
+        CloseDecision::Proceed => app.exit(0),
+        CloseDecision::Confirm { databases } => confirm_then_quit(app, databases),
+    }
+}
+
 fn open_new_window(app: &AppHandle) {
     let label = next_window_label();
     // New windows inherit the persisted zoom as their starting point — the same
@@ -1764,13 +2686,25 @@ fn open_new_window(app: &AppHandle) {
         }
         Err(e) => {
             // No silent failures: a menu click that produced nothing looks like a
-            // frozen app. Non-blocking dialog — this runs on the main thread.
+            // frozen app. Non-blocking (`inform`): this runs on the main thread.
             eprintln!("could not open a new window: {e}");
-            app.dialog()
-                .message(format!("Could not open a new window: {e}"))
-                .title("New Window")
-                .show(|_| {});
+            inform(
+                app,
+                target_window(app).as_deref(),
+                "New Window",
+                format!("Could not open a new window: {e}"),
+                tauri_plugin_dialog::MessageDialogKind::Info,
+            );
         }
+    }
+}
+
+/// Hands a menu item the page runs (Open, Save, Refresh, SQL Console) to the page
+/// of window `label`. The menu and the Windows shortcuts (`shell_keys`) both
+/// deliver through here.
+pub(crate) fn forward_menu_item(app: &AppHandle, label: &str, id: &str) {
+    if let Err(e) = app.emit_to(label, "desktop-menu", id.to_string()) {
+        eprintln!("could not deliver menu item {id} to {label}: {e}");
     }
 }
 
@@ -1820,7 +2754,7 @@ const RECENTS_CAP: usize = 10;
 ///
 /// There is no webview-reachable command that writes this file or this state: every
 /// entry traces back to a dialog pick (`pick_database`) or an OS open request (file
-/// associations, Task 8) — both already-trusted paths that reach `SessionAllowlist` on
+/// associations) — both already-trusted paths that reach `SessionAllowlist` on
 /// their own. If the webview could write `recents.json` directly, a single user click on
 /// a poisoned "recent" entry would launder an arbitrary path into the read allowlist.
 #[derive(Default)]
@@ -2237,7 +3171,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<(Menu<tauri::Wry>, ThemeItems, R
 ///
 /// Must run on the main thread: `set_menu` mutates the live menu bar, which on macOS is a
 /// main-thread-only operation. Every caller here is already on the main thread (menu
-/// event handlers, and the `RunEvent` callback Task 8 adds) except `pick_database`, which
+/// event handlers, and the `RunEvent` callback) except `pick_database`, which
 /// is `(async)` and hops over explicitly with `run_on_main_thread`.
 ///
 /// Rebuilding recreates every menu item from scratch, including the Theme
@@ -2267,7 +3201,7 @@ fn rebuild_menu(app: &AppHandle) {
 /// entry, rebuilds the menu, and tells the webview to load it.
 ///
 /// Reused by every source of "open this path" that has already resolved to a real,
-/// user-sanctioned file — the Open Recent menu here, and (Task 8) Finder file
+/// user-sanctioned file — the Open Recent menu here, and Finder file
 /// associations and cold-start argv. `pick_database`'s own dialog-pick path calls
 /// `add_recent` plus a main-thread-deferred `rebuild_menu` directly instead of this
 /// function: it already does its own allowlist insert and already returns the file to the
@@ -2314,7 +3248,7 @@ fn deliver_opens(app: &AppHandle, target: &str, paths: &[PathBuf]) {
     // `emit_to` matches a listener registered for this label. bridge.js registers its
     // two listeners through `getCurrentWebviewWindow().listen`, which targets
     // `WebviewWindow { label }`; the plain `event.listen` it used before targeted
-    // `Any`, which `emit_to`'s filter does NOT match (tauri 2.11.5,
+    // `Any`, which `emit_to`'s filter does NOT match (tauri 2.11.5 through 2.12.7,
     // `manager::emit_to::filter_target`). The two have to move together.
     //
     // One failed emit does not abandon the rest of the group: each path is a file the
@@ -2375,12 +3309,31 @@ fn has_database_extension(path: &Path) -> bool {
         .is_some_and(|ext| DB_EXTENSIONS.contains(&ext.as_str()))
 }
 
+/// A switch, not a file: what a browser engine or a test driver passes
+/// (--remote-debugging-port=…, --user-data-dir=…, macOS's -psn_…). Neither a file
+/// manager nor an association passes one. An argument that starts with '-' but names
+/// something that is there (`exists`; "-x.db" in the current folder) is a file.
+#[cfg(any(test, windows, target_os = "linux"))]
+fn is_launch_switch(argument: &std::ffi::OsStr, exists: impl FnOnce() -> bool) -> bool {
+    argument.as_encoded_bytes().first() == Some(&b'-') && !exists()
+}
+
 /// Linux desktop files pass URLs; Windows associations pass paths. These are
 /// OS launch arguments, never page-provided grants. Resolve them before the
 /// ready latch so an early launch cannot lose its file-open request.
+/// Returns the paths to open, and for each launch argument that could not be opened
+/// the sentence the user is told.
 #[cfg(any(test, windows, target_os = "linux"))]
-fn startup_database_paths(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<PathBuf> {
+fn startup_database_paths(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> (Vec<PathBuf>, Vec<String>) {
+    let mut refused: Vec<String> = Vec::new();
     let paths: Vec<PathBuf> = arguments.into_iter().filter_map(|argument| {
+        // Any failure to look it up leaves it a switch: a switch's text is not a path
+        // (`--user-data-dir=C:\…` is not even a valid name on Windows) and must not
+        // draw a dialog.
+        if is_launch_switch(&argument, || fs::symlink_metadata(&argument).is_ok()) {
+            eprintln!("ignoring launch switch {}", argument.to_string_lossy());
+            return None;
+        }
         let path = if argument.to_str().is_some_and(|value| value.starts_with("file://")) {
             match tauri::Url::parse(argument.to_str().unwrap())
                 .map_err(|error| error.to_string())
@@ -2388,22 +3341,27 @@ fn startup_database_paths(arguments: impl IntoIterator<Item = std::ffi::OsString
             {
                 Ok(path) => path,
                 Err(error) => {
-                    eprintln!("could not open launch URL {}: {error}", argument.to_string_lossy());
+                    refused.push(format!("SQLite Explorer could not open {}: {error}.", argument.to_string_lossy()));
                     return None;
                 }
             }
         } else {
             PathBuf::from(argument)
         };
-        match fs::canonicalize(&path) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                eprintln!("could not open launch path {}: {error}", path.display());
+        match resolve_for_guard(&path) {
+            Resolved::Canonical(path) => Some(path),
+            Resolved::Missing => {
+                let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                refused.push(format!("SQLite Explorer could not open \"{name}\": it does not exist."));
+                None
+            }
+            Resolved::Unresolvable(sentence) => {
+                refused.push(sentence);
                 None
             }
         }
     }).collect();
-    droppable_paths(&paths)
+    (droppable_paths(&paths), refused)
 }
 
 /// The subset of a drop worth opening: plausible databases by extension, regular
@@ -2710,8 +3668,12 @@ pub fn run() {
         Err(std::env::VarError::NotPresent) => builder,
         Err(error) => panic!("Invalid QA WebDriver port: {error}"),
     };
+    let builder = builder.plugin(navigation_pin());
+    // Ctrl+Q and Ctrl+Shift+N while a Windows webview has the keyboard; see
+    // `shell_keys`. After the pin, so a webview gets its request pin first.
+    #[cfg(windows)]
+    let builder = builder.plugin(shell_keys::plugin());
     builder
-        .plugin(navigation_pin())
         .plugin(tauri_plugin_dialog::init())
         // App-global: paths the user picked (layer 1 of the path authority), the
         // shared menu bar's theme checkmarks, and the one recents MRU. Everything
@@ -2923,10 +3885,7 @@ pub fn run() {
                     // Quit asks the same question ⌘W does, over every window —
                     // see the `quit` item in `build_menu` for why this is not
                     // `PredefinedMenuItem::quit`.
-                    "quit-app" => match quit_decision_for(&app.state::<Windows>()) {
-                        CloseDecision::Proceed => app.exit(0),
-                        CloseDecision::Confirm { databases } => confirm_then_quit(app, databases),
-                    },
+                    "quit-app" => request_quit(app),
                     "zoom-in" | "zoom-out" | "zoom-reset" => {
                         let direction = match id {
                             "zoom-in" => 1,
@@ -3001,10 +3960,13 @@ pub fn run() {
                             // looks like a bug, not "the file moved." Tell the user,
                             // then self-heal the list so the dead entry does not sit
                             // there forever.
-                            app.dialog()
-                                .message(format!("{} no longer exists.", path.display()))
-                                .title("File Not Found")
-                                .show(|_| {});
+                            inform(
+                                app,
+                                target_window(app).as_deref(),
+                                "File Not Found",
+                                format!("{} no longer exists.", path_for_people(&path)),
+                                tauri_plugin_dialog::MessageDialogKind::Info,
+                            );
                             let remaining: Vec<PathBuf> = {
                                 let recents = app.state::<RecentsStore>();
                                 let mut r = recents.0.lock().unwrap();
@@ -3024,13 +3986,7 @@ pub fn run() {
                     // acts on ONE database, so it goes to ONE window. Broadcasting
                     // these would make a single ⌘S save every open window.
                     _ => match target_window(app) {
-                        Some(label) => {
-                            if let Err(e) =
-                                app.emit_to(label.as_str(), "desktop-menu", event.id().0.clone())
-                            {
-                                eprintln!("could not deliver menu item {id} to {label}: {e}");
-                            }
-                        }
+                        Some(label) => forward_menu_item(app, &label, id),
                         None => eprintln!("menu item {id} ignored: no window is open"),
                     },
                 }
@@ -3049,8 +4005,14 @@ pub fn run() {
                 eprintln!("OS-initiated quits will not ask about unsaved changes: {e}");
             }
             #[cfg(any(windows, target_os = "linux"))]
-            for path in startup_database_paths(std::env::args_os().skip(1)) {
-                open_into_window(app.handle(), MAIN_WINDOW_LABEL, path);
+            {
+                let (paths, refused) = startup_database_paths(std::env::args_os().skip(1));
+                for path in paths {
+                    open_into_window(app.handle(), MAIN_WINDOW_LABEL, path);
+                }
+                if !refused.is_empty() {
+                    tell_user(app.handle(), Some(MAIN_WINDOW_LABEL), "Could Not Open", &refused);
+                }
             }
             Ok(())
         })
@@ -3117,6 +4079,653 @@ mod tests {
         dir
     }
 
+    /// Whether a test that drives the `sqlite3` tool may skip when it is missing: not
+    /// when SQLX_REQUIRE_SQLITE3 is "1". CI sets it on every runner, where a skip would
+    /// read as a pass.
+    fn sqlite3_skip_allowed(require: Option<&std::ffi::OsStr>) -> bool {
+        require != Some(std::ffi::OsStr::new("1"))
+    }
+
+    /// Whether `sqlite3` runs here. When it does not, `test` is skipped, or fails
+    /// under SQLX_REQUIRE_SQLITE3=1.
+    fn sqlite3_available(test: &str) -> bool {
+        if std::process::Command::new("sqlite3").arg("-version").output().is_ok_and(|o| o.status.success()) {
+            return true;
+        }
+        assert!(
+            sqlite3_skip_allowed(std::env::var_os("SQLX_REQUIRE_SQLITE3").as_deref()),
+            "sqlite3 is not installed, and SQLX_REQUIRE_SQLITE3=1 does not let the {test} skip"
+        );
+        eprintln!("sqlite3 is not installed; {test} skipped");
+        false
+    }
+
+    /// What a guard is keyed by, from what the volume answered: run on every platform.
+    #[test]
+    fn a_guard_is_keyed_by_the_canonical_path_or_refuses_by_name() {
+        let path = Path::new("/somewhere/x.db");
+        use std::io::{Error, ErrorKind};
+        let there = || Ok(false);
+        let not_there = || Err(Error::from(ErrorKind::NotFound));
+        assert!(matches!(
+            resolved_for_guard(path, Ok(PathBuf::from("/real/x.db")), there),
+            Resolved::Canonical(p) if p == Path::new("/real/x.db")
+        ));
+        assert!(matches!(resolved_for_guard(path, Err(ErrorKind::NotFound.into()), not_there), Resolved::Missing));
+        // NotFound from canonicalize for a file that is there (a volume with no drive
+        // letter, a dangling link) is not a missing file.
+        for (answer, entry) in [
+            (Error::from(ErrorKind::NotFound), Ok(false)),
+            (Error::from(ErrorKind::NotFound), Err(Error::from_raw_os_error(5))),
+            (Error::from_raw_os_error(1), Ok(false)),
+            (Error::from_raw_os_error(1), Err(Error::from(ErrorKind::NotFound))),
+        ] {
+            match resolved_for_guard(path, Err(answer), || entry) {
+                Resolved::Unresolvable(sentence) => {
+                    assert!(sentence.starts_with("ERR_FILE_UNRESOLVABLE: ") && sentence.contains("\"x.db\""), "{sentence}");
+                }
+                _ => panic!("a file that is there, or not known not to be, is not missing"),
+            }
+        }
+        // A link there whose target is gone is said to be that.
+        match resolved_for_guard(path, Err(ErrorKind::NotFound.into()), || Ok(true)) {
+            Resolved::Unresolvable(sentence) => {
+                assert_eq!(sentence, "ERR_FILE_MISSING: \"x.db\" is a link to a file that no longer exists.");
+            }
+            _ => panic!("a link to nothing is neither a path nor a missing name"),
+        }
+        // On disk, a link counts as pointing to nothing only when its target is
+        // gone: a link to a file that is there is not "a link to nothing", whatever
+        // canonicalize answered.
+        #[cfg(unix)]
+        {
+            let dir = scratch_dir("dangling-or-not");
+            fs::write(dir.join("real.db"), b"x").unwrap();
+            std::os::unix::fs::symlink(dir.join("real.db"), dir.join("live.db")).unwrap();
+            std::os::unix::fs::symlink(dir.join("gone.db"), dir.join("dead.db")).unwrap();
+            assert!(!is_dangling_link(&dir.join("live.db")).unwrap(), "a link to a file that is there");
+            assert!(is_dangling_link(&dir.join("dead.db")).unwrap(), "a link whose target is gone");
+            assert!(!is_dangling_link(&dir.join("real.db")).unwrap(), "not a link");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        // On disk: a link whose target is gone is there, and cannot be resolved.
+        #[cfg(unix)]
+        {
+            let dir = scratch_dir("resolve-dangling");
+            std::os::unix::fs::symlink(dir.join("gone.db"), dir.join("x.db")).unwrap();
+            let dangling = resolve_for_guard(&dir.join("x.db"));
+            let absent = resolve_for_guard(&dir.join("absent.db"));
+            fs::remove_dir_all(&dir).unwrap();
+            assert!(matches!(dangling, Resolved::Unresolvable(_)));
+            assert!(matches!(absent, Resolved::Missing));
+        }
+    }
+
+    /// Where the location of a database cannot be resolved, every guard keyed by it
+    /// says so by name instead of letting the file through unguarded: the WebAssembly
+    /// read, its in-place save, a Save As that would adopt it, a launch argument, and a
+    /// page's report of what it has open. (A folder this user cannot search stands in
+    /// for a volume that never answers.)
+    #[cfg(unix)]
+    #[test]
+    fn a_database_whose_location_cannot_be_resolved_is_refused_by_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("unresolvable");
+        let locked = dir.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("x.db"), b"SQLite format 3\0").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let db = locked.join("x.db");
+        let denied = fs::canonicalize(&db).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let files = native::OpenFiles::default();
+        let read = native::admit_wasm_read(&files, &db, "main");
+        let save = assert_generation_current(&WindowState::default(), &db);
+        let adopt = adoption_refusal(&db);
+        let (launched, launch_refused) = startup_database_paths([db.clone().into_os_string()]);
+        let pushed = native::sync_reported(&files, "main", std::slice::from_ref(&db));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        // Not enforced for root: the case would prove nothing.
+        assert!(denied, "a mode-000 folder is searchable here");
+        let named = |r: &str| r.starts_with("ERR_FILE_UNRESOLVABLE: ") && r.contains("\"x.db\"");
+        let mut wrong = Vec::new();
+        if !read.as_ref().is_err_and(|r| named(r)) {
+            wrong.push(format!("read: {read:?}"));
+        }
+        if !save.as_ref().is_err_and(|r| named(r) && r.contains("Export Database")) {
+            wrong.push(format!("save: {save:?}"));
+        }
+        if !adopt.as_deref().is_some_and(|r| named(r) && r.contains("Export Database") && !r.contains("another drive")) {
+            wrong.push(format!("Save As adoption: {adopt:?}"));
+        }
+        if !(launched.is_empty() && launch_refused.len() == 1 && named(&launch_refused[0])) {
+            wrong.push(format!("launch: {launched:?} {launch_refused:?}"));
+        }
+        match pushed {
+            Ok(synced) if synced.installed == 0 && synced.unresolvable.len() == 1 && named(&synced.unresolvable[0].1) => {}
+            other => wrong.push(format!("push: {other:?}")),
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A dialog reads every refusal without its code, however many there are and
+    /// whichever come first.
+    #[test]
+    fn refusals_shown_to_a_person_carry_no_codes() {
+        let text = for_people(&[
+            "SQLite Explorer could not open \"a.db\": it does not exist.".to_string(),
+            "ERR_FILE_UNRESOLVABLE: SQLite Explorer cannot resolve the location of \"b.db\" (x), so it y".to_string(),
+        ]);
+        assert_eq!(
+            text,
+            "SQLite Explorer could not open \"a.db\": it does not exist.\n\n\
+             SQLite Explorer cannot resolve the location of \"b.db\" (x), so it y"
+        );
+    }
+
+    /// Save As asks before it writes whether the file it would adopt could be guarded.
+    /// The command needs a live app and a dialog, so the order is read from its code,
+    /// with comments removed, so that a comment naming the check does not count.
+    #[test]
+    fn a_save_as_checks_its_adoption_before_it_writes() {
+        let source = include_str!("lib.rs");
+        let save_as = source.split("async fn save_file_as").nth(1).expect("save_file_as");
+        let save_as = &save_as[..save_as.find("fn urlencoding_decode").expect("decoder follows")];
+        let code: String = save_as.lines().map(|line| line.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n");
+        let asked = code.find("if let Some(refusal) = adoption_refusal(&path) {").expect("asked, in code");
+        let written = code.find("write_atomically(&path, &bytes)?;").expect("written, in code");
+        assert!(asked < written, "the adoption is checked before the write");
+    }
+
+    /// A link whose target is gone: a Save As over it writes a new file in place of the
+    /// link (so it is not refused), and a read or a launch says the file it points to no
+    /// longer exists rather than that its location cannot be resolved.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_nothing_is_said_to_be_one() {
+        let dir = scratch_dir("dangling-link");
+        let link = dir.join("x.db");
+        std::os::unix::fs::symlink(dir.join("gone.db"), &link).unwrap();
+        let adopt = adoption_refusal(&link);
+        let (paths, refused) = startup_database_paths([link.clone().into_os_string()]);
+        let read = native::admit_wasm_read(&native::OpenFiles::default(), &link, "main");
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(adopt, None, "Save As replaces the link");
+        assert!(paths.is_empty());
+        let said = |r: &str| r.contains("\"x.db\" is a link to a file that no longer exists");
+        assert!(refused.len() == 1 && said(&refused[0]), "{refused:#?}");
+        assert!(read.as_ref().is_err_and(|r| said(r)), "{read:?}");
+    }
+
+    /// A switch on the command line is not a file the user asked to open: no dialog.
+    #[test]
+    fn launch_switches_are_not_files() {
+        let dir = scratch_dir("launch-switches");
+        let db = dir.join("x.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        let (paths, refused) = startup_database_paths([
+            "--remote-debugging-port=9222".into(),
+            "--user-data-dir=/tmp/profile".into(),
+            "-psn_0_123456".into(),
+            db.clone().into_os_string(),
+        ]);
+        let canonical = fs::canonicalize(&db).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(paths, vec![canonical]);
+        assert!(refused.is_empty(), "{refused:#?}");
+    }
+
+    /// An argument that starts with '-' is a switch only when nothing of that name is
+    /// there: "-x.db" in the current folder is a file to open.
+    #[test]
+    fn a_launch_argument_starting_with_a_dash_that_names_a_file_is_a_file() {
+        use std::ffi::OsStr;
+        assert!(!is_launch_switch(OsStr::new("-x.db"), || true));
+        assert!(is_launch_switch(OsStr::new("-x.db"), || false));
+        assert!(is_launch_switch(OsStr::new("--remote-debugging-port=9222"), || false));
+        assert!(!is_launch_switch(OsStr::new("x.db"), || panic!("only an argument starting with '-' is looked up")));
+    }
+
+    /// A launch argument that names no file, or no file the shell can read as a path,
+    /// is said to the user, not only on stderr.
+    #[test]
+    fn a_launch_argument_that_cannot_be_opened_is_named() {
+        let dir = scratch_dir("launch-refused");
+        let (paths, refused) = startup_database_paths([dir.join("missing.db").into_os_string(), "file://[invalid".into()]);
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(paths.is_empty());
+        assert_eq!(refused.len(), 2, "{refused:#?}");
+        assert!(refused[0].contains("\"missing.db\""), "{refused:#?}");
+        assert!(refused[1].contains("file://[invalid"), "{refused:#?}");
+    }
+
+    /// A main file that exists but cannot be opened cannot have its lock probed for a
+    /// connection in EXCLUSIVE locking mode, so it is refused as unchecked, read and
+    /// destination alike, rather than taken for one no connection holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_main_file_that_cannot_be_opened_is_refused_as_unchecked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("main-unopenable");
+        let db = dir.join("x.db");
+        let mut header = b"SQLite format 3\0".to_vec();
+        header.resize(100, 0);
+        header[18] = 2;
+        header[19] = 2;
+        fs::write(&db, &header).unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o000)).unwrap();
+        // Not enforced for root: the case would prove nothing.
+        let denied = File::open(&db).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+        let read = snapshot_refusal(&db);
+        let destination = log_beside_destination(&db).map_err(|e| e.to_string());
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(denied, "a mode-000 file opened here");
+        assert!(
+            read.as_deref().is_some_and(|r| r.starts_with("ERR_DATABASE_LOG_UNCHECKED") && r.contains("(\"x.db\":")),
+            "{read:?}"
+        );
+        assert!(destination.as_ref().is_err_and(|e| e.starts_with("\"x.db\":")), "{destination:?}");
+    }
+
+    /// SQLite on Windows names a database's logs beside the path it was given, not its
+    /// link target (GetFullPathNameW), and that resolution needs no answer from the
+    /// volume. The choice runs here on every platform; its effect is pinned on Windows
+    /// by `a_link_to_a_database_has_its_logs_beside_the_link_on_windows`.
+    #[test]
+    fn the_windows_log_location_resolves_no_link_and_needs_no_volume() {
+        let dir = scratch_dir("absolute-location");
+        let missing = dir.join("no-such-folder").join("x.db");
+        assert_eq!(absolute_location(&missing).unwrap(), Some(missing.clone()), "a path that does not exist");
+        #[cfg(unix)]
+        {
+            fs::write(dir.join("real.db"), b"SQLite format 3\0").unwrap();
+            std::os::unix::fs::symlink(dir.join("real.db"), dir.join("link.db")).unwrap();
+            assert_eq!(absolute_location(&dir.join("link.db")).unwrap(), Some(dir.join("link.db")), "a link is not followed");
+        }
+        assert_eq!(absolute_location(Path::new("/")).unwrap(), None, "no file name");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The locations a Windows read looks at, from what the path and its target answer.
+    /// Run on every platform; `a_link_to_a_database_is_checked_beside_the_link_and_its_target_on_windows`
+    /// is the effect on Windows.
+    #[test]
+    fn a_windows_read_looks_beside_a_link_and_beside_its_target() {
+        use std::io::{Error, ErrorKind};
+        let given = PathBuf::from("C:\\data\\link.db");
+        let target = PathBuf::from("C:\\real\\real.db");
+        let locations = |link: std::io::Result<bool>, resolved: std::io::Result<PathBuf>| {
+            windows_read_log_locations(given.clone(), link, move || resolved).map_err(|e| e.to_string())
+        };
+        assert_eq!(locations(Ok(false), Err(Error::other("not asked"))), Ok(vec![given.clone()]), "no link");
+        assert_eq!(locations(Err(ErrorKind::NotFound.into()), Err(Error::other("not asked"))), Ok(vec![given.clone()]));
+        assert_eq!(locations(Ok(true), Ok(target.clone())), Ok(vec![given.clone(), target.clone()]), "a link");
+        assert_eq!(locations(Ok(true), Err(ErrorKind::NotFound.into())), Ok(vec![given.clone()]), "a dangling link");
+        assert!(locations(Ok(true), Err(Error::from_raw_os_error(1))).is_err(), "a target that cannot be resolved");
+        assert!(locations(Err(Error::from_raw_os_error(5)), Ok(target)).is_err(), "a path that cannot be looked at");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_link_to_a_database_is_checked_beside_the_link_and_its_target_on_windows() {
+        let dir = scratch_dir("windows-link-logs");
+        let mut header = b"SQLite format 3\0".to_vec();
+        header.resize(100, 0);
+        header[18] = 1;
+        header[19] = 1;
+        fs::write(dir.join("real.db"), &header).unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(dir.join("real.db"), dir.join("link.db")) {
+            panic!("could not create a file symlink ({e}); enable Developer Mode or run elevated");
+        }
+        fs::write(dir.join("real.db-wal"), [0u8; 4096]).unwrap();
+        let beside_target = log_beside(&dir.join("link.db")).unwrap();
+        let destination_beside_target = log_beside_destination(&dir.join("link.db")).unwrap();
+        fs::write(dir.join("link.db-wal"), [0u8; 4096]).unwrap();
+        let beside_link = log_beside(&dir.join("link.db")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(beside_target, Some(LogBeside::Wal), "a read takes the target's bytes, so its log counts");
+        assert_eq!(destination_beside_target, None, "a write replaces the link: the target's log is not the new file's");
+        assert_eq!(beside_link, Some(LogBeside::Wal), "the link's own name carries the logs SQLite reads through it");
+    }
+
+    #[test]
+    fn a_missing_sqlite3_fails_the_live_tests_when_it_is_required() {
+        use std::ffi::OsStr;
+        assert!(!sqlite3_skip_allowed(Some(OsStr::new("1"))));
+        for value in [None, Some(OsStr::new("")), Some(OsStr::new("0")), Some(OsStr::new("yes"))] {
+            assert!(sqlite3_skip_allowed(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_webassembly_engine_never_takes_a_file_with_changes_outside_it() {
+        let dir = scratch_dir("snapshot-refusal");
+        let db = dir.join("db.sqlite");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        assert_eq!(snapshot_refusal(&db), None, "no journals");
+
+        let wal = dir.join("db.sqlite-wal");
+        fs::write(&wal, [0u8; 32]).unwrap();
+        assert_eq!(snapshot_refusal(&db), None, "a WAL header alone carries no changes");
+        fs::write(&wal, [0u8; 33]).unwrap();
+        assert!(snapshot_refusal(&db).is_some_and(|r| r.contains("-wal")), "frames after the header");
+        fs::remove_file(&wal).unwrap();
+
+        let journal = dir.join("db.sqlite-journal");
+        fs::write(&journal, b"").unwrap();
+        assert_eq!(snapshot_refusal(&db), None, "TRUNCATE leaves an empty journal");
+        fs::write(&journal, [0u8; 512]).unwrap();
+        assert_eq!(snapshot_refusal(&db), None, "PERSIST zeroes the header");
+        let mut hot = vec![0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+        hot.resize(512, 0);
+        fs::write(&journal, &hot).unwrap();
+        assert!(snapshot_refusal(&db).is_some_and(|r| r.contains("rollback journal")), "a live or hot journal");
+
+        // SQLite names the journals after the file it opens, which resolves links.
+        #[cfg(unix)]
+        {
+            let link = dir.join("link.sqlite");
+            std::os::unix::fs::symlink(&db, &link).unwrap();
+            assert!(snapshot_refusal(&link).is_some());
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_connection_holding_the_file_in_wal_mode_counts_even_with_an_empty_wal() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::process::{Command, Stdio};
+        // The control arm needs a real SQLite connection in another process.
+        if !sqlite3_available("live WAL connection test") {
+            return;
+        }
+        let dir = scratch_dir("live-wal");
+        let db = dir.join("db.sqlite");
+        let mut holder = Command::new("sqlite3").arg(&db).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        writeln!(
+            holder.stdin.as_mut().unwrap(),
+            "PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1); PRAGMA wal_checkpoint(TRUNCATE); \
+             SELECT 'READY';"
+        )
+        .unwrap();
+        holder.stdin.as_mut().unwrap().flush().unwrap();
+        // Wait for the holder to have run every statement, not for files to
+        // appear: an empty -wal and a -shm already exist right after the switch
+        // to WAL, while the connection is still taking its -shm locks (on
+        // Windows, os_win.c's winLockSharedMemory releases the exclusive DMS
+        // lock before it takes the shared one), and a probe in that gap sees
+        // no connection.
+        let mut lines = BufReader::new(holder.stdout.take().unwrap()).lines();
+        assert!(lines.any(|l| l.is_ok_and(|l| l == "READY")), "the holder did not get through its statements");
+        // A TRUNCATE checkpoint leaves the -wal empty while the connection stays open.
+        assert!(dir.join("db.sqlite-shm").exists(), "WAL mode keeps a -shm");
+        assert_eq!(fs::metadata(dir.join("db.sqlite-wal")).map(|m| m.len()).ok(), Some(0), "the -wal is empty");
+        assert_eq!(
+            log_beside(&db).unwrap(),
+            Some(LogBeside::LiveWal),
+            "another program holds the file in WAL mode with an empty -wal"
+        );
+        assert!(snapshot_refusal(&db).is_some_and(|r| r.starts_with("ERR_DATABASE_HAS_WAL")));
+        drop(holder.stdin.take());
+        holder.wait().unwrap();
+        // Control: a closed connection's leftovers hold no lock.
+        assert_eq!(snapshot_refusal(&db), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// EXCLUSIVE locking mode set before WAL keeps the wal-index in the
+    /// connection's own memory: no -shm, so no lock on one to see, and after a
+    /// TRUNCATE checkpoint an empty -wal, or none yet if nothing was read since
+    /// the switch. What the connection holds for as long as it is open is
+    /// SQLite's EXCLUSIVE lock on the main file.
+    #[test]
+    fn a_connection_holding_the_file_exclusively_in_wal_mode_counts_without_a_shm() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::process::{Child, Command, Stdio};
+        // The arms need real SQLite connections in another process.
+        if !sqlite3_available("exclusive WAL connection test") {
+            return;
+        }
+        // A connection left open once it has run `sql`.
+        let hold = |db: &Path, sql: &str| -> Child {
+            let mut child =
+                Command::new("sqlite3").arg(db).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            writeln!(child.stdin.as_mut().unwrap(), "{sql} SELECT 'READY';").unwrap();
+            child.stdin.as_mut().unwrap().flush().unwrap();
+            let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+            assert!(lines.any(|l| l.is_ok_and(|l| l == "READY")), "the holder did not get through {sql:?}");
+            child
+        };
+        let close = |mut child: Child| {
+            drop(child.stdin.take());
+            child.wait().unwrap();
+        };
+        let dir = scratch_dir("exclusive-wal");
+        let mut wrong = Vec::new();
+        // Exact answers: a control that came back Wal or Journal is as wrong as a
+        // held file that came back None.
+        let mut expect = |what: &str, got: Option<LogBeside>, want: Option<LogBeside>| {
+            if got != want {
+                wrong.push(format!("{what}: {got:?}, expected {want:?}"));
+            }
+        };
+        let live = Some(LogBeside::LiveWal);
+
+        let db = dir.join("db.sqlite");
+        let holder = hold(
+            &db,
+            "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; CREATE TABLE t(x); \
+             INSERT INTO t VALUES (1); PRAGMA wal_checkpoint(TRUNCATE);",
+        );
+        assert!(!dir.join("db.sqlite-shm").exists(), "EXCLUSIVE mode keeps no -shm");
+        assert_eq!(fs::metadata(dir.join("db.sqlite-wal")).map(|m| m.len()).ok(), Some(0));
+        expect("held, empty -wal", log_beside(&db).unwrap(), live);
+        expect("held, as a destination", log_beside_destination(&db).unwrap(), live);
+        assert!(snapshot_refusal(&db).is_some_and(|r| r.starts_with("ERR_DATABASE_HAS_WAL")));
+        close(holder);
+        expect("closed, its empty -wal left", log_beside(&db).unwrap(), None);
+
+        let switched = dir.join("switched.sqlite");
+        close(hold(&switched, "CREATE TABLE t(x); INSERT INTO t VALUES (1);"));
+        let holder = hold(&switched, "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL;");
+        assert!(!dir.join("switched.sqlite-wal").exists(), "no -wal before the first access");
+        expect("switched to WAL, no -wal yet", log_beside(&switched).unwrap(), live);
+        close(holder);
+
+        // Controls: a rollback-mode reader holds read locks only…
+        let rollback = dir.join("rollback.sqlite");
+        let reader = hold(&rollback, "CREATE TABLE t(x); INSERT INTO t VALUES (1); BEGIN; SELECT count(*) FROM t;");
+        expect("rollback reader mid-read", log_beside(&rollback).unwrap(), None);
+        close(reader);
+        let reader = hold(&rollback, "SELECT count(*) FROM t;");
+        expect("rollback reader idle", log_beside(&rollback).unwrap(), None);
+        close(reader);
+        // …and an EXCLUSIVE-mode rollback connection holds the same lock as the
+        // WAL one, over a file whose header says rollback and which is whole
+        // between its transactions (its journal header is zeroed).
+        let exclusive_rollback = dir.join("exclusive-rollback.sqlite");
+        let holder = hold(&exclusive_rollback, "PRAGMA locking_mode=EXCLUSIVE; CREATE TABLE t(x); INSERT INTO t VALUES (1);");
+        expect("EXCLUSIVE rollback connection", log_beside(&exclusive_rollback).unwrap(), None);
+        close(holder);
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A Save As replaces a link at the destination rather than follow it, so the
+    /// main-file lock probe must not follow one either: a link whose target another
+    /// program holds in EXCLUSIVE+WAL mode is not a WAL beside the new file.
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_link_to_a_file_held_exclusively_in_wal_mode_is_not_a_log() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::process::{Command, Stdio};
+        if !sqlite3_available("destination link probe test") {
+            return;
+        }
+        let dir = scratch_dir("dest-link-exclusive");
+        let target = dir.join("target.sqlite");
+        let link = dir.join("link.sqlite");
+        let mut holder = Command::new("sqlite3").arg(&target).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        writeln!(
+            holder.stdin.as_mut().unwrap(),
+            "PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES (1); \
+             PRAGMA wal_checkpoint(TRUNCATE); SELECT 'READY';"
+        )
+        .unwrap();
+        holder.stdin.as_mut().unwrap().flush().unwrap();
+        let mut lines = BufReader::new(holder.stdout.take().unwrap()).lines();
+        assert!(lines.any(|l| l.is_ok_and(|l| l == "READY")), "the holder did not get ready");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let through_link = log_beside_destination(&link).unwrap();
+        let at_target = log_beside_destination(&target).unwrap();
+        let source_lane = log_beside(&link).unwrap();
+        drop(holder.stdin.take());
+        holder.wait().unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(through_link, None, "the write replaces the link; the target's lock is not the new file's");
+        assert_eq!(at_target, Some(LogBeside::LiveWal), "control: the held file itself");
+        assert_eq!(source_lane, Some(LogBeside::LiveWal), "a read resolves the link, as SQLite does");
+    }
+
+    /// The Windows probes read only a lock conflict as a held lock; any other
+    /// failure means the volume could not lock at all, as the Unix arm reads a
+    /// failed F_GETLK.
+    #[test]
+    fn only_a_lock_violation_reads_as_a_held_lock_on_windows() {
+        assert!(lock_try_failure_means_held(ERROR_LOCK_VIOLATION_CODE));
+        // ERROR_INVALID_FUNCTION, ERROR_INVALID_HANDLE, ERROR_NOT_SUPPORTED, and
+        // ERROR_IO_PENDING, which LockFileEx reports only for an asynchronous
+        // handle without LOCKFILE_FAIL_IMMEDIATELY (the probes use neither).
+        for other in [1, 6, 50, 997] {
+            assert!(!lock_try_failure_means_held(other), "Windows error {other}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_a_log_name_does_not_park_the_check() {
+        // A FIFO swapped in at a log's name between a type check and an open
+        // used to block the open forever; logs are now opened without blocking
+        // and judged by the descriptor.
+        let dir = scratch_dir("log-fifo");
+        let db = dir.join("db.sqlite");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let fifo = std::ffi::CString::new(dir.join(format!("db.sqlite{suffix}")).to_str().unwrap()).unwrap();
+            // SAFETY: a valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        }
+        let (done, finished) = std::sync::mpsc::channel();
+        let probe = db.clone();
+        std::thread::spawn(move || done.send(log_beside(&probe)).unwrap());
+        let answer = finished.recv_timeout(std::time::Duration::from_secs(5)).expect("the check returned");
+        assert!(matches!(answer, Ok(None)), "a FIFO is not a log: {answer:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_log_beside_a_file_not_yet_created_still_counts() {
+        // SQLite applies a leftover log to whatever file is created under its
+        // name, so the check cannot wait for the file to exist.
+        let dir = scratch_dir("log-no-main");
+        fs::write(dir.join("new.sqlite-wal"), [0u8; 64]).unwrap();
+        assert!(snapshot_refusal(&dir.join("new.sqlite")).is_some_and(|r| r.contains("-wal")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A log beside a database that this process cannot open is judged the way SQLite
+    /// judges it, not taken for no log. sqlite3 3.54.1 cannot open the database either
+    /// (read-write or read-only) where it would read that log, and opens it cleanly where
+    /// it would not; a log opened read-only is as good as a readable one.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_cannot_be_opened_is_judged_as_sqlite_judges_it() {
+        use std::os::unix::fs::PermissionsExt;
+        // Bytes 18 and 19 of the header: 1 in rollback mode, 2 in WAL mode.
+        let header = |version: u8| {
+            let mut bytes = b"SQLite format 3\0".to_vec();
+            bytes.resize(100, 0);
+            bytes[18] = version;
+            bytes[19] = version;
+            bytes
+        };
+        let mut hot = JOURNAL_MAGIC.to_vec();
+        hot.resize(512, 0);
+        let shm = vec![0u8; 32768];
+        // (case, header version, [(log suffix, contents, mode)], refused)
+        type Logs = Vec<(&'static str, Vec<u8>, u32)>;
+        let cases: Vec<(&str, u8, Logs, bool)> = vec![
+            ("rollback, -wal header only", 1, vec![("-wal", vec![0; 32], 0o000)], true),
+            ("rollback, -wal with frames", 1, vec![("-wal", vec![0; 4152], 0o000)], true),
+            ("rollback, empty -wal", 1, vec![("-wal", vec![], 0o000)], false),
+            ("rollback, -shm, no -wal", 1, vec![("-shm", shm.clone(), 0o000)], false),
+            ("rollback, -shm, empty -wal", 1, vec![("-shm", shm.clone(), 0o000), ("-wal", vec![], 0o644)], false),
+            ("rollback, -shm, -wal header", 1, vec![("-shm", shm.clone(), 0o000), ("-wal", vec![0; 32], 0o644)], true),
+            ("rollback, empty -journal", 1, vec![("-journal", vec![], 0o000)], false),
+            ("rollback, zeroed -journal", 1, vec![("-journal", vec![0; 512], 0o000)], true),
+            ("rollback, hot -journal", 1, vec![("-journal", hot.clone(), 0o000)], true),
+            ("WAL, -shm, no -wal", 2, vec![("-shm", shm.clone(), 0o000)], true),
+            ("WAL, -shm, empty -wal", 2, vec![("-shm", shm.clone(), 0o000), ("-wal", vec![], 0o644)], true),
+            ("WAL, empty -wal", 2, vec![("-wal", vec![], 0o000)], true),
+            ("WAL, -wal with frames", 2, vec![("-wal", vec![0; 4152], 0o000), ("-shm", shm.clone(), 0o644)], true),
+            ("WAL, zeroed -journal", 2, vec![("-journal", vec![0; 512], 0o000)], true),
+            ("WAL, read-only -shm, empty -wal", 2, vec![("-shm", shm.clone(), 0o444), ("-wal", vec![], 0o644)], false),
+        ];
+        let mut wrong = Vec::new();
+        for (what, version, logs, refused) in cases {
+            let dir = scratch_dir("log-unopenable");
+            let db = dir.join("x.db");
+            fs::write(&db, header(version)).unwrap();
+            for (suffix, contents, mode) in &logs {
+                let log = dir.join(format!("x.db{suffix}"));
+                fs::write(&log, contents).unwrap();
+                fs::set_permissions(&log, fs::Permissions::from_mode(*mode)).unwrap();
+                if *mode == 0o000 {
+                    // Not enforced for root: the case would prove nothing.
+                    let denied = File::open(&log).is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+                    assert!(denied, "{what}: a mode-000 {suffix} opened here");
+                }
+            }
+            let refusal = snapshot_refusal(&db);
+            for (suffix, _, _) in &logs {
+                fs::set_permissions(dir.join(format!("x.db{suffix}")), fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            fs::remove_dir_all(&dir).unwrap();
+            let unopenable = logs.iter().find(|(_, _, mode)| *mode == 0o000).map(|(suffix, _, _)| format!("x.db{suffix}"));
+            let right = match (&refusal, refused) {
+                (None, false) => true,
+                (Some(r), true) => {
+                    r.starts_with("ERR_DATABASE_LOG_UNCHECKED") && unopenable.as_ref().is_some_and(|n| r.contains(n.as_str()))
+                }
+                _ => false,
+            };
+            if !right {
+                wrong.push(format!("{what}: {refusal:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn the_webassembly_read_and_save_check_for_a_log_before_touching_the_file() {
+        let source = include_str!("lib.rs");
+        let read = source.split("async fn read_database_bytes").nth(1).expect("read_database_bytes");
+        let read = &read[..read.find("async fn save_database").expect("save follows")];
+        // The log check runs inside the read's gate, whose own order (another
+        // window's hold, then the log, then this window's hold) is pinned
+        // beside it in native.rs.
+        assert!(read.find("admit_wasm_read").expect("gated") < read.find("read_regular_file_bounded").expect("read"));
+        // A WAL writer never changes the main file's generation until it
+        // checkpoints, so the stale-image guard alone cannot see one.
+        let save = source.split("async fn save_database").nth(1).expect("save_database");
+        let save = &save[..save.find("async fn save_file_as").expect("save_file_as follows")];
+        let guard = save.find("assert_generation_current").expect("the stale-image guard");
+        let checked = save.find("snapshot_refusal").expect("the save checks for a log");
+        let write = save.find("write_atomically").expect("the write");
+        assert!(guard < checked && checked < write, "order: generation, log, write");
+    }
+
     #[test]
     fn allowlist_blocks_unpicked_paths() {
         let allowlist = SessionAllowlist::default();
@@ -3170,7 +4779,7 @@ mod tests {
         fs::write(&second, b"database").unwrap();
         fs::write(&text, b"text").unwrap();
         fs::create_dir(&directory).unwrap();
-        let paths = startup_database_paths([
+        let (paths, _) = startup_database_paths([
             first.clone().into_os_string(),
             tauri::Url::from_file_path(&second).unwrap().to_string().into(),
             directory.into_os_string(),
@@ -3701,7 +5310,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The race Task 8 exists to close: `RunEvent::Opened` can arrive before the webview's
+    /// The race the parked-open queue closes: `RunEvent::Opened` can arrive before the webview's
     /// `onOpenFile` listener is wired up, and losing that open silently would be worse than
     /// any queueing complexity. Parks until `mark_ready` flushes it; `mark_ready` is
     /// idempotent so a duplicate readiness signal cannot re-flush a path that already went
@@ -4034,7 +5643,7 @@ mod tests {
         }
     }
 
-    /// The open cap is PER WINDOW — the ruling, asserted rather than described.
+    /// The open cap is PER WINDOW (see `MAX_NATIVE_SIDECARS`), asserted rather than described.
     /// An app-wide cap would refuse window 2's first open while its own page
     /// counts zero open databases, since the host's matching `MAX_OPEN_DATABASES`
     /// is per registry and a registry is per window.
@@ -4445,6 +6054,251 @@ mod tests {
         assert!(live.contains(".on_webview_ready(") && live.contains("install_request_pin(&_webview)"));
     }
 
+    /// A reload replaces the document, and the document's heap is where every
+    /// pending edit lives: F5 on Windows dropped an unsaved edit with no prompt
+    /// (measured on a Windows test machine at bdfc08f). So while the window reports
+    /// unsaved work, the pin refuses every document load on the app's own origin,
+    /// whatever started it (a key, a context menu's Reload, `location.reload()`).
+    /// A clean window still reloads, and a `blob:` URL is the page's own data
+    /// (a download), never a new document.
+    #[test]
+    fn a_reload_never_discards_unsaved_changes() {
+        let url = |text: String| tauri::Url::parse(&text).expect("test URL parses");
+        let clean = UnsavedState::default();
+        let dirty = normalise_unsaved(true, 1);
+        // Both served origins (macOS and Linux, Windows), on every platform, and
+        // this platform's own through `served_origin`.
+        let own = served_origin().as_str().trim_end_matches('/').to_string();
+        for origin in ["tauri://localhost".to_string(), "http://tauri.localhost".to_string(), own] {
+            let allowed = vec![url(origin.clone())];
+            let page = url(format!("{origin}/viewer.html"));
+            let query = url(format!("{origin}/viewer.html?reload=1"));
+            let blob = url(format!("blob:{origin}/6f1c-1b2e"));
+            let foreign = url("https://example.com/".to_string());
+            assert_eq!(navigation_refusal(&page, &allowed, clean), None, "{origin}: a clean window reloads");
+            assert_eq!(navigation_refusal(&query, &allowed, clean), None, "{origin}");
+            for target in [&page, &query] {
+                assert_eq!(
+                    navigation_refusal(target, &allowed, dirty),
+                    Some(NavigationRefusal::UnsavedChanges),
+                    "{target}: a reload would discard the unsaved edit"
+                );
+            }
+            assert_eq!(navigation_refusal(&blob, &allowed, dirty), None, "{origin}: a download is not a document load");
+            for unsaved in [clean, dirty] {
+                assert_eq!(navigation_refusal(&foreign, &allowed, unsaved), Some(NavigationRefusal::OffOrigin));
+            }
+        }
+        // The plugin decides from the window's own report, through this function.
+        let source = include_str!("lib.rs");
+        let live = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let pin = live.split("fn navigation_pin<").nth(1).expect("navigation_pin");
+        let pin = &pin[..pin.find("\n}\n").expect("end of navigation_pin")];
+        assert!(pin.contains("reported_unsaved(&windows, &label)"), "{pin}");
+        assert!(pin.contains("navigation_refusal(url, &allowed, unsaved)"), "{pin}");
+    }
+
+    /// Windows paths come back from `canonicalize` in the verbatim form, and the
+    /// recents store keeps them so: File Not Found said `\\?\C:\…` (measured
+    /// on a Windows test machine). What a person reads drops the prefix, as Explorer
+    /// does; what is stored and opened keeps it.
+    #[test]
+    fn a_verbatim_windows_path_reads_as_explorer_shows_it() {
+        for (stored, shown) in [
+            (r"\\?\C:\data\x.db", r"C:\data\x.db"),
+            (r"\\?\UNC\server\share\x.db", r"\\server\share\x.db"),
+            (r"C:\data\x.db", r"C:\data\x.db"),
+            (r"\\server\share\x.db", r"\\server\share\x.db"),
+            // A verbatim path that is not a drive or UNC path has no shorter
+            // spelling: left as it is.
+            (r"\\?\Volume{0b0c}\x.db", r"\\?\Volume{0b0c}\x.db"),
+            ("/tmp/x.db", "/tmp/x.db"),
+        ] {
+            assert_eq!(strip_verbatim(stored), shown, "{stored}");
+        }
+        let source = include_str!("lib.rs");
+        let live = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        assert!(live.contains("format!(\"{} no longer exists.\", path_for_people(&path))"));
+    }
+
+    /// The file dialogs belong to the window that asked. On Windows the panel is
+    /// owned by it: unowned, the Open panel came up at the screen's top-left
+    /// corner and could fall behind the app (measured on a Windows test machine). On
+    /// Linux the chooser is transient for and modal to it: rfd's GTK chooser has
+    /// no parent at all (measured on a Linux test machine: no WM_TRANSIENT_FOR). Not
+    /// on macOS, where a parented panel becomes a sheet. So every one is built by
+    /// `file_dialog`.
+    #[test]
+    fn every_file_dialog_is_built_by_file_dialog() {
+        let strip = |source: &'static str| {
+            let live = &source[..source.find("#[cfg(test)]\nmod tests").unwrap_or(source.len())];
+            live.lines().filter(|line| !line.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+        };
+        let lib = strip(include_str!("lib.rs"));
+        let native = strip(include_str!("native.rs"));
+        let shown = lib.split("impl<'a> FileDialog<'a> {").nth(1).expect("FileDialog");
+        let shown = &shown[..shown.find("\n}\n").expect("end of FileDialog")];
+        assert!(shown.contains("#[cfg(windows)]") && shown.contains(".set_parent(self.window)"), "{shown}");
+        assert!(shown.contains("gtk_dialog::choose_file(self.window"), "{shown}");
+        let gtk = strip(include_str!("gtk_dialog.rs"));
+        let chooser = gtk.split("fn present_chooser(").nth(1).expect("present_chooser");
+        assert!(
+            chooser.contains("gtk::FileChooserNative::new(") && chooser.contains("Some(&parent)") && chooser.contains("set_modal(true)"),
+            "the Linux chooser is transient for and modal to its window"
+        );
+        for (name, code) in [("lib.rs", &lib), ("native.rs", &native)] {
+            let compact: String = code.split_whitespace().collect();
+            let built = compact.matches(".dialog().file()").count();
+            let expected = usize::from(name == "lib.rs");
+            assert_eq!(built, expected, "{name}: a file dialog built outside file_dialog");
+        }
+    }
+
+    /// Every message dialog is attached to a window. Unattached, rfd hands a
+    /// macOS message to UserNotificationCenter: the keyboard never reaches it,
+    /// its first click only focuses it, and it stays on screen after the app is
+    /// gone (measured with the File Not Found message of Open Recent). On
+    /// Windows an unowned message box can sit behind the window. So a message is
+    /// shown only by the two unsaved-changes prompts and `inform`, and each of
+    /// them attaches its dialog.
+    #[test]
+    fn every_message_dialog_is_attached_to_a_window() {
+        let source = include_str!("lib.rs");
+        let live = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let owner = |at: usize| {
+            let line = live[..at]
+                .lines()
+                .rev()
+                .find(|line| {
+                    let line = line.trim_start();
+                    ["fn ", "pub fn ", "pub(crate) fn ", "async fn ", "pub(crate) async fn "]
+                        .iter()
+                        .any(|start| line.starts_with(start))
+                })
+                .expect("a message outside any function");
+            let name = &line[line.find("fn ").unwrap() + 3..];
+            name[..name.find(['(', '<']).unwrap()].to_string()
+        };
+        let owners: std::collections::BTreeSet<String> =
+            live.match_indices(".message(").map(|(at, _)| owner(at)).collect();
+        let allowed = ["confirm_then_close", "confirm_then_quit", "inform"];
+        for name in &owners {
+            assert!(allowed.contains(&name.as_str()), "{name} shows a message of its own");
+        }
+        for name in allowed {
+            let body = live.split(&format!("fn {name}(")).nth(1).expect(name);
+            let body = &body[..body.find("\n}\n").expect("end of function")];
+            assert!(body.contains(".parent("), "{name} does not attach its dialog");
+        }
+        assert!(!live.contains(".show(|_| {})"), "a message shown without a window to attach to");
+        // Each of them asks through `answer_on`, which on Linux builds the dialog
+        // transient for the window itself: rfd's GTK backend passes no parent.
+        for name in allowed {
+            let body = live.split(&format!("fn {name}(")).nth(1).expect(name);
+            let body = &body[..body.find("\n}\n").expect("end of function")];
+            assert!(body.contains("answer_on("), "{name} skips the Linux route");
+        }
+        let gtk = include_str!("gtk_dialog.rs");
+        assert!(gtk.contains("gtk::MessageDialog::new(\n        Some(&parent),"), "the GTK dialog has the window as its parent");
+        assert!(gtk.contains("gtk::DialogFlags::MODAL"));
+        // The Linux session's logout message is one of these too.
+        let session = include_str!("linux_session.rs");
+        assert!(!session.contains(".message(") && session.contains("crate::inform("));
+    }
+
+    /// On Windows the menu's accelerators never fire while the page has the
+    /// keyboard, so `shell_keys` takes the two the shell runs itself. It must take
+    /// exactly what the menu shows, through the same quit path, never a key a
+    /// layout or a held key produces by accident, and never act inside WebView2's
+    /// event dispatch.
+    #[test]
+    fn the_windows_shortcut_hook_matches_the_menu() {
+        use shell_keys::{shell_key, ShellKey, Taken};
+        let source = include_str!("lib.rs");
+        let live = &source[..source.find("#[cfg(test)]\nmod tests").expect("tests module")];
+        let menu = live.split("fn build_menu").nth(1).expect("build_menu");
+        let accelerator = |id: &str| {
+            let item = &menu[menu.find(&format!("\"{id}\",")).expect(id)..];
+            let start = item.find("Some(\"").expect("an accelerator") + "Some(\"".len();
+            item[start..start + item[start..].find('"').expect("closing quote")].to_string()
+        };
+        for (id, action) in [
+            ("quit-app", ShellKey::Quit),
+            ("new-window", ShellKey::NewWindow),
+            ("refresh-db", ShellKey::Refresh),
+            ("sql-console", ShellKey::SqlConsole),
+        ] {
+            let keys = accelerator(id);
+            let parts: Vec<&str> = keys.split('+').collect();
+            assert_eq!(parts[0], "CmdOrCtrl", "{id}: {keys}");
+            let shift = parts.contains(&"Shift");
+            let letter = parts.last().expect("a key");
+            assert_eq!(letter.len(), 1, "{id}: {keys} is not a letter key");
+            let key = u32::from(letter.as_bytes()[0].to_ascii_uppercase());
+            assert_eq!(shell_key(key, true, shift, false, false), Some(Taken::Run(action)), "{id}: {keys}");
+            assert_eq!(shell_key(key, true, shift, true, false), None, "{id}: AltGr is Ctrl+Alt");
+            // Taken, but run once: a held key repeats, and a repeat the page saw
+            // would reach the browser's own binding for the key.
+            assert_eq!(shell_key(key, true, shift, false, true), Some(Taken::Swallow), "{id}: a held key repeats");
+            assert_eq!(shell_key(key, false, shift, false, false), None, "{id}: needs Ctrl");
+        }
+        // Shift must match, except where the other one is the browser's.
+        assert_eq!(shell_key(u32::from(b'Q'), true, true, false, false), None);
+        assert_eq!(shell_key(u32::from(b'N'), true, false, false, false), None);
+        assert_eq!(shell_key(u32::from(b'K'), true, false, false, false), None);
+        // The Window menu's predefined Minimize (muda's Ctrl+M off macOS).
+        assert!(menu.contains("PredefinedMenuItem::minimize(app, None)?"));
+        assert_eq!(shell_key(u32::from(b'M'), true, false, false, false), Some(Taken::Run(ShellKey::Minimize)));
+        assert_eq!(shell_key(u32::from(b'M'), true, false, false, true), Some(Taken::Swallow));
+        // The browser's reload keys reload the page, which discarded unsaved
+        // edits (measured on a Windows test machine): taken, and nothing runs. Ctrl+R
+        // alone is the menu's Refresh, above.
+        const VK_F5: u32 = 0x74;
+        const VK_BROWSER_REFRESH: u32 = 0xA8;
+        for (key, ctrl, shift) in [
+            (VK_F5, false, false),
+            (VK_F5, true, false),
+            (VK_F5, false, true),
+            (VK_F5, true, true),
+            (VK_BROWSER_REFRESH, false, false),
+            (u32::from(b'R'), true, true),
+        ] {
+            for repeat in [false, true] {
+                assert_eq!(shell_key(key, ctrl, shift, false, repeat), Some(Taken::Swallow), "{key:#x} {ctrl} {shift}");
+            }
+        }
+        assert_eq!(shell_key(u32::from(b'R'), true, false, true, false), None, "AltGr+R types a character");
+        // The viewer's own keys stay the viewer's.
+        for letter in [b'O', b'S', b'Z', b'Y', b'W'] {
+            for shift in [false, true] {
+                assert_eq!(shell_key(u32::from(letter), true, shift, false, false), None);
+            }
+        }
+
+        assert!(
+            live.contains("#[cfg(windows)]\n    let builder = builder.plugin(shell_keys::plugin());"),
+            "the hook is installed on every Windows webview"
+        );
+        assert!(live.contains("\"quit-app\" => request_quit(app),"));
+        let hook = include_str!("shell_keys.rs");
+        assert!(hook.contains("crate::request_quit(&handle)"), "one quit path for menu and key");
+        // The page's two items go where the menu's go, to the window with the key.
+        assert!(live.contains("Some(label) => forward_menu_item(app, &label, id),"));
+        for id in ["refresh-db", "sql-console"] {
+            assert!(hook.contains(&format!("crate::forward_menu_item(&handle, &label, \"{id}\")")), "{id}");
+        }
+        let install = hook.split("fn install(").nth(1).expect("install");
+        let install = &install[..install.find("fn run(").expect("run")];
+        assert!(
+            !install.contains("request_quit") && !install.contains("open_new_window"),
+            "the handler must not act inside WebView2's dispatch"
+        );
+        let run = hook.split("fn run(").nth(1).expect("run");
+        let thread = run.find("thread::Builder").expect("a thread of its own");
+        let queued = run.find("run_on_main_thread").expect("the event loop");
+        assert!(thread < queued, "run_on_main_thread on the main thread runs inline");
+    }
+
     // -- Unsaved changes are not discarded without asking -------------------
 
     /// The per-window decision. A window with dirty databases must not close on
@@ -4822,7 +6676,41 @@ mod tests {
         );
     }
 
-    // -- Capstone QA: adversarial probes of the webview-facing surface ------
+    /// Both unsaved-changes prompts are sheets on a window. Unattached, rfd
+    /// hands the alert to UserNotificationCenter: the keyboard never reaches
+    /// it (Return and Escape go to the app), the first click only focuses it,
+    /// and it stays on screen after the app is gone. Measured on macOS 26 in
+    /// the 2026-11-25 QA; a GUI run is the only place that shows, so the
+    /// shipping bodies are pinned here.
+    #[test]
+    fn the_unsaved_prompts_are_sheets_on_a_window() {
+        let source = include_str!("lib.rs");
+        for name in ["fn confirm_then_close", "fn confirm_then_quit"] {
+            let body = source.split(name).nth(1).expect(name);
+            let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+            let body: String = body
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parent = body.find(".parent(").unwrap_or_else(|| panic!("{name}: the prompt is not attached to a window"));
+            let shown = body.find("blocking_show()").expect("the prompt is still shown");
+            assert!(parent < shown, "{name}: the window must be set before the prompt is shown");
+        }
+        let quit = source.split("fn confirm_then_quit").nth(1).expect("confirm_then_quit");
+        let quit = &quit[..quit.find("\n}\n").unwrap_or(quit.len())];
+        assert!(
+            quit.contains("bring_forward(window)"),
+            "an OS quit arrives while another app may be in front: its window comes forward to ask"
+        );
+        let forward = source.split("fn bring_forward").nth(1).expect("bring_forward");
+        let forward = &forward[..forward.find("\n}\n").unwrap_or(forward.len())];
+        let restore = forward.find("is_minimized()").expect("the restore is waited for");
+        let focus = forward.find("set_focus()").expect("then the window is focused");
+        assert!(restore < focus, "tao ignores set_focus on a minimized window: restore first");
+    }
+
+    // -- Adversarial probes of the webview-facing surface -------------------
 
     /// The allowlist is an exact-path set and the webview supplies the string,
     /// so what counts as "the same path" is `Path`'s COMPONENT-wise equality,
@@ -4992,9 +6880,9 @@ mod tests {
         assert_eq!(parse_settings(deep_object.as_bytes()), serde_json::json!({}));
     }
 
-    /// Regression for the capstone's BUG-3 (2026-08-18). Was a
+    /// Regression for a bug an adversarial review found (2026-08-18). Was a
     /// characterisation test asserting the bug; it is now the positive
-    /// assertion its author asked for.
+    /// assertion.
     ///
     /// `quit_decision` used to add the per-window counts with `+`. Every value
     /// is pushed by a page through `set_unsaved_state`, so two windows
@@ -5057,7 +6945,7 @@ mod tests {
         assert_eq!(normalise_unsaved(true, 7), UnsavedState { databases: 7 });
     }
 
-    // -- Capstone fixes: dispatch, non-regular files, cross-window writers ---
+    // -- Dispatch, non-regular files, cross-window writers --------------------
 
     /// BUG-1 / BUG-2, as an invariant rather than one measurement.
     ///
@@ -5133,7 +7021,7 @@ mod tests {
         // added without an annotation would drop this count.
         assert_eq!(seen, 18, "the command surface changed size");
 
-        // …and the file-I/O commands: the two the capstone named specifically,
+        // …and the file-I/O commands: the two the review named specifically,
         // plus the import read that joined them.
         let source = include_str!("lib.rs");
         for command in [
@@ -5259,8 +7147,8 @@ mod tests {
             .find("assert_allowlisted")
             .expect("the allowlist is still layer 1");
         let guard = body
-            .find("hold_for_read")
-            .expect("the read must take the app-global cross-window hold");
+            .find("admit_wasm_read")
+            .expect("the read must pass the app-global cross-window gate");
         let read = body
             .find("read_regular_file")
             .expect("the read must go through the regular-file gate");
@@ -5482,9 +7370,9 @@ mod tests {
         // so `openPaths` is renamed to a single letter and only the shape of
         // the call site survives.
         let bundle = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../viewer-dist/viewer.html"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../viewer-dist/web/viewer.html"),
         )
-        .expect("the synced viewer bundle");
+        .expect("the built viewer bundle");
         let call = bundle
             .split("setUnsavedState?.(")
             .nth(1)
@@ -5494,7 +7382,7 @@ mod tests {
             args.matches(',').count(),
             2,
             "viewer-dist predates the open-path push (call args: {args:?}); \
-             re-sync it — npm run sync-viewer"
+             rebuild it — npm run build:viewer"
         );
     }
 
@@ -5551,9 +7439,10 @@ mod tests {
     }
 
     /// The File menu is the ONLY way to reach `exportDb`: the whole-database export is
-    /// implemented on both engines and covered by upstream unit tests, but for one
-    /// release it had no entry point at all. The viewer half is pinned upstream
-    /// (`desktop_capstone_ui.test.ts` greps the built bundle); this is the shell half.
+    /// implemented on both engines and covered by the viewer's unit tests, but for one
+    /// release it had no entry point at all. The viewer half is pinned in
+    /// `viewer/tests/unit/desktop_ui_surface.test.ts` (it greps the built bundle);
+    /// this is the shell half.
     #[test]
     fn the_file_menu_offers_the_whole_database_export() {
         let source = include_str!("lib.rs");
@@ -5660,7 +7549,7 @@ mod tests {
         // Not a regular file: refused by type, like the database read.
         assert!(read_text_bounded(&dir, IMPORT_MAX_BYTES).unwrap_err().contains("not a regular file"));
 
-        // The shipped constant is the upstream parser's 64 MiB, and the message
+        // The shipped constant is the viewer parser's 64 MiB, and the message
         // the user sees quotes it.
         assert_eq!(IMPORT_MAX_BYTES, 64 * 1024 * 1024);
         fs::remove_dir_all(&dir).unwrap();
@@ -5737,24 +7626,24 @@ mod tests {
         );
     }
 
-    /// The shell's 64 MiB is the upstream parser's 64 MiB: the synced desktop
+    /// The shell's 64 MiB is the viewer parser's 64 MiB: the built desktop
     /// bundle carries the parser's own refusal text for that size, so the two gates
     /// cannot drift apart unnoticed on a re-pin.
     #[test]
     fn the_import_cap_matches_the_viewer_parser() {
         let bundle = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../viewer-dist/viewer.html"
+            "/../viewer-dist/web/viewer.html"
         ))
-        .expect("viewer-dist/viewer.html is synced");
+        .expect("viewer-dist/web/viewer.html is built");
         assert!(
             bundle.contains("exceeds the 64 MiB limit"),
-            "the synced viewer's parseImport no longer refuses at 64 MiB; re-derive IMPORT_MAX_BYTES"
+            "the built viewer's parseImport no longer refuses at 64 MiB; re-derive IMPORT_MAX_BYTES"
         );
         assert_eq!(IMPORT_MAX_BYTES / (1024 * 1024), 64);
         // The viewer's import flow is in the bundle at all (a sync to a bundle
         // without it would make File ▸ Import a dead menu item).
-        assert!(bundle.contains("importDataModal"), "the synced viewer has no import modal");
+        assert!(bundle.contains("importDataModal"), "the built viewer has no import modal");
     }
 
     /// File ▸ Import CSV/JSON… exists, sits in the File menu, and rides the default
@@ -5777,10 +7666,10 @@ mod tests {
         // …and the viewer bundle actually listens for it.
         let bundle = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../viewer-dist/viewer.html"
+            "/../viewer-dist/web/viewer.html"
         ))
-        .expect("viewer-dist/viewer.html is synced");
-        assert!(bundle.contains("import-data"), "the synced viewer does not handle the import-data menu id");
+        .expect("viewer-dist/web/viewer.html is built");
+        assert!(bundle.contains("import-data"), "the built viewer does not handle the import-data menu id");
     }
 
     /// bridge.js calls exactly the two import commands, by these names, and decodes

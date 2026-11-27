@@ -1,8 +1,9 @@
 //! Native engine sidecar: lifecycle, framed-JSON proxy, and the OUTER two
 //! layers of the desktop's three-layer path authority.
 //!
-//! The sidecar is the upstream `desktop/native-worker-desktop.js` bundle (the
-//! byte-identical worker method layer over a `tjs:sqlite` sql.js shim) run
+//! The sidecar is the `native/native-worker-desktop.js` bundle that
+//! `npm run build:viewer` builds from `viewer/core/native/` (the
+//! byte-identical worker method layer over a `tjs:sqlite` sql.js shim), run
 //! inside the pinned txiki binary:
 //!
 //!     tjs run native-worker-desktop.js <dbPath> ro|rw
@@ -18,7 +19,7 @@
 //!            allowlist (dialog-picked / OS-delivered — the same gate
 //!            `read_database_bytes` uses), then binds the sidecar to the
 //!            canonicalised path via argv.
-//!   layer 2  (upstream, sidecar-side) the engine factory refuses any
+//!   layer 2  (sidecar-side, viewer/core/native) the engine factory refuses any
 //!            `initializeDatabase` whose `config.path` differs from its argv
 //!            path, refuses rw opens on an `ro` spawn, and blocks the SQL
 //!            escape hatches (ATTACH/DETACH, VACUUM INTO) at the shim.
@@ -53,10 +54,10 @@
 //! result, which the shell atomically renames into the dest. The envelope is
 //! SHELL-CONSTRUCTED and does not pass `gate_envelope` — and, conversely, the
 //! gate guarantees no WEBVIEW envelope can ever impersonate it: anything that
-//! is not `{channel:"rpc", kind:"invoke", targetMethod ∈ KNOWN_METHODS}` is
-//! refused, and the `__shell` messageId namespace is reserved. The webview
-//! names NO path anywhere in the export flow (dest is the user's dialog pick,
-//! tempPath is the shell's own).
+//! is not `{channel:"rpc", kind:"invoke", targetMethod ∈ KNOWN_METHODS ∪
+//! TRANSPORT_METHODS}` is refused, and the `__shell` messageId namespace is
+//! reserved. The webview names NO path anywhere in the export flow (dest is
+//! the user's dialog pick, tempPath is the shell's own).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -69,11 +70,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::DialogExt;
 
 // ---------------------------------------------------------------------------
-// Wire constants (must mirror upstream core/native/frame-codec.js exactly;
-// pinned cross-language by tests/fixtures/native-frames.{bin,json})
+// Wire constants (must mirror viewer/core/native/frame-codec.js exactly;
+// pinned cross-language by viewer/tests/fixtures/native-frames.{bin,json})
 // ---------------------------------------------------------------------------
 
 /// Frame = u32 big-endian payload length || UTF-8 JSON payload. The prefix
@@ -123,9 +123,13 @@ const QUERY_PLAN_LIBRARY: &str = "query-plan.dll";
 
 /// Outgoing-frame queue depth, PER SIDECAR (each has its own writer thread
 /// and its own queue). The sidecar is a synchronous engine draining stdin
-/// sequentially and the host issues RPCs sequentially against any one
-/// database, so legitimate in-flight writes are ~1 per sidecar; the headroom
-/// exists for pipelining, while the cap bounds worst-case buffered memory
+/// sequentially, and the host keeps at most one native frame per database in
+/// flight (desktop-host.js chains every call on an entry, both native exports
+/// included, from the transport port on), so legitimate in-flight writes are 1
+/// per sidecar and ERR_NATIVE_WRITE_BACKPRESSURE is unreachable from a
+/// well-behaved page. A value larger than one frame crosses as `nativeTransfer`
+/// pieces, each its own frame. The cap stays the shell's own bound, not the
+/// page's: it bounds worst-case buffered memory
 /// when a hostile or wedged child stops reading: 4 × `MAX_FRAME_BYTES`
 /// (16 MiB) = 64 MiB per sidecar, and `MAX_NATIVE_SIDECARS` (16) bounds how
 /// many sidecars can exist at once — 1 GiB total, the derivation that fixes
@@ -316,9 +320,9 @@ fn message_key_of(id: &serde_json::Value) -> Option<MessageKey> {
 }
 
 /// Every method the worker layer's dispatch table exposes, pinned from
-/// upstream `website/src/sqlite-viewer/worker.js` (`const methods = {…}`,
-/// lines 3548-3583) at desktop-target commit 6540fdf — the same commit the
-/// synced `native-worker-desktop.js` artifact is built from.
+/// `viewer/worker/worker.js` (`const methods = {…}`), the
+/// source `native-worker-desktop.js` is built from. scripts/build-viewer.mjs
+/// refuses a build whose bundled dispatch table differs from this list.
 ///
 /// PATH AUDIT (layer 3's ground truth — re-verify on every artifact re-pin):
 /// the ONLY method whose payload carries a filesystem path consumed as one is
@@ -330,8 +334,10 @@ fn message_key_of(id: &serde_json::Value) -> Option<MessageKey> {
 /// return content in-band (no target path); `refreshFile` takes no arguments;
 /// every other payload is table/column/view names, SQL text (path escapes in
 /// SQL — ATTACH, VACUUM INTO — are blocked sidecar-side at the shim), record
-/// ids, or cell values. Methods NOT in this list are refused, not forwarded:
-/// a method added upstream must be re-audited here before the shell will
+/// ids, cell values, or byte-count budgets (see the entries). The request a
+/// `REQUEST_TRANSFER_METHODS` entry receives in pieces is the same payload,
+/// assembled by the sidecar. Methods NOT in this list are refused, not forwarded:
+/// a method added to the worker must be re-audited here before the shell will
 /// carry it (drift fails loud instead of silently widening the boundary).
 const KNOWN_METHODS: [&str; 38] = [
     "initializeDatabase",
@@ -359,22 +365,36 @@ const KNOWN_METHODS: [&str; 38] = [
     "replaceOversizedCell",
     "insertRow",
     // Added in the v1.7.2 merge (2026-09-07), a sibling of `insertRow`:
-    // `insertRowWithHistory(table, data, maxEditValueBytes, maxUndoSnapshotBytes)`
-    // — a table name, the row's column values, and two byte limits. It delegates
+    // `insertRowWithHistory(table, data, maxEditValueBytes, undoLimit)` — a table
+    // name, the row's column values, a byte limit, and the undo limit. It delegates
     // to the same internal insert as `insertRow` with undo-history capture on.
+    // THE UNDO LIMIT, the same slot on deleteRows, importRows and updateCellBatch:
+    // a bare non-negative byte count (the older form, still accepted), or the
+    // object the desktop host now sends, `{limitBytes, reservedBytes, setting,
+    // raisable?}`: the configured maxUndoMemory and what the rest of the history
+    // entry takes, both byte counts; `setting`, a display string of at most 120
+    // characters naming the setting; and `raisable: false` when the limit is at
+    // the setting's maximum. The worker only ever uses the last two to word a
+    // refusal's message: never a path the sidecar opens, never SQL. The gate checks no
+    // argument shapes here, as for every worker method but initializeDatabase.
     // NO filesystem path, so layer 3 needs no path check beyond DbId resolution.
     "insertRowWithHistory",
     // Added with the desktop CSV/JSON import (2026-09-07):
     // `importRows(table, rows, options)` — a table name, an array of
     // `{column: value}` row objects the page mapped from a parsed CSV/JSON
-    // source, and an options object of three byte budgets (`maxEditValueBytes`,
-    // `maxUndoSnapshotBytes`, `maxSnapshotTransportBytes`). It runs every row
+    // source, and an options object of three budgets (`maxEditValueBytes`,
+    // `maxUndoSnapshotBytes`, now the undo limit described at insertRowWithHistory,
+    // and `maxSnapshotTransportBytes`). It runs every row
     // inside one savepoint and answers the compact post-image set the host
     // records as one undo entry. The FILE never reaches the worker: the shell
     // reads it through `read_import_text` (lib.rs, its own read-only allowlist)
     // and the page parses it. NO filesystem path in the payload, so layer 3
-    // needs no path check beyond DbId resolution.
+    // needs no path check beyond DbId resolution. On the native engine the host
+    // sets `maxSnapshotTransportBytes` to 268435456, the transfer ceiling, where
+    // it was 14 MiB: still a byte count.
     "importRows",
+    // `deleteRows(table, rowIds, undoLimit)`: the third argument is the undo limit
+    // (see insertRowWithHistory), covering the deleted rows. No path.
     "deleteRows",
     "deleteColumns",
     // Audited on admission (the drift pin refused the sync until this entry
@@ -394,11 +414,180 @@ const KNOWN_METHODS: [&str; 38] = [
     "dropView",
     "undoModification",
     "redoModification",
+    // `updateCellBatch(table, updates, label, maxEditValueBytes,
+    // historyReplayToken, answerToken, undoLimit)`: the seventh argument is the
+    // undo limit (see insertRowWithHistory), covering the batch's prior values.
+    // The two token slots are worker-internal Symbols a page cannot
+    // produce: they cross the JSON lane as null, and null never matches. A null
+    // maxEditValueBytes reads as absent. No path.
     "updateCellBatch",
     "addColumn",
     "ping",
     "refreshFile",
 ];
+
+/// Transport methods native-host.js serves BEFORE the worker's dispatch table
+/// (viewer/core/native/native-transfer.js): they move a value larger than one
+/// frame in pieces. Not worker methods, so not in KNOWN_METHODS, which the
+/// build-viewer drift pin compares with the bundle's dispatch table; build-viewer pins
+/// this list against the bundle separately. Every entry needs its own payload check
+/// in `gate_envelope`, which refuses one that has none.
+///
+/// PATH AUDIT: `nativeTransfer` is path-free and carries no SQL authority. Its
+/// payload is exactly one of `["push", id, index, parts, length, piece]`,
+/// `["pull", id, index]` or `["commit", id]` (`check_native_transfer`). A piece is
+/// opaque JSON text the sidecar only concatenates: never consumed as a path, never
+/// run as SQL, never loaded. The assembled text is decoded with the frame codec and
+/// handed ONLY to the method a later real invoke names, which this gate judges by
+/// that invoke's own targetMethod (`REQUEST_TRANSFER_METHODS`). `pull` and `commit`
+/// only read or release the sidecar's own parked answer. Every piece is its own
+/// frame (at most MAX_FRAME_BYTES) and its own `native_rpc`, so it gets RPC_TIMEOUT
+/// and the identity re-stat before and after like any request: a file replaced
+/// mid-exchange is refused with ERR_NATIVE_FILE_CHANGED, the page retires the
+/// database, the sidecar is closed, and the parked write rolls back with the session.
+const TRANSPORT_METHODS: [&str; 1] = ["nativeTransfer"];
+
+/// The worker methods whose request may arrive in pieces: an envelope naming one of
+/// them may carry `content.payloadTransfer: {id, length, parts}` in place of
+/// `content.payload`, and the sidecar substitutes the payload it assembled from
+/// `nativeTransfer` pushes (it refuses the field on every other method too). Pinned
+/// against the bundle by build-viewer. Never `initializeDatabase`: the gate reads
+/// that method's `config.path` and `config.queryTimeout` from its payload, and a
+/// payload in pieces would hide both.
+const REQUEST_TRANSFER_METHODS: [&str; 6] = [
+    "updateCellBatch",
+    "deleteRows",
+    "insertRowWithHistory",
+    "importRows",
+    "undoModification",
+    "redoModification",
+];
+
+/// The longest value one transfer carries, in UTF-16 code units of JSON text (the
+/// sidecar's bound; not pinned by build-viewer).
+const MAX_TRANSFER_UNITS: u64 = 256 * 1024 * 1024;
+
+/// The longest transfer piece, in UTF-16 code units: what one frame holds at three
+/// UTF-8 bytes per unit after 4 KiB of envelope, the sidecar's own derivation.
+const MAX_TRANSFER_PIECE_UNITS: u64 = (MAX_FRAME_BYTES as u64 - 4096) / 3;
+
+/// A transfer id as the sidecar accepts one: 1 to 64 of `[A-Za-z0-9_-]`.
+fn transfer_id_ok(value: Option<&serde_json::Value>) -> bool {
+    value.and_then(|v| v.as_str()).is_some_and(|id| {
+        (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    })
+}
+
+/// A piece's length in UTF-16 units on the wire and as the sidecar decodes it, or
+/// `None` for a wire string the frame codec would not decode to plain text. The codec
+/// writes one more `~` before a string that starts with `~` and strips it on read
+/// (escapeJsonSafeNumberString / decodeJsonSafeNumberString,
+/// viewer/src/core/json-safe-numbers.ts), so a piece led by "~~" decodes one unit shorter
+/// than it travels. A single leading `~` is the codec's tag for a non-finite number,
+/// never its form of text: such a piece is refused, which is stricter than the
+/// sidecar for a hand-made "~x" (it decodes that as itself).
+fn piece_units(wire: &str) -> Option<(u64, u64)> {
+    let units = wire.encode_utf16().count() as u64;
+    if wire.starts_with("~~") {
+        Some((units, units - 1))
+    } else if wire.starts_with('~') {
+        None
+    } else {
+        Some((units, units))
+    }
+}
+
+/// The stateless half of the sidecar's own `nativeTransfer` checks; the order of
+/// pieces, and that they add up, are its to judge. Counts must be JSON integers
+/// (`as_u64` refuses `1.0`, which the page never sends), and the argument count is
+/// exact: the page sends six, three and two. A piece is bounded by its length ON THE
+/// WIRE, the codec's escape of a leading `~` included: the rule the sidecar
+/// applies (wirePieceUnits, viewer/core/native/native-transfer.js) and the page cuts pieces to, so the two
+/// sides judge every piece alike. Only its decoded length is compared with the
+/// transfer's total, as the sidecar adds up decoded pieces.
+fn check_native_transfer(payload: Option<&serde_json::Value>) -> Result<(), String> {
+    check_native_transfer_bounded(payload, MAX_TRANSFER_PIECE_UNITS)
+}
+
+/// `check_native_transfer` with the piece bound as an argument: the tests judge
+/// pieces the viewer's codec wrote at a small bound rather than commit megabytes.
+fn check_native_transfer_bounded(payload: Option<&serde_json::Value>, piece_bound: u64) -> Result<(), String> {
+    let args = payload.and_then(|p| p.as_array());
+    let ok = args.is_some_and(|args| {
+        let count = |i: usize| args.get(i).and_then(|v| v.as_u64());
+        transfer_id_ok(args.get(1))
+            && match (args.first().and_then(|v| v.as_str()), args.len()) {
+                (Some("push"), 6) => match (count(2), count(3), count(4), args[5].as_str()) {
+                    (Some(index), Some(parts), Some(length), Some(piece)) => {
+                        (1..=MAX_TRANSFER_UNITS).contains(&length)
+                            && (1..=length).contains(&parts)
+                            && index < parts
+                            && piece_units(piece).is_some_and(|(wire, decoded)| {
+                                wire <= piece_bound && (1..=length).contains(&decoded)
+                            })
+                    }
+                    _ => false,
+                },
+                (Some("pull"), 3) => count(2).is_some_and(|index| index < MAX_TRANSFER_UNITS),
+                (Some("commit"), 2) => true,
+                _ => false,
+            }
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "ERR_NATIVE_ENVELOPE_MALFORMED: nativeTransfer payload must be [\"push\", id, index, parts, length, piece], \
+             [\"pull\", id, index] or [\"commit\", id], with id 1-64 of [A-Za-z0-9_-], 1 <= length <= \
+             {MAX_TRANSFER_UNITS}, 1 <= parts <= length, index < parts, and a non-empty text piece of at \
+             most {piece_bound} UTF-16 units on the wire"
+        ))
+    }
+}
+
+/// `content.payloadTransfer`, judged by presence (the sidecar treats `null` as
+/// present). Allowed only where the sidecar assembles a payload, never with
+/// `content.payload` beside it, and only in the shape the page sends.
+fn check_payload_transfer(
+    method: &str,
+    content: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let Some(transfer) = content.get("payloadTransfer") else {
+        return Ok(());
+    };
+    // Before the general rule, so a later edit to the list cannot let it through.
+    if method == "initializeDatabase" {
+        return Err("ERR_NATIVE_ENVELOPE_MALFORMED: initializeDatabase cannot take its payload in pieces: \
+             the gate checks its config.path and config.queryTimeout in the payload itself"
+            .into());
+    }
+    if !REQUEST_TRANSFER_METHODS.contains(&method) {
+        return Err(format!(
+            "ERR_NATIVE_ENVELOPE_MALFORMED: method {method:?} cannot take its payload in pieces"
+        ));
+    }
+    if content.contains_key("payload") {
+        return Err(format!(
+            "ERR_NATIVE_ENVELOPE_MALFORMED: a {method:?} envelope carries payload or payloadTransfer, never both"
+        ));
+    }
+    let shape = transfer.as_object().filter(|t| t.len() == 3).and_then(|t| {
+        Some((t.get("id")?, t.get("length")?.as_u64()?, t.get("parts")?.as_u64()?))
+    });
+    match shape {
+        Some((id, length, parts))
+            if transfer_id_ok(Some(id))
+                && (1..=MAX_TRANSFER_UNITS).contains(&length)
+                && (1..=length).contains(&parts) =>
+        {
+            Ok(())
+        }
+        _ => Err(format!(
+            "ERR_NATIVE_ENVELOPE_MALFORMED: content.payloadTransfer must be {{id, length, parts}} with id \
+             1-64 of [A-Za-z0-9_-], 1 <= length <= {MAX_TRANSFER_UNITS} and 1 <= parts <= length"
+        )),
+    }
+}
 
 /// Layer 3: validates one outgoing envelope against the bound path and
 /// returns its routing key. Fail closed on every branch — an envelope this
@@ -441,10 +630,22 @@ pub(crate) fn gate_envelope(envelope_json: &str, bound_path: &str) -> Result<Mes
         .get("targetMethod")
         .and_then(|v| v.as_str())
         .ok_or("ERR_NATIVE_ENVELOPE_MALFORMED: content.targetMethod must be a string")?;
-    if !KNOWN_METHODS.contains(&method) {
+    if !KNOWN_METHODS.contains(&method) && !TRANSPORT_METHODS.contains(&method) {
         return Err(format!(
             "ERR_NATIVE_METHOD_UNLISTED: method {method:?} is not in the shell's audited method list and is not forwarded"
         ));
+    }
+    check_payload_transfer(method, content)?;
+    match method {
+        "nativeTransfer" => check_native_transfer(content.get("payload"))?,
+        // A transport method admitted without a payload check of its own would
+        // reach the sidecar unjudged.
+        _ if TRANSPORT_METHODS.contains(&method) => {
+            return Err(format!(
+                "ERR_NATIVE_METHOD_UNLISTED: transport method {method:?} has no payload check in the shell"
+            ))
+        }
+        _ => {}
     }
     if method == "initializeDatabase" {
         // payload = [filename, config]; the path the engine will open is
@@ -611,9 +812,12 @@ impl SidecarCore {
     /// checked under the pending lock so a concurrent `fail_all` can never
     /// miss the entry. The enqueue is `try_send` on a bounded queue — this
     /// function never blocks on pipe state, so a wedged or hostile child
-    /// cannot park async blocking-pool threads here: a full queue (only ever
-    /// reachable when the child stopped draining stdin — the host issues
-    /// RPCs sequentially) fails fast with a structured error.
+    /// cannot park async blocking-pool threads here: a full queue fails fast
+    /// with a structured error. The page pipelines its requests (nothing
+    /// queues them before `native_rpc`; the sidecar runs them one at a time
+    /// in arrival order), so the queue fills only once the child stops
+    /// draining stdin with the pipe buffer already full: a wedged child, or
+    /// one busy in a long statement while large frames wait behind it.
     fn submit(&self, key: MessageKey, envelope: &str) -> Result<mpsc::Receiver<RpcOutcome>, String> {
         let (tx, rx) = mpsc::channel();
         self.submit_with(key, envelope, Responder::Blocking(tx))?;
@@ -1421,6 +1625,377 @@ fn already_open_error(path: &Path, owner: &str, here: &str) -> String {
     )
 }
 
+/// A directory entry's identity, a link at the final component identified as itself
+/// rather than its target: device and inode on Unix, volume serial and 128-bit file id
+/// on Windows.
+fn entry_identity(path: &Path) -> io::Result<(u64, u128)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path)?;
+        Ok((meta.dev(), meta.ino() as u128))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        };
+        // Attributes only, no data access. BACKUP_SEMANTICS opens a folder as well,
+        // OPEN_REPARSE_POINT the link itself rather than its target.
+        let handle = fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        crate::windows_file_info::identity(&handle).map_err(io::Error::other)
+    }
+}
+
+/// Whether `dest` is, as its volume resolves names, a database in `held` or one of that
+/// database's `-wal`, `-shm` or `-journal`. Every comparison is by no-follow identity,
+/// with the volume resolving the spelling: that is what makes "É.db" and "é.db" on a
+/// case-insensitive volume, or the NFC and NFD spellings of one name on APFS, the one
+/// file they are on disk, and no fold done here could match every volume's.
+///
+/// - The destination's own entry, when it exists, is compared with every open database
+///   and with every journal file those databases have now, looked up under their own
+///   names. That covers every spelling the volume resolves to an existing journal: APFS
+///   folds U+017F (long s) onto s, so "x.db-ſhm" IS the live "x.db-shm", and a write
+///   there replaced the wal-index another connection was using.
+/// - A journal name that does not exist yet can only be matched by spelling: the
+///   destination's name minus each journal suffix it ends with in any ASCII case
+///   (refusing `x.db-WAL` beside an open `x.db` on a case-sensitive volume is the safe
+///   way to be wrong) is looked up and compared with the open databases. U+017F (long
+///   s) counts as an s there: measured on APFS, it is the only one-code-point non-ASCII
+///   spelling of any suffix letter (every code point to U+2FFFF probed), and matching it
+///   before a `-shm` exists keeps a connection that opens the database in WAL mode while
+///   the write is under way from having its new `-shm` replaced through it. A file at a
+///   `-shm` name nothing had used is harmless in itself, because the first connection to
+///   open the database in WAL mode truncates the `-shm` before reading it (a database
+///   image written there left the data intact). Not measured: multi-code-point
+///   spellings, the hyphen, NTFS's own folding, and arbitrary bytes at a `-wal` or
+///   `-journal` name, which SQLite would read if they were a valid log.
+///
+/// Identity cannot tell one link to a file from another, so a hard link to an open
+/// database is refused too, though writing there would only replace that link. Only
+/// "no such file" means no clash; any other failure refuses, since a destination that
+/// cannot be looked at cannot be known not to be open.
+/// Where a journal `suffix` (`-wal`, `-shm`, `-journal`) starts at the end of a name's
+/// encoded bytes, if the name ends with it after a non-empty prefix: letters in any
+/// ASCII case, and an s also as U+017F (encoded C5 BF), the one spelling APFS folds onto
+/// a suffix letter (see `open_database_refusal`). The leading '-' is matched as itself.
+fn journal_suffix_cut(bytes: &[u8], suffix: &str) -> Option<usize> {
+    const LONG_S: [u8; 2] = [0xC5, 0xBF];
+    let mut end = bytes.len();
+    for &want in suffix.as_bytes().iter().rev() {
+        if want == b's' && end >= 2 && bytes[end - 2..end] == LONG_S {
+            end -= 2;
+        } else if end >= 1 && bytes[end - 1].eq_ignore_ascii_case(&want) {
+            end -= 1;
+        } else {
+            return None;
+        }
+    }
+    (end > 0).then_some(end)
+}
+
+fn open_database_refusal(held: &[PathBuf], folder: &Path, dest_name: &std::ffi::OsStr) -> Option<String> {
+    let name = dest_name.to_string_lossy();
+    let unchecked = |e: io::Error| {
+        format!(
+            "ERR_DESTINATION_UNCHECKED: SQLite Explorer could not check whether \"{name}\" is a \
+             database open in it, or one of its journal files ({e}), so it did not write there. \
+             Choose another location."
+        )
+    };
+    // An open database's own entry could not be looked at (its share went away, or
+    // it lost search permission). Still a refusal, but naming which one, by file name
+    // only: this sentence can reach a page in another window.
+    let held_unchecked = |held: &Path, e: io::Error| {
+        let held = held.file_name().map_or_else(|| "an open database".into(), |n| n.to_string_lossy());
+        format!(
+            "ERR_DESTINATION_UNCHECKED: SQLite Explorer could not check whether \"{name}\" is the \
+             open database \"{held}\" or one of its journal files ({e}), so it did not write there. \
+             Save under a name that does not exist yet, or close \"{held}\" (or make its folder \
+             reachable again) and try again."
+        )
+    };
+    let bytes = dest_name.as_encoded_bytes();
+    // Looked up only once a candidate exists, so a Save As under a new name never
+    // touches the volume an open database is on.
+    let mut open_ids: Option<Vec<(u64, u128)>> = None;
+    let mut journal_ids: Option<Vec<(u64, u128)>> = None;
+    let open_refusal = || {
+        format!(
+            "ERR_DESTINATION_OPEN: \"{name}\" is a database open in SQLite Explorer, or one of its \
+             journal files, so writing there would replace it. Choose another name (Save writes \
+             the open database itself)."
+        )
+    };
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let base = if suffix.is_empty() {
+            dest_name
+        } else {
+            let Some(cut) = journal_suffix_cut(bytes, suffix) else { continue };
+            // SAFETY: `cut` is immediately before the suffix's leading '-' just
+            // matched, an ASCII byte after a non-empty prefix, which is where an
+            // OsStr's encoded bytes may be split.
+            unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[..cut]) }
+        };
+        let candidate = match entry_identity(&folder.join(base)) {
+            Ok(id) => id,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Some(unchecked(e)),
+        };
+        if open_ids.is_none() {
+            let mut ids = Vec::with_capacity(held.len());
+            for path in held {
+                match entry_identity(path) {
+                    Ok(id) => ids.push(id),
+                    // Gone from its name since it was opened: nothing found at a
+                    // destination is that file.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Some(held_unchecked(path, e)),
+                }
+            }
+            open_ids = Some(ids);
+        }
+        if open_ids.as_ref().is_some_and(|ids| ids.contains(&candidate)) {
+            return Some(open_refusal());
+        }
+        // The destination's own entry exists: compare it with the journal files the
+        // open databases have now, whatever spelling it was reached by.
+        if suffix.is_empty() {
+            if journal_ids.is_none() {
+                let mut ids = Vec::new();
+                for path in held {
+                    let Some(held_name) = path.file_name() else { continue };
+                    for journal in ["-wal", "-shm", "-journal"] {
+                        let mut journal_name = held_name.to_os_string();
+                        journal_name.push(journal);
+                        match entry_identity(&path.with_file_name(journal_name)) {
+                            Ok(id) => ids.push(id),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                            Err(e) => return Some(held_unchecked(path, e)),
+                        }
+                    }
+                }
+                journal_ids = Some(ids);
+            }
+            if journal_ids.as_ref().is_some_and(|ids| ids.contains(&candidate)) {
+                return Some(open_refusal());
+            }
+        }
+    }
+    None
+}
+
+/// Why an export or Save As must not write `dest`: it is a database open in
+/// any window of this app, or that database's `-wal`, `-shm` or `-journal`;
+/// or a log SQLite would apply to it sits beside it (`crate::log_beside`).
+/// Writing over the first replaces a file an engine has open; a file under one
+/// of the others would be read as that database's journal on its next open;
+/// and a new file under a live or leftover log would be read with that log's
+/// pages, whether or not the program that wrote it is still running.
+pub(crate) fn destination_refusal(files: &OpenFiles, dest: &Path) -> Option<String> {
+    // A path with no final name names no file to check: refused, not let through.
+    let Some(dest_name) = dest.file_name() else {
+        return Some(format!("ERR_DESTINATION_UNCHECKED: {} names no file to write.", dest.display()));
+    };
+    let name = dest_name.to_string_lossy().into_owned();
+    let folder = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    // On Windows every rule below judges the name Win32 will write (`win32_final_name`).
+    #[cfg(windows)]
+    let written = match win32_final_name(dest_name) {
+        Ok(written) => written,
+        Err((code, why)) => return Some(format!("{code}: \"{name}\" {why}, so SQLite Explorer did not write there.")),
+    };
+    #[cfg(windows)]
+    let dest_name = written.as_os_str();
+    #[cfg(windows)]
+    let dest = &folder.join(dest_name);
+    // The held paths are copied out and the lock released before anything is
+    // stat-ed: set_unsaved_state takes this lock on the main thread, and a
+    // volume that stops answering must not freeze every window.
+    let held: Vec<PathBuf> = {
+        let mut inner = files.0.lock().unwrap();
+        inner.prune(Instant::now());
+        inner.holders.keys().cloned().collect()
+    };
+    // The name as written, and on Windows, when something is already there, its long
+    // name too: an 8.3 short name ("XDB-WA~1" for x.db-wal) names the same file but
+    // none of the spellings the rules match.
+    #[cfg(windows)]
+    let spellings = match destination_spellings(dest_name, crate::windows_file_info::long_name(dest)) {
+        Ok(spellings) => spellings,
+        Err(e) => {
+            return Some(format!(
+                "ERR_DESTINATION_UNCHECKED: SQLite Explorer could not read the long name of \"{name}\" ({e}), \
+                 so it did not write there. Choose another location."
+            ))
+        }
+    };
+    #[cfg(not(windows))]
+    let spellings = vec![dest_name.to_os_string()];
+    if let Some(refusal) = named_destination_refusal(&held, folder, &spellings, &name) {
+        return Some(refusal);
+    }
+    // After the open-files check, and reached whatever it found short of a
+    // refusal: an open database with a live WAL is named as the open one, not
+    // as a file some other program holds. Beside every spelling: an 8.3 short
+    // name's own log names are not the ones SQLite keeps for the long name.
+    let beside: Vec<PathBuf> =
+        std::iter::once(dest.to_path_buf()).chain(spellings.iter().skip(1).map(|spelling| folder.join(spelling))).collect();
+    destination_log_refusal(&beside, &name)
+}
+
+/// The refusal for a log SQLite would apply to a file written at any of `paths` (the
+/// destination under each spelling of its name), named for the user as `name`.
+fn destination_log_refusal(paths: &[PathBuf], name: &str) -> Option<String> {
+    for path in paths {
+        let log = match crate::log_beside_destination(path) {
+            Ok(log) => log,
+            Err(unchecked) => {
+                return Some(format!(
+                    "ERR_DESTINATION_UNCHECKED: SQLite Explorer could not check \"{name}\" for a log SQLite \
+                     would apply to the new file ({unchecked}), so it did not write there. Choose another \
+                     location."
+                ))
+            }
+        };
+        if let Some(log) = log {
+            let what = match log {
+                crate::LogBeside::Wal => "a -wal file holding frames",
+                crate::LogBeside::LiveWal => "a WAL log another program is writing",
+                crate::LogBeside::Journal => "a rollback journal",
+            };
+            return Some(format!(
+                "ERR_DESTINATION_HAS_LOG: \"{name}\" has {what} beside it, which SQLite would apply to \
+                 the new file the next time it is opened. Choose another name, or close the program that \
+                 has it open and try again."
+            ));
+        }
+    }
+    None
+}
+
+/// The rules a destination's name is judged by, for each spelling of it: as written,
+/// and on Windows its long name too (`destination_spellings`). The first refusal any
+/// spelling draws is the answer.
+fn named_destination_refusal(held: &[PathBuf], folder: &Path, spellings: &[std::ffi::OsString], name: &str) -> Option<String> {
+    for spelling in spellings {
+        if !held.is_empty() {
+            if let Some(refusal) = open_database_refusal(held, folder, spelling) {
+                return Some(refusal);
+            }
+        }
+        if let Some(refusal) = journal_name_refusal(folder, spelling, name) {
+            return Some(refusal);
+        }
+    }
+    None
+}
+
+/// The spellings a destination is judged by: `written`, and `long` (the long name
+/// of what is already at it, on Windows) when that is another. A long name that
+/// could not be read is the caller's to refuse.
+#[cfg(any(windows, test))]
+fn destination_spellings(
+    written: &std::ffi::OsStr,
+    long: io::Result<Option<std::ffi::OsString>>,
+) -> io::Result<Vec<std::ffi::OsString>> {
+    let mut spellings = vec![written.to_os_string()];
+    if let Some(long) = long? {
+        if long != written {
+            spellings.push(long);
+        }
+    }
+    Ok(spellings)
+}
+
+/// A name SQLite reads as a journal of the database whose name it starts with
+/// (x.db-wal is x.db's) is refused, whatever is open, when that database is there:
+/// whatever is written here is read as part of it the next time anything opens it.
+/// The suffix is matched by the open databases' spelling rule (`destination_refusal`
+/// runs that check first, so that an open one is still named as open), and the name
+/// it leaves is looked up by the volume, so the volume decides whether a spelling is
+/// there. Only nothing of that name, or something there that is not a file, admits;
+/// any other lookup failure refuses as unchecked.
+fn journal_name_refusal(folder: &Path, dest_name: &std::ffi::OsStr, name: &str) -> Option<String> {
+    let encoded = dest_name.as_encoded_bytes();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let Some(cut) = journal_suffix_cut(encoded, suffix) else { continue };
+        // SAFETY: `cut` is immediately before the suffix's leading '-', an ASCII
+        // byte after a non-empty prefix, which is where an OsStr's encoded bytes may
+        // be split.
+        let base = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&encoded[..cut]) };
+        let base_name = base.to_string_lossy();
+        // A regular file, or a link to one, is what SQLite could open as that database;
+        // a folder, a link to nothing, or anything else under the name is not.
+        let base_path = folder.join(base);
+        let database_there = match fs::symlink_metadata(&base_path) {
+            Ok(meta) if meta.file_type().is_symlink() => fs::metadata(&base_path).map(|target| target.is_file()),
+            Ok(meta) => Ok(meta.is_file()),
+            Err(e) => Err(e),
+        };
+        match database_there {
+            Ok(false) => {}
+            Ok(true) => {
+                return Some(format!(
+                    "ERR_DESTINATION_JOURNAL_NAME: \"{name}\" ends in {suffix} and \"{base_name}\" is beside it, \
+                     so SQLite would read a file written there as part of \"{base_name}\". Choose a name \
+                     without that ending."
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Some(format!(
+                    "ERR_DESTINATION_UNCHECKED: SQLite Explorer could not check whether \"{base_name}\" is \
+                     beside \"{name}\" ({e}), which SQLite would then read as its journal, so it did not \
+                     write there. Choose another location."
+                ))
+            }
+        }
+    }
+    None
+}
+
+/// A destination's final name as Win32 resolves it before any file system sees it:
+/// trailing dots and spaces dropped, and a trailing "::$DATA" (the file's own data
+/// stream, in any case) taken as the file itself, until neither applies. So
+/// "x.db-shm.", "x.db-journal " and "x.db-wal::$DATA" are those journal files. A name
+/// that is then empty names no file, and one that still has a ':' names an alternate
+/// data stream, never a sensible database; the `Err` carries the refusal's code and
+/// reason. Applied on Windows only, where it is what the write will name: on Unix
+/// those characters are part of the name, and a lookup of the normalized name would
+/// examine another file than the one written.
+#[cfg(any(windows, test))]
+fn win32_final_name(name: &std::ffi::OsStr) -> Result<std::ffi::OsString, (&'static str, &'static str)> {
+    const DATA_STREAM: &[u8] = b"::$DATA";
+    let mut bytes = name.as_encoded_bytes();
+    loop {
+        let before = bytes.len();
+        while let [rest @ .., b'.' | b' '] = bytes {
+            bytes = rest;
+        }
+        if bytes.len() >= DATA_STREAM.len() && bytes[bytes.len() - DATA_STREAM.len()..].eq_ignore_ascii_case(DATA_STREAM) {
+            bytes = &bytes[..bytes.len() - DATA_STREAM.len()];
+        }
+        if bytes.len() == before {
+            break;
+        }
+    }
+    if bytes.is_empty() {
+        return Err(("ERR_DESTINATION_UNCHECKED", "names no file once Windows drops its trailing dots and spaces"));
+    }
+    if bytes.contains(&b':') {
+        return Err(("ERR_DESTINATION_STREAM", "names a data stream inside a file (the part after ':'), not a file"));
+    }
+    // SAFETY: only ASCII bytes were cut, from the end, so what is left ends where an
+    // OsStr's encoded bytes may be split.
+    Ok(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(bytes) }.to_os_string())
+}
+
 /// Takes the native (shell-observed) hold on `canonical` for `window`, or
 /// refuses because someone already has the file open. Read-ONLY opens do not
 /// hold: several readers of one file cannot lose each other's work, and
@@ -1478,16 +2053,18 @@ fn claim_native_at(
 /// already has open, and otherwise takes the provisional hold that covers the
 /// gap until that window's first push.
 ///
-/// A resolution failure (the file vanished, a permission error mid-path)
-/// yields `Ok(())` with no hold: this function only ever ADDS a refusal, and
-/// the read it guards fails on its own if the path is unusable.
+/// A file gone from its name yields `Ok(())` with no hold: the read it guards
+/// fails on its own. One whose location cannot be resolved is refused by name
+/// (`crate::resolved_for_guard`): it could not be held, so it is not read unguarded.
 pub(crate) fn hold_for_read(
     files: &OpenFiles,
     requested: &Path,
     window: &str,
 ) -> Result<(), String> {
-    let Ok(canonical) = fs::canonicalize(requested) else {
-        return Ok(());
+    let canonical = match crate::resolve_for_guard(requested) {
+        crate::Resolved::Canonical(canonical) => canonical,
+        crate::Resolved::Missing => return Ok(()),
+        crate::Resolved::Unresolvable(sentence) => return Err(sentence),
     };
     hold_for_read_at(files, &canonical, window, Instant::now())
 }
@@ -1527,6 +2104,50 @@ fn hold_for_read_at(
     }
 }
 
+/// The WebAssembly read's gate, in the order its refusals must reach the user. A file
+/// another window has open is named as that first: when that window holds it natively,
+/// its own sidecar is what keeps the log beside the file, so "a -wal file holding
+/// frames" would send the user to close a program that is SQLite Explorer itself. That
+/// look claims nothing. Then a log beside the file, and only then the hold, so a read
+/// refused for a log claims nothing another window would then wait out.
+pub(crate) fn admit_wasm_read(files: &OpenFiles, requested: &Path, window: &str) -> Result<(), String> {
+    refuse_if_open_elsewhere(files, requested, window)?;
+    if let Some(refusal) = crate::snapshot_refusal(requested) {
+        return Err(refusal);
+    }
+    hold_for_read(files, requested, window)
+}
+
+/// `hold_for_read`'s refusal without its hold. The path is resolved before the lock is
+/// taken and the lock is released before anything is stat-ed: `set_unsaved_state`
+/// takes it on the main thread. Like `hold_for_read`, a file gone from its name adds
+/// no refusal (the read it guards fails on its own), and one whose location cannot be
+/// resolved is refused by name.
+fn refuse_if_open_elsewhere(files: &OpenFiles, requested: &Path, window: &str) -> Result<(), String> {
+    let canonical = match crate::resolve_for_guard(requested) {
+        crate::Resolved::Canonical(canonical) => canonical,
+        crate::Resolved::Missing => return Ok(()),
+        crate::Resolved::Unresolvable(sentence) => return Err(sentence),
+    };
+    refuse_if_open_elsewhere_at(files, &canonical, window, Instant::now())
+}
+
+fn refuse_if_open_elsewhere_at(
+    files: &OpenFiles,
+    canonical: &Path,
+    window: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let inner = files.0.lock().unwrap();
+    match inner.holders.get(canonical) {
+        // An expired provisional hold refuses nothing, pruned or not.
+        Some(holder) if holder.window != window && holder.live_at(now) => {
+            Err(already_open_error(canonical, &holder.window, window))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Installs `window`'s reported open-path set WHOLESALE, replacing whatever
 /// it reported before. This is what makes a close release itself: a database
 /// the page no longer lists is simply not in the new set.
@@ -1535,14 +2156,24 @@ fn hold_for_read_at(
 /// page must not be able to squat on a file someone else has open) nor to
 /// release it. Never touches the `native` flag either, in either direction.
 ///
-/// Returns the number of spellings actually installed, or `Err` for a push
-/// that was rejected whole (see `MAX_REPORTED_OPEN_PATHS`).
+/// Returns what was installed, or `Err` for a push that was rejected whole (see
+/// `MAX_REPORTED_OPEN_PATHS`).
 pub(crate) fn sync_reported(
     files: &OpenFiles,
     window: &str,
     spellings: &[PathBuf],
-) -> Result<usize, String> {
+) -> Result<Synced, String> {
     sync_reported_at(files, window, spellings, Instant::now())
+}
+
+/// What a push installed: how many spellings, and the ones whose location could not
+/// be resolved, with the sentence the user is told (`crate::resolved_for_guard`).
+#[derive(Debug)]
+pub(crate) struct Synced {
+    /// Read by the tests, which measure a push by it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) installed: usize,
+    pub(crate) unresolvable: Vec<(PathBuf, String)>,
 }
 
 fn sync_reported_at(
@@ -1550,7 +2181,8 @@ fn sync_reported_at(
     window: &str,
     spellings: &[PathBuf],
     now: Instant,
-) -> Result<usize, String> {
+) -> Result<Synced, String> {
+    let mut unresolvable: Vec<(PathBuf, String)> = Vec::new();
     if spellings.len() > MAX_REPORTED_OPEN_PATHS {
         return Err(format!(
             "a window reported {} open databases, over the {MAX_REPORTED_OPEN_PATHS} cap; \
@@ -1561,20 +2193,20 @@ fn sync_reported_at(
     let mut inner = files.0.lock().unwrap();
     inner.prune(now);
     // Resolve through the previous push's spellings first, so a steady state
-    // costs no `realpath` at all. A spelling that cannot be resolved is
-    // dropped: it names no file, so it can collide with nothing.
+    // costs no `realpath` at all. A spelling gone from its name is dropped: it
+    // names no file, so it can collide with nothing. One whose location cannot be
+    // resolved is dropped too, since it cannot be keyed, and handed back so the
+    // user is told that file is not guarded.
     let previous = inner.reported.remove(window).unwrap_or_default();
     let mut current: HashMap<PathBuf, PathBuf> = HashMap::with_capacity(spellings.len());
     for spelling in spellings {
         let canonical = match previous.get(spelling) {
             Some(cached) => cached.clone(),
-            None => match fs::canonicalize(spelling) {
-                Ok(canonical) => canonical,
-                Err(e) => {
-                    eprintln!(
-                        "[open-files] {window} reported {} as open but it cannot be resolved ({e}); ignoring it",
-                        spelling.display()
-                    );
+            None => match crate::resolve_for_guard(spelling) {
+                crate::Resolved::Canonical(canonical) => canonical,
+                crate::Resolved::Missing => continue,
+                crate::Resolved::Unresolvable(sentence) => {
+                    unresolvable.push((spelling.clone(), sentence));
                     continue;
                 }
             },
@@ -1622,7 +2254,7 @@ fn sync_reported_at(
     }
     let installed = current.len();
     inner.reported.insert(window.to_string(), current);
-    Ok(installed)
+    Ok(Synced { installed, unresolvable })
 }
 
 /// Drops every PAGE hold a window has, leaving its native holds alone.
@@ -1681,7 +2313,7 @@ pub(crate) fn refuse_second_opener(path: &Path, owner: &str, here: &str) -> Stri
 pub(crate) type DbId = String;
 
 /// Process-monotonic source of `DbId`s. Deliberately process-global rather
-/// than per-registry: Task 5 splits the registry per window, and ids that
+/// than per-registry: the registry is split per window, and ids that
 /// stay unique across every registry mean a leaked or stale id can never
 /// resolve in a DIFFERENT window's registry. Uniqueness is the requirement,
 /// not unpredictability — the id is an authorisation *reference*, not a
@@ -1711,7 +2343,23 @@ pub(crate) fn next_db_id() -> DbId {
 /// for no practical gain. Exit cost does not enter into it — `shutdown_all`
 /// fans the reaps out, so quitting costs ~one grace period at any N.
 ///
-/// PER WINDOW, not app-wide (Task 5 ruling). Two reasons, in order:
+/// Native transfers leave this bound as it is: every piece is one frame of at
+/// most MAX_FRAME_BYTES. Their memory is inside each sidecar process, one
+/// transfer per connection of at most MAX_TRANSFER_UNITS (2^28) UTF-16 units of
+/// JSON text, freed on commit, on the first frame that does not continue it, and
+/// at exit. Holding the text is the small part (512 MiB as two-byte JS strings,
+/// derived); decoding it is not. The review measured tjs at about 45 bytes per
+/// character of object-dense JSON after JSON.parse, and about 93 with the decode's
+/// copy (synthetic `[[],[],…]` text, not a real payload): about 11 to 23 GiB for
+/// one sidecar decoding a request at the 2^28-unit ceiling, against about 0.7 to
+/// 1.4 GiB for one 16 MiB frame. Reaching it needs a compromised page, which can
+/// push such a request to every sidecar it opens and then send the invoke that
+/// decodes it: local memory exhaustion of the sidecars and the machine, with no
+/// file read or written. The shell's own 1 GiB buffering bound above is
+/// unchanged; the shell does not bound sidecar memory, which a page could already
+/// grow with SQL alone.
+///
+/// PER WINDOW, not app-wide. Two reasons, in order:
 ///   1. The host's own `MAX_OPEN_DATABASES = 16` is per registry, and a
 ///      registry is per window — so an app-wide shell cap would refuse an
 ///      open the page believes it has room for ("16 databases are already
@@ -1756,7 +2404,7 @@ struct Registry {
 
 /// The registry of open sidecars for ONE window: N entries, each keyed by the
 /// DbId the shell issued for it. Kept as a plain value (not a hidden global)
-/// precisely so Task 5 could put one of these behind every window label
+/// precisely so one of these could sit behind every window label
 /// without touching the routing code — `lib.rs`'s `Windows` map owns the
 /// per-window instances, and every command resolves the one belonging to the
 /// window that sent it (the label comes from Tauri's own webview identity,
@@ -1797,7 +2445,7 @@ fn shutdown_handle(handle: SidecarHandle, reason: &str) {
 ///    only dialog picks and OS-delivered opens feed (`assert_allowlisted`,
 ///    the same gate `read_database_bytes` uses). The webview can never
 ///    introduce a new path here.
-/// 2. The path is canonicalised for the argv binding (Task 4's layer-2
+/// 2. The path is canonicalised for the argv binding (layer 2's
 ///    contract: "the shell canonicalises; the sidecar does not normalise").
 /// 3. The FINAL component must not be a symlink: an rw sidecar session
 ///    writes through the real file, and the shell's own save path
@@ -2591,6 +3239,7 @@ fn export_table_default_name(args: &serde_json::Value) -> String {
 /// `{success:true, savedAs}` on success; real failures are structured Errs.
 fn export_command(
     app: &AppHandle,
+    window: &tauri::Window,
     core: &SidecarCore,
     method: &str,
     args: Option<serde_json::Value>,
@@ -2599,15 +3248,12 @@ fn export_command(
     // No dialog for a database whose file was replaced underneath the sidecar:
     // the export would copy the orphaned inode. The page retires it on this.
     assert_file_current(core)?;
-    let picked = app
-        .dialog()
-        .file()
-        .set_file_name(default_name)
-        .blocking_save_file();
-    let Some(picked) = picked else {
+    let Some(dest) = crate::file_dialog(app, window).set_file_name(default_name).blocking_save_file()? else {
         return Ok(serde_json::json!({ "success": false }));
     };
-    let dest = picked.into_path().map_err(|e| e.to_string())?;
+    if let Some(refusal) = destination_refusal(&app.state::<OpenFiles>(), &dest) {
+        return Err(refusal);
+    }
     let saved_as = export_to_dest(core, method, args, &dest, EXPORT_TIMEOUT)?;
     Ok(serde_json::json!({ "success": true, "savedAs": saved_as }))
 }
@@ -2730,7 +3376,7 @@ pub(crate) async fn native_export_database(
         .and_then(|n| n.to_str())
         .unwrap_or("export")
         .to_string();
-    crate::blocking(move || export_command(&app, &core, "exportDatabase", None, &default_name)).await
+    crate::blocking(move || export_command(&app, &window, &core, "exportDatabase", None, &default_name)).await
 }
 
 /// Table export to a dialog-picked destination. `args_json` is the worker's
@@ -2759,7 +3405,7 @@ pub(crate) async fn native_export_table(
     }
     let default_name = export_table_default_name(&args);
     crate::blocking(move || {
-        export_command(&app, &core, "exportTable", Some(args), &default_name)
+        export_command(&app, &window, &core, "exportTable", Some(args), &default_name)
     })
     .await
 }
@@ -2773,15 +3419,664 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Cross-language byte fixture, vendored VERBATIM from the upstream repo:
-    ///   SQLite-Explorer desktop-target tests/fixtures/native-frames.{bin,json}
-    ///   @ commit 6540fdf (canonical source; generated by
-    ///   `npm run native-frame-fixture`, staleness-guarded by upstream tests).
-    /// REFRESH: re-copy both files from that path whenever upstream
-    /// regenerates them, and re-run this suite — these are the exact bytes
-    /// the JS codec emits, so a divergence here is a wire break.
-    const FIXTURE_BIN: &[u8] = include_bytes!("../tests/fixtures/native-frames.bin");
-    const FIXTURE_JSON: &str = include_str!("../tests/fixtures/native-frames.json");
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_symlink_is_judged_by_its_own_name() {
+        // The write replaces the link itself, so the new file's logs are the
+        // ones beside the link's name, not beside its target's.
+        let dir = std::env::temp_dir().join(format!("sqx-dest-link-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let files = OpenFiles::default();
+        fs::write(dir.join("target.sqlite"), b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("target.sqlite-wal"), [0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(dir.join("target.sqlite"), dir.join("link.sqlite")).unwrap();
+        assert_eq!(destination_refusal(&files, &dir.join("link.sqlite")), None, "the target's log is not the new file's");
+        fs::write(dir.join("link.sqlite-wal"), [0u8; 4096]).unwrap();
+        assert!(destination_refusal(&files, &dir.join("link.sqlite")).is_some_and(|r| r.starts_with("ERR_DESTINATION_HAS_LOG")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_destination_check_stats_no_folder_under_the_registry_lock() {
+        // set_unsaved_state takes the same lock on the main thread: a folder on
+        // a volume that stops answering must not freeze every window.
+        let source = include_str!("native.rs");
+        let body = source.split("pub(crate) fn destination_refusal").nth(1).expect("destination_refusal");
+        let body = &body[..body.find("\n}\n").expect("end")];
+        let released = body.find("holders.keys().cloned().collect()").expect("the held paths are copied out under the lock");
+        let stat = body.find("named_destination_refusal(").expect("the open databases are compared");
+        let long = body.find("long_name(").expect("the long name is read");
+        assert!(released < stat && released < long, "nothing is stat-ed until the lock is released");
+        assert!(!body[..released].contains("identity("), "nothing is stat-ed under the lock");
+    }
+
+    #[test]
+    fn an_export_never_writes_beside_a_log_sqlite_would_apply_to_it() {
+        // Not open here, but a -wal holding frames or a live journal sits
+        // beside the destination: SQLite's next open would apply it to the new
+        // file, whether a program still has it open or it is a crash leftover.
+        let dir = std::env::temp_dir().join(format!("sqx-dest-log-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let files = OpenFiles::default();
+        let dest = dir.join("other.sqlite");
+        fs::write(&dest, b"SQLite format 3\0").unwrap();
+        assert_eq!(destination_refusal(&files, &dest), None, "no log");
+        fs::write(dir.join("other.sqlite-wal"), [0u8; 32]).unwrap();
+        assert_eq!(destination_refusal(&files, &dest), None, "a WAL header alone");
+        fs::write(dir.join("other.sqlite-wal"), [0u8; 4096]).unwrap();
+        assert!(destination_refusal(&files, &dest).is_some_and(|r| r.starts_with("ERR_DESTINATION_HAS_LOG")));
+        fs::remove_file(dir.join("other.sqlite-wal")).unwrap();
+        let mut hot = vec![0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+        hot.resize(512, 0);
+        // A destination that does not exist yet, with a journal left beside its name.
+        fs::write(dir.join("fresh.sqlite-journal"), &hot).unwrap();
+        assert!(destination_refusal(&files, &dir.join("fresh.sqlite")).is_some_and(|r| r.starts_with("ERR_DESTINATION_HAS_LOG")));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_export_never_writes_over_an_open_database_or_its_journals() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("db.sqlite");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        let canonical = fs::canonicalize(&db).unwrap();
+        let files = OpenFiles::default();
+        let hold = claim_native(&files, &canonical, "main").unwrap();
+
+        for name in ["db.sqlite", "db.sqlite-wal", "db.sqlite-shm", "db.sqlite-journal"] {
+            let refusal = destination_refusal(&files, &dir.join(name));
+            assert!(refusal.as_deref().is_some_and(|r| r.contains("open in SQLite Explorer")), "{name}: {refusal:?}");
+        }
+        // Another case is the same file only where the volume folds case.
+        let folds = fs::symlink_metadata(dir.join("DB.SQLITE")).is_ok();
+        let refusal = destination_refusal(&files, &dir.join("DB.SQLITE-Journal"));
+        assert_eq!(refusal.as_deref().is_some_and(|r| r.contains("open in SQLite Explorer")), folds, "{refusal:?}");
+        for name in ["db.sqlite.csv", "other.sqlite", "db.sqlite-wal.bak"] {
+            assert_eq!(destination_refusal(&files, &dir.join(name)), None, "{name}");
+        }
+        // An open database with a live WAL is still named as the open one,
+        // not as a file some other program holds.
+        fs::write(dir.join("db.sqlite-wal"), [0u8; 4096]).unwrap();
+        assert!(destination_refusal(&files, &db).is_some_and(|r| r.starts_with("ERR_DESTINATION_OPEN")));
+        fs::remove_file(dir.join("db.sqlite-wal")).unwrap();
+        // The same name in another folder is another file.
+        let elsewhere = dir.join("sub");
+        fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(destination_refusal(&files, &elsewhere.join("db.sqlite")), None);
+        // …and a log beside it is still found while a database is open.
+        fs::write(elsewhere.join("db.sqlite-wal"), [0u8; 4096]).unwrap();
+        assert!(destination_refusal(&files, &elsewhere.join("db.sqlite")).is_some_and(|r| r.starts_with("ERR_DESTINATION_HAS_LOG")));
+        fs::remove_file(elsewhere.join("db.sqlite-wal")).unwrap();
+
+        drop(hold);
+        assert_eq!(destination_refusal(&files, &db), None, "a closed database is not refused");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The volume decides which spellings name one file: on a case-insensitive
+    /// volume (APFS's default, NTFS) "É.db" and "é.db" are one file, and
+    /// APFS treats a name's NFC and NFD spellings as one as well. The
+    /// expectation is read from the volume itself, so the test holds on a
+    /// volume that folds neither.
+    #[test]
+    fn an_open_database_is_refused_under_every_spelling_its_volume_resolves_to_it() {
+        let root = std::env::temp_dir().join(format!("sqx-dest-fold-{}-{}", std::process::id(), line!()));
+        let files = OpenFiles::default();
+        // (the open database, then destinations and the database name each one's
+        // journal suffix leaves)
+        let cases: [(&str, &[(&str, &str)]); 2] = [
+            ("\u{c9}.db", &[("\u{e9}.db", "\u{e9}.db"), ("\u{e9}.db-wal", "\u{e9}.db"), ("\u{e9}.DB-Journal", "\u{e9}.DB")]),
+            ("\u{e9}.db", &[("e\u{301}.db", "e\u{301}.db"), ("e\u{301}.db-shm", "e\u{301}.db")]),
+        ];
+        let mut wrong = Vec::new();
+        for (i, (open, destinations)) in cases.iter().enumerate() {
+            let dir = root.join(i.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            let db = dir.join(open);
+            fs::write(&db, b"SQLite format 3\0").unwrap();
+            let hold = claim_native(&files, &fs::canonicalize(&db).unwrap(), "main").unwrap();
+            for (name, base) in destinations.iter() {
+                let same_file = fs::symlink_metadata(dir.join(base)).is_ok();
+                let refusal = destination_refusal(&files, &dir.join(name));
+                // Not refused means no refusal at all, not merely not this one: where the
+                // volume does not make the name the open database's, nothing of the name
+                // a journal suffix leaves is there either.
+                let right = if same_file {
+                    refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_OPEN"))
+                } else {
+                    refusal.is_none()
+                };
+                if !right {
+                    wrong.push(format!("{open:?} open, {name:?} picked (same file: {same_file}): {refusal:?}"));
+                }
+            }
+            drop(hold);
+        }
+        fs::remove_dir_all(&root).unwrap();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A journal file that exists is matched by identity under every spelling the
+    /// volume resolves to it: APFS folds U+017F (long s) onto s, so "x.db-ſhm"
+    /// names the live "x.db-shm", and a Save As there would replace the wal-index
+    /// another connection is using. A journal name that does not exist yet is
+    /// matched by spelling: any ASCII case, and U+017F for an s.
+    #[test]
+    fn a_destination_resolving_to_an_open_databases_journal_is_refused_in_any_spelling() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-journal-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("x.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        let files = OpenFiles::default();
+        let _hold = claim_native(&files, &fs::canonicalize(&db).unwrap(), "main").unwrap();
+        let open = |name: &str| {
+            destination_refusal(&files, &dir.join(name)).is_some_and(|r| r.starts_with("ERR_DESTINATION_OPEN"))
+        };
+        let long_s = "x.db-\u{17f}hm";
+
+        // No -shm yet: still refused, under the long-s spelling too, so that a
+        // connection opening the database in WAL mode while the write is under
+        // way cannot have its new -shm replaced through that spelling.
+        assert!(open(long_s), "the long-s spelling of -shm before a -shm exists");
+        assert!(open("x.db-SHM") && open("x.db-shm"), "an ASCII spelling of the suffix");
+        assert!(open("x.db-\u{17f}HM"), "long s with the rest of the suffix in another case");
+        assert_eq!(destination_refusal(&files, &dir.join("x.db-\u{17f}")), None, "not a journal suffix");
+
+        fs::write(dir.join("x.db-shm"), [0u8; 32768]).unwrap();
+        // Refused on every volume: where the volume folds it (APFS) it is the
+        // live -shm, matched by identity; where it does not (ext4), it is
+        // refused by spelling, the safe way to be wrong, as x.db-WAL is.
+        assert!(open(long_s), "the long-s spelling of a live -shm");
+        assert!(open("x.db-SHM") && open("x.db-shm"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only "no such file" says a destination is not an open database. Any
+    /// other answer, here a folder this user cannot search, refuses rather
+    /// than writes unchecked.
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_that_cannot_be_checked_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sqx-dest-unchecked-{}-{}", std::process::id(), line!()));
+        let locked = dir.join("locked");
+        fs::create_dir_all(locked.join("sub")).unwrap();
+        let db = dir.join("open.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        let files = OpenFiles::default();
+        let _hold = claim_native(&files, &fs::canonicalize(&db).unwrap(), "main").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::symlink_metadata(locked.join("sub").join("open.db")).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+        let refusal = destination_refusal(&files, &locked.join("sub").join("open.db"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        if !denied {
+            eprintln!("a mode-000 folder is searchable here (root?); unchecked-destination test skipped");
+            return;
+        }
+        assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_UNCHECKED")), "{refusal:?}");
+    }
+
+    /// Only "no such file" says there is no log beside a destination. A log there that
+    /// cannot be opened, or a folder that cannot be resolved, refuses the write as
+    /// unchecked.
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_whose_logs_cannot_be_looked_at_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sqx-dest-log-unchecked-{}-{}", std::process::id(), line!()));
+        let locked = dir.join("locked");
+        fs::create_dir_all(locked.join("sub")).unwrap();
+        let files = OpenFiles::default();
+        let dest = dir.join("other.sqlite");
+        let mut header = b"SQLite format 3\0".to_vec();
+        header.resize(100, 0);
+        header[18] = 1;
+        header[19] = 1;
+        fs::write(&dest, &header).unwrap();
+        let wal = dir.join("other.sqlite-wal");
+        fs::write(&wal, [0u8; 4152]).unwrap();
+        fs::set_permissions(&wal, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::File::open(&wal).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied)
+            && fs::canonicalize(locked.join("sub")).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+        let beside_log = destination_refusal(&files, &dest);
+        let in_locked = destination_refusal(&files, &locked.join("sub").join("new.sqlite"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&wal, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        // Not enforced for root: the cases would prove nothing.
+        assert!(denied, "mode 000 is not enforced here");
+        assert!(
+            beside_log.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_UNCHECKED") && r.contains("other.sqlite-wal")),
+            "{beside_log:?}"
+        );
+        assert!(in_locked.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_UNCHECKED")), "{in_locked:?}");
+    }
+
+    /// An open database whose own entry cannot be looked at (its share went
+    /// away, or it lost search permission) still fails closed, but the refusal
+    /// names WHICH database, by file name only, and what to do.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreachable_open_database_is_named_in_the_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sqx-dest-held-unreachable-{}-{}", std::process::id(), line!()));
+        let locked = dir.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        let far = locked.join("far.db");
+        fs::write(&far, b"SQLite format 3\0").unwrap();
+        let existing = dir.join("existing.db");
+        fs::write(&existing, b"SQLite format 3\0").unwrap();
+        let files = OpenFiles::default();
+        let _hold = claim_native(&files, &fs::canonicalize(&far).unwrap(), "main").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::symlink_metadata(&far).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+        let refusal = destination_refusal(&files, &existing);
+        let fresh = destination_refusal(&files, &dir.join("new.db"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        if !denied {
+            eprintln!("a mode-000 folder is searchable here (root?); unreachable-database test skipped");
+            return;
+        }
+        let refusal = refusal.expect("fails closed");
+        assert!(refusal.starts_with("ERR_DESTINATION_UNCHECKED"), "{refusal}");
+        assert!(refusal.contains("\"far.db\"") && refusal.contains("\"existing.db\""), "{refusal}");
+        assert!(!refusal.contains(&*locked.to_string_lossy()), "names the file, never its path: {refusal}");
+        // A name that does not exist yet needs no look at the open databases.
+        assert_eq!(fresh, None);
+    }
+
+    /// A name ending in a journal suffix is refused, whatever is open, when the name it
+    /// starts with is a regular file, or a link to one: SQLite reads such a file as that
+    /// database's journal. With nothing of that name beside it, or a folder, or a link
+    /// to nothing, it is a file like any other ("trip-journal" with no "trip", and
+    /// "notes-journal" beside a folder "notes"). Every spelling the suffix match takes
+    /// is covered (any ASCII case, U+017F for an s); whether "X.DB" names x.db is the
+    /// volume's to say.
+    #[test]
+    fn a_destination_named_like_a_journal_is_refused_when_its_database_is_there() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-journal-name-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let files = OpenFiles::default();
+        let journal_named = ["x.db-wal", "x.db-shm", "x.db-journal", "x.db-JOURNAL", "x.db-\u{17f}hm"];
+        let mut wrong = Vec::new();
+        let expect = |name: &str, base_there: bool, wrong: &mut Vec<String>| {
+            let refusal = destination_refusal(&files, &dir.join(name));
+            let right = if base_there {
+                refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_JOURNAL_NAME"))
+            } else {
+                refusal.is_none()
+            };
+            if !right {
+                wrong.push(format!("{name} (base there: {base_there}): {refusal:?}"));
+            }
+        };
+        // Nothing at x.db, then a file, then a folder.
+        for make in [None, Some(false), Some(true)] {
+            match make {
+                Some(false) => fs::write(dir.join("x.db"), b"SQLite format 3\0").unwrap(),
+                Some(true) => fs::create_dir(dir.join("x.db")).unwrap(),
+                None => {}
+            }
+            let a_file = make == Some(false);
+            for name in journal_named {
+                expect(name, a_file, &mut wrong);
+            }
+            expect("X.DB-WAL", a_file && fs::symlink_metadata(dir.join("X.DB")).is_ok(), &mut wrong);
+            for name in ["x.db-wal.bak", "x.db-\u{17f}", "-wal", "x.db-walnut"] {
+                expect(name, false, &mut wrong);
+            }
+            match make {
+                Some(false) => fs::remove_file(dir.join("x.db")).unwrap(),
+                Some(true) => fs::remove_dir(dir.join("x.db")).unwrap(),
+                None => {}
+            }
+        }
+        // A link counts as what it points to: a file, a folder, or nothing.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("x.db")).unwrap();
+            expect("x.db-wal", false, &mut wrong);
+            fs::write(dir.join("target.db"), b"SQLite format 3\0").unwrap();
+            fs::remove_file(dir.join("x.db")).unwrap();
+            std::os::unix::fs::symlink(dir.join("target.db"), dir.join("x.db")).unwrap();
+            expect("x.db-wal", true, &mut wrong);
+            fs::create_dir(dir.join("notes")).unwrap();
+            std::os::unix::fs::symlink(dir.join("notes"), dir.join("folder-link")).unwrap();
+            expect("folder-link-journal", false, &mut wrong);
+        }
+        // A plain file of the base name, whatever it holds, could be opened as a database.
+        fs::write(dir.join("trip"), b"a text file").unwrap();
+        expect("trip-wal", true, &mut wrong);
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A base name that cannot be looked up is not known to be absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_named_destination_whose_database_cannot_be_looked_up_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("sqx-dest-journal-locked-{}-{}", std::process::id(), line!()));
+        let locked = dir.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let denied = fs::symlink_metadata(locked.join("x.db")).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied);
+        let refusal = destination_refusal(&OpenFiles::default(), &locked.join("x.db-wal"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        // Not enforced for root: the case would prove nothing.
+        assert!(denied, "a mode-000 folder is searchable here");
+        assert!(
+            refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_UNCHECKED") && r.contains("\"x.db\"")),
+            "{refusal:?}"
+        );
+    }
+
+    /// The name Win32 will write, from the name a destination was picked by. Run on
+    /// every platform; applied by `destination_refusal` on Windows only.
+    #[test]
+    fn a_destination_name_is_normalized_as_win32_resolves_it() {
+        use std::ffi::{OsStr, OsString};
+        let written = |name: &str| win32_final_name(OsStr::new(name));
+        for (picked, name) in [
+            ("x.db-shm.", "x.db-shm"),
+            ("x.db-journal ", "x.db-journal"),
+            ("x.db-wal::$DATA", "x.db-wal"),
+            ("x.db-WAL::$data", "x.db-WAL"),
+            ("x.db-wal. ::$DATA . ", "x.db-wal"),
+            ("\u{e9}.db-shm..", "\u{e9}.db-shm"),
+            ("x.db", "x.db"),
+            (".x.db", ".x.db"),
+        ] {
+            assert_eq!(written(picked), Ok(OsString::from(name)), "{picked:?}");
+        }
+        for (picked, code) in [
+            ("...", "ERR_DESTINATION_UNCHECKED"),
+            (" . ", "ERR_DESTINATION_UNCHECKED"),
+            ("::$DATA", "ERR_DESTINATION_UNCHECKED"),
+            ("x.db:evil", "ERR_DESTINATION_STREAM"),
+            ("x.db-wal:s:$DATA", "ERR_DESTINATION_STREAM"),
+            ("x.db::$INDEX_ALLOCATION", "ERR_DESTINATION_STREAM"),
+        ] {
+            assert_eq!(written(picked).map_err(|(code, _)| code), Err(code), "{picked:?}");
+        }
+    }
+
+    /// On Windows a journal file reached by a spelling Win32 resolves to it is refused
+    /// like the journal file itself, and a stream name is refused outright.
+    #[cfg(windows)]
+    #[test]
+    fn win32_spellings_of_journal_files_are_refused_on_windows() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-win32-names-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("x.db"), b"SQLite format 3\0").unwrap();
+        let files = OpenFiles::default();
+        let code = |name: &str| destination_refusal(&files, &dir.join(name)).map(|r| r[..r.find(':').unwrap()].to_string());
+        let mut wrong = Vec::new();
+        for (name, want) in [
+            ("x.db-journal ", "ERR_DESTINATION_JOURNAL_NAME"),
+            ("x.db-WAL::$DATA", "ERR_DESTINATION_JOURNAL_NAME"),
+            ("x.db-shm.", "ERR_DESTINATION_JOURNAL_NAME"),
+            ("x.db:evil", "ERR_DESTINATION_STREAM"),
+            ("...", "ERR_DESTINATION_UNCHECKED"),
+        ] {
+            if code(name).as_deref() != Some(want) {
+                wrong.push(format!("{name:?} (x.db not open): {:?}", code(name)));
+            }
+        }
+        // Open, with its -shm there: the journal by identity, the database by its own.
+        fs::write(dir.join("x.db-shm"), [0u8; 32768]).unwrap();
+        let hold = claim_native(&files, &fs::canonicalize(dir.join("x.db")).unwrap(), "main").unwrap();
+        for name in ["x.db-shm.", "x.db-SHM::$DATA", "x.db.", "x.db::$DATA"] {
+            if code(name).as_deref() != Some("ERR_DESTINATION_OPEN") {
+                wrong.push(format!("{name:?} (x.db open): {:?}", code(name)));
+            }
+        }
+        drop(hold);
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The read hold refuses a file it cannot key on its own, not only behind the read
+    /// gate's first look: a link whose target is gone is there but has no location.
+    #[cfg(unix)]
+    #[test]
+    fn the_read_hold_refuses_a_file_it_cannot_key() {
+        let dir = std::env::temp_dir().join(format!("sqx-hold-unresolvable-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone.db"), dir.join("x.db")).unwrap();
+        let held = hold_for_read(&OpenFiles::default(), &dir.join("x.db"), "main");
+        let absent = hold_for_read(&OpenFiles::default(), &dir.join("absent.db"), "main");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(held.as_ref().is_err_and(|r| r.starts_with("ERR_FILE_MISSING")), "{held:?}");
+        assert_eq!(absent, Ok(()), "a name that is not there adds no refusal: the read fails on its own");
+    }
+
+    /// The spellings a destination is judged by, and that any of them can draw the
+    /// refusal: here the 8.3 short name of x.db-wal, which matches no rule, and its long
+    /// name, which does. Run on every platform; the Windows-only tests below use real
+    /// short names.
+    #[test]
+    fn a_destination_is_judged_by_every_spelling_of_its_name() {
+        use std::ffi::{OsStr, OsString};
+        let short = OsStr::new("XDBWAL~1");
+        assert_eq!(destination_spellings(short, Ok(None)).unwrap(), vec![OsString::from("XDBWAL~1")]);
+        assert_eq!(
+            destination_spellings(short, Ok(Some(OsString::from("x.db-wal")))).unwrap(),
+            vec![OsString::from("XDBWAL~1"), OsString::from("x.db-wal")]
+        );
+        assert_eq!(destination_spellings(OsStr::new("x.db"), Ok(Some(OsString::from("x.db")))).unwrap().len(), 1);
+        assert!(destination_spellings(short, Err(io::Error::from_raw_os_error(5))).is_err());
+        let dir = std::env::temp_dir().join(format!("sqx-dest-spellings-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("x.db"), b"SQLite format 3\0").unwrap();
+        let both = named_destination_refusal(&[], &dir, &[OsString::from("XDBWAL~1"), OsString::from("x.db-wal")], "XDBWAL~1");
+        let short_only = named_destination_refusal(&[], &dir, &[OsString::from("XDBWAL~1")], "XDBWAL~1");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(both.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_JOURNAL_NAME")), "{both:?}");
+        assert_eq!(short_only, None);
+    }
+
+    /// The log check looks beside every spelling of the destination: here an 8.3 short
+    /// name, beside which nothing is, and the long name of a closed database whose -wal
+    /// holds frames. Run on every platform.
+    #[test]
+    fn a_log_beside_any_spelling_of_a_destination_refuses_it() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-log-spellings-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("long name.db"), b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("long name.db-wal"), [0u8; 4096]).unwrap();
+        let both = destination_log_refusal(&[dir.join("LONGNA~1.DB"), dir.join("long name.db")], "LONGNA~1.DB");
+        let short_only = destination_log_refusal(&[dir.join("LONGNA~1.DB")], "LONGNA~1.DB");
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(both.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_HAS_LOG")), "{both:?}");
+        assert_eq!(short_only, None);
+    }
+
+    /// The 8.3 short name of a closed database whose -wal holds frames is refused like
+    /// the database's own name. A volume that makes no short names is skipped, said.
+    #[cfg(windows)]
+    #[test]
+    fn an_8_3_name_of_a_database_with_a_log_is_refused_on_windows() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-short-log-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("long database name.sqlite");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("long database name.sqlite-wal"), [0u8; 4096]).unwrap();
+        let short = crate::windows_file_info::short_name(&db).unwrap().expect("the database is there");
+        if short.eq_ignore_ascii_case("long database name.sqlite") {
+            fs::remove_dir_all(&dir).unwrap();
+            eprintln!("skipped: this volume makes no 8.3 names");
+            return;
+        }
+        let refusal = destination_refusal(&OpenFiles::default(), &dir.join(&short));
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_HAS_LOG")), "{short:?}: {refusal:?}");
+    }
+
+    /// A destination whose path is longer than MAX_PATH (260 characters) is judged like
+    /// any other: its long name is read through a verbatim path rather than failing as
+    /// unchecked or being skipped.
+    #[cfg(windows)]
+    #[test]
+    fn a_destination_past_max_path_is_judged_by_its_long_name_on_windows() {
+        let mut dir = std::env::temp_dir().join(format!("sqx-dest-long-path-{}-{}", std::process::id(), line!()));
+        let root = dir.clone();
+        while dir.as_os_str().len() < 300 {
+            dir.push("a-folder-name-long-enough-to-pass-max-path-quickly-0123456789");
+        }
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("x.db"), b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("x.db-wal"), [0u8; 32]).unwrap();
+        let wal = dir.join("x.db-wal");
+        let long = crate::windows_file_info::long_name(&wal);
+        let journal = destination_refusal(&OpenFiles::default(), &wal);
+        let fresh = destination_refusal(&OpenFiles::default(), &dir.join("new.db"));
+        // Its 8.3 short name, where the volume makes them, draws the same refusal.
+        let short = crate::windows_file_info::short_name(&wal);
+        let by_short = match &short {
+            Ok(Some(short)) if !short.eq_ignore_ascii_case("x.db-wal") => Some(destination_refusal(&OpenFiles::default(), &dir.join(short))),
+            _ => None,
+        };
+        fs::remove_dir_all(&root).unwrap();
+        assert!(wal.as_os_str().len() > 260, "the path is past MAX_PATH");
+        assert_eq!(long.unwrap(), Some(std::ffi::OsString::from("x.db-wal")));
+        assert!(journal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_JOURNAL_NAME")), "{journal:?}");
+        assert_eq!(fresh, None, "a new name past MAX_PATH is not refused as unchecked");
+        assert!(short.as_ref().is_ok_and(|s| s.is_some()), "{short:?}");
+        match by_short {
+            Some(refusal) => assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_JOURNAL_NAME")), "{short:?}: {refusal:?}"),
+            None => eprintln!("8.3 half skipped: this volume makes no 8.3 names"),
+        }
+    }
+
+    /// The 8.3 short name of an existing journal file is judged by its long name too.
+    /// A volume that makes no short names (8.3 creation can be off) is skipped, said.
+    #[cfg(windows)]
+    #[test]
+    fn an_8_3_name_of_a_journal_file_is_judged_by_its_long_name_on_windows() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-short-wal-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("x.db"), b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("x.db-wal"), [0u8; 32]).unwrap();
+        let short = crate::windows_file_info::short_name(&dir.join("x.db-wal")).unwrap().expect("x.db-wal is there");
+        if short.eq_ignore_ascii_case("x.db-wal") {
+            fs::remove_dir_all(&dir).unwrap();
+            eprintln!("skipped: this volume makes no 8.3 names (x.db-wal's short name is itself)");
+            return;
+        }
+        let refusal = destination_refusal(&OpenFiles::default(), &dir.join(&short));
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_JOURNAL_NAME")), "{short:?}: {refusal:?}");
+    }
+
+    /// A journal-named destination spelled with the database's 8.3 short name ("LONGDA~1.SQL-wal")
+    /// is refused: the volume resolves the short name when the database is looked up.
+    #[cfg(windows)]
+    #[test]
+    fn an_8_3_name_of_the_database_counts_for_the_journal_rule_on_windows() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-short-base-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("long database name.sqlite");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        let short = crate::windows_file_info::short_name(&db).unwrap().expect("the database is there");
+        if short.eq_ignore_ascii_case("long database name.sqlite") {
+            fs::remove_dir_all(&dir).unwrap();
+            eprintln!("skipped: this volume makes no 8.3 names");
+            return;
+        }
+        let mut journal = short.clone();
+        journal.push("-wal");
+        let refusal = destination_refusal(&OpenFiles::default(), &dir.join(&journal));
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_JOURNAL_NAME")), "{journal:?}: {refusal:?}");
+    }
+
+    /// A destination whose own entry is one of an open database's journal files
+    /// now, whatever it is called (here a hard link with no journal suffix to the
+    /// live -shm), is refused as that journal: only the identity comparison with
+    /// the open databases' journal files can see it.
+    #[test]
+    fn a_link_to_an_open_databases_live_shm_is_refused_whatever_its_name() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-shm-link-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("x.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("x.db-shm"), [0u8; 32768]).unwrap();
+        fs::hard_link(dir.join("x.db-shm"), dir.join("alias.bin")).unwrap();
+        let files = OpenFiles::default();
+        let hold = claim_native(&files, &fs::canonicalize(&db).unwrap(), "main").unwrap();
+        let refusal = destination_refusal(&files, &dir.join("alias.bin"));
+        drop(hold);
+        let closed = destination_refusal(&files, &dir.join("alias.bin"));
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_OPEN")), "{refusal:?}");
+        assert_eq!(closed, None, "once the database is closed it is a file like any other");
+    }
+
+    /// Windows resolves a trailing dot away ("x.db-shm." opens x.db-shm), so with
+    /// the -shm present that spelling is the live -shm, matched by identity.
+    #[cfg(windows)]
+    #[test]
+    fn a_trailing_dot_spelling_of_a_live_shm_is_refused_on_windows() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-shm-dot-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("x.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("x.db-shm"), [0u8; 32768]).unwrap();
+        let files = OpenFiles::default();
+        let _hold = claim_native(&files, &fs::canonicalize(&db).unwrap(), "main").unwrap();
+        let same_file = entry_identity(&dir.join("x.db-shm.")).ok() == entry_identity(&dir.join("x.db-shm")).ok();
+        let refusal = destination_refusal(&files, &dir.join("x.db-shm."));
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(same_file, "Windows did not resolve the trailing dot to x.db-shm");
+        assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_OPEN")), "{refusal:?}");
+    }
+
+    /// Identity cannot tell one link to a file from another, so a hard link to
+    /// an open database is refused like the database, though writing there
+    /// would only replace that link.
+    #[test]
+    fn a_hard_link_to_an_open_database_is_refused_like_the_database() {
+        let dir = std::env::temp_dir().join(format!("sqx-dest-hardlink-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("open.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        fs::hard_link(&db, dir.join("alias.db")).unwrap();
+        let files = OpenFiles::default();
+        let _hold = claim_native(&files, &fs::canonicalize(&db).unwrap(), "main").unwrap();
+        for name in ["alias.db", "alias.db-wal"] {
+            let refusal = destination_refusal(&files, &dir.join(name));
+            assert!(refusal.as_deref().is_some_and(|r| r.starts_with("ERR_DESTINATION_OPEN")), "{name}: {refusal:?}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// No unit test can invoke the commands (they need a live AppHandle and a
+    /// dialog), so the wiring is pinned on the source: both writers that take a
+    /// user-picked destination consult the registry before they write.
+    #[test]
+    fn every_picked_destination_is_checked_against_the_open_databases() {
+        let native = include_str!("native.rs");
+        let export = native.split("fn export_command(").nth(1).expect("export_command");
+        let export = &export[..export.find("\n}\n").expect("end of export_command")];
+        assert!(export.find("destination_refusal").expect("checked") < export.find("export_to_dest").expect("written"));
+        let lib = include_str!("lib.rs");
+        let save_as = lib.split("async fn save_file_as").nth(1).expect("save_file_as");
+        let save_as = &save_as[..save_as.find("fn urlencoding_decode").expect("decoder follows")];
+        assert!(save_as.find("destination_refusal").expect("checked") < save_as.find("write_atomically").expect("written"));
+    }
+
+    /// Cross-language byte fixture: viewer/tests/fixtures/native-frames.{bin,json},
+    /// the exact bytes the JS codec emits (`npm run native-frame-fixture` writes
+    /// them; viewer/tests/unit/native_frame_codec.test.ts holds the JS side to the
+    /// same files), so a divergence here is a wire break.
+    const FIXTURE_BIN: &[u8] = include_bytes!("../../viewer/tests/fixtures/native-frames.bin");
+    const FIXTURE_JSON: &str = include_str!("../../viewer/tests/fixtures/native-frames.json");
 
     fn manifest() -> serde_json::Value {
         serde_json::from_str(FIXTURE_JSON).expect("fixture manifest parses")
@@ -3056,6 +4351,223 @@ mod tests {
         );
         let err = gate_envelope(&huge, BOUND).unwrap_err();
         assert!(err.contains("ERR_NATIVE_FRAME_TOO_LARGE"), "{err}");
+    }
+
+    /// An invoke envelope with `fields` set on its content beside the basics.
+    fn invoke_with(method: &str, fields: serde_json::Value) -> String {
+        let mut content = serde_json::json!({
+            "kind": "invoke",
+            "messageId": "rpc_1_123",
+            "targetMethod": method
+        });
+        for (key, value) in fields.as_object().expect("fields is an object") {
+            content[key] = value.clone();
+        }
+        serde_json::json!({ "channel": "rpc", "content": content }).to_string()
+    }
+
+    #[test]
+    fn the_gate_admits_each_native_transfer_op_and_refuses_malformed_ones() {
+        use serde_json::json;
+        let id64 = format!("{}abcd", "A-z_09".repeat(10));
+        for payload in [
+            json!(["push", "req_1_1732500000000", 0, 3, 200, "x".repeat(64)]),
+            json!(["push", "a", 2, 3, 3, "y"]),
+            json!(["pull", "reply_7", 0]),
+            json!(["pull", "reply_7", 41]),
+            json!(["commit", "reply_7"]),
+            json!(["commit", id64]),
+        ] {
+            let admitted = gate_envelope(&invoke("nativeTransfer", payload.clone()), BOUND);
+            assert!(admitted.is_ok(), "{}: {admitted:?}", excerpt(&payload.to_string()));
+        }
+        // A piece is bounded in UTF-16 units, as the sidecar counts it: the
+        // longest one fits one frame at three UTF-8 bytes per unit, and an
+        // astral character is two units.
+        let at_limit = "\u{20ac}".repeat(MAX_TRANSFER_PIECE_UNITS as usize);
+        let envelope = invoke("nativeTransfer", json!(["push", "t", 0, 1, MAX_TRANSFER_PIECE_UNITS, at_limit]));
+        assert!(envelope.len() <= MAX_FRAME_BYTES as usize, "the limit piece fits one frame");
+        assert!(gate_envelope(&envelope, BOUND).is_ok(), "a piece at the limit");
+        // The bound itself, on the wire: a piece led by "~~" travels one unit
+        // longer than it decodes, and the wire length is what is bounded.
+        let bound = MAX_TRANSFER_PIECE_UNITS as usize;
+        let push = |piece: String| invoke("nativeTransfer", json!(["push", "t", 0, 2, 2 * MAX_TRANSFER_PIECE_UNITS, piece]));
+        assert_eq!(MAX_TRANSFER_PIECE_UNITS, 5_591_040, "(16 MiB - 4 KiB) / 3, the viewer's TRANSFER_PIECE_UNITS");
+        assert!(gate_envelope(&push("a".repeat(bound)), BOUND).is_ok(), "plain text at the bound");
+        assert!(gate_envelope(&push(format!("~~{}", "~".repeat(bound - 2))), BOUND).is_ok(), "~ text at the bound on the wire");
+        for over in ["a".repeat(bound + 1), format!("~~{}", "~".repeat(bound - 1))] {
+            let err = gate_envelope(&push(over), BOUND).unwrap_err();
+            assert!(err.contains("ERR_NATIVE_ENVELOPE_MALFORMED"), "one over on the wire: {err}");
+        }
+        let ascii_over = "x".repeat(MAX_TRANSFER_PIECE_UNITS as usize + 1);
+        let astral_over = "\u{1f600}".repeat(MAX_TRANSFER_PIECE_UNITS as usize / 2 + 1);
+
+        for payload in [
+            json!(["drop", "t", 0]),
+            json!([7, "t"]),
+            json!(["commit"]),
+            json!(["commit", ""]),
+            json!(["commit", "x".repeat(65)]),
+            json!(["commit", "../etc"]),
+            json!(["commit", "t d"]),
+            json!(["commit", 7]),
+            json!(["pull", "t", 1.5]),
+            json!(["pull", "t", -1]),
+            json!(["pull", "t", "1"]),
+            json!(["pull", "t", null]),
+            json!(["pull", "t", MAX_TRANSFER_UNITS]),
+            json!(["push", "t", 0, 1, 1, 7]),
+            json!(["push", "t", 0, 1, 0, "x"]),
+            json!(["push", "t", 0, 0, 1, "x"]),
+            json!(["push", "t", 0, 3, 2, "x"]),
+            json!(["push", "t", 3, 3, 9, "x"]),
+            json!(["push", "t", 0, 1, MAX_TRANSFER_UNITS + 1, "x"]),
+            json!(["push", "t", 0, 1, 1, ""]),
+            json!(["push", "t", 0, 1, 1, "xy"]),
+            json!(["push", "t", 0, 1, 1.0, "x"]),
+            json!(["push", "t", 0, 1, MAX_TRANSFER_PIECE_UNITS + 1, ascii_over]),
+            json!(["push", "t", 0, 1, MAX_TRANSFER_UNITS, astral_over]),
+            json!(["push", "t", 0, 1, 1, "x", "extra"]),
+            json!(["pull", "t", 0, "extra"]),
+            json!(["commit", "t", "extra"]),
+            json!(["pull", "t"]),
+            json!("commit"),
+            json!({ "op": "commit", "id": "t" }),
+            json!(null),
+        ] {
+            let err = gate_envelope(&invoke("nativeTransfer", payload.clone()), BOUND).unwrap_err();
+            assert!(err.contains("ERR_NATIVE_ENVELOPE_MALFORMED"), "{}: {err}", excerpt(&payload.to_string()));
+        }
+        let err = gate_envelope(&invoke_with("nativeTransfer", json!({})), BOUND).unwrap_err();
+        assert!(err.contains("ERR_NATIVE_ENVELOPE_MALFORMED"), "no payload: {err}");
+        // A transport method, not a worker one: the drift pin's list is unchanged.
+        assert!(!KNOWN_METHODS.contains(&"nativeTransfer"));
+        assert_eq!(KNOWN_METHODS.len(), 38);
+    }
+
+    /// Push envelopes encoded by the viewer's page codec itself
+    /// (scripts/gen-native-transfer-fixtures.mjs; the manifest records the
+    /// codec sources' hashes, and each case's verdict under the
+    /// sidecar's own rule). The codec writes one more `~` before a string that
+    /// starts with `~`, and a non-finite number as a `~`-tagged string: the gate
+    /// bounds a piece by its wire length as the sidecar does, and refuses one that
+    /// decodes to anything but text. The pieces are judged at the manifest's small
+    /// test bound; the real bound is pinned in
+    /// the_gate_admits_each_native_transfer_op_and_refuses_malformed_ones.
+    #[test]
+    fn transfer_pieces_from_the_real_codec_are_judged_by_the_sidecars_rule() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native-transfer");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["transferPieceUnits"].as_u64(),
+            Some(MAX_TRANSFER_PIECE_UNITS),
+            "the gate's bound is the codec's"
+        );
+        let test_bound = manifest["testPieceUnits"].as_u64().expect("the bound the pieces were written for");
+        let cases = manifest["cases"].as_array().unwrap();
+        assert!(cases.len() >= 4);
+        let mut wrong = Vec::new();
+        for case in cases {
+            let file = case["file"].as_str().unwrap();
+            let envelope: serde_json::Value = serde_json::from_str(&fs::read_to_string(dir.join(file)).unwrap()).unwrap();
+            let verdict = check_native_transfer_bounded(envelope.pointer("/content/payload"), test_bound);
+            let right = match case["gate"].as_str().unwrap() {
+                "admit" => verdict.is_ok(),
+                "refuse" => verdict.as_ref().is_err_and(|e| e.contains("ERR_NATIVE_ENVELOPE_MALFORMED")),
+                other => panic!("{file}: unknown expectation {other}"),
+            };
+            if !right {
+                wrong.push(format!("{file} (expected {}): {}", case["gate"], excerpt(&format!("{verdict:?}"))));
+            }
+            // Through the whole gate at the real bound, every piece here is short;
+            // only one that decodes to anything but text is refused.
+            let through_gate = gate_envelope(&envelope.to_string(), BOUND);
+            if through_gate.is_ok() != (case["decodedType"] == "string") {
+                wrong.push(format!("{file} through the gate: {}", excerpt(&format!("{through_gate:?}"))));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+
+        // Hand-made wire forms the codec never writes for text: the gate is
+        // stricter than the sidecar here, which decodes "~x" as itself.
+        let push = |piece: &str| invoke("nativeTransfer", serde_json::json!(["push", "t", 0, 1, 2, piece]));
+        assert!(gate_envelope(&push("~~"), BOUND).is_ok(), "the codec's form of a lone ~");
+        for tagged in ["~", "~x", "~sqlite-explorer-non-finite:Infinity"] {
+            let err = gate_envelope(&push(tagged), BOUND).unwrap_err();
+            assert!(err.contains("ERR_NATIVE_ENVELOPE_MALFORMED"), "{tagged}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_gate_takes_a_payload_in_pieces_only_where_the_sidecar_assembles_one() {
+        use serde_json::json;
+        let transfer = json!({ "id": "req_3_1732500000000", "length": 20_000_000, "parts": 4 });
+        for method in [
+            "updateCellBatch",
+            "deleteRows",
+            "insertRowWithHistory",
+            "importRows",
+            "undoModification",
+            "redoModification",
+        ] {
+            let admitted = gate_envelope(&invoke_with(method, json!({ "payloadTransfer": transfer })), BOUND);
+            assert!(admitted.is_ok(), "{method}: {admitted:?}");
+        }
+
+        // initializeDatabase, explicitly, even beside a payload the path check
+        // would pass: the gate reads its path and deadline from the payload.
+        for fields in [
+            json!({ "payload": ["x", { "path": BOUND }], "payloadTransfer": transfer }),
+            json!({ "payloadTransfer": transfer }),
+        ] {
+            let err = gate_envelope(&invoke_with("initializeDatabase", fields), BOUND).unwrap_err();
+            assert!(
+                err.contains("ERR_NATIVE_ENVELOPE_MALFORMED") && err.contains("initializeDatabase cannot take its payload in pieces"),
+                "{err}"
+            );
+        }
+        // Any other method, a worker one or the transport itself.
+        for method in ["runQuery", "updateCell", "executeReadQuery", "exportTable", "nativeTransfer"] {
+            let err = gate_envelope(&invoke_with(method, json!({ "payloadTransfer": transfer })), BOUND).unwrap_err();
+            assert!(
+                err.contains("ERR_NATIVE_ENVELOPE_MALFORMED") && err.contains("cannot take its payload in pieces"),
+                "{method}: {err}"
+            );
+        }
+        // The lists agree with each other: every request-transfer method is an
+        // audited worker method, initializeDatabase is never one, and no
+        // transport method hides in the worker list.
+        assert!(REQUEST_TRANSFER_METHODS.iter().all(|m| KNOWN_METHODS.contains(m)));
+        assert!(!REQUEST_TRANSFER_METHODS.contains(&"initializeDatabase"));
+        assert!(TRANSPORT_METHODS.iter().all(|m| !KNOWN_METHODS.contains(m)));
+        // Never both, so nothing is ambiguous about which one runs.
+        for payload in [json!([]), json!(null)] {
+            let fields = json!({ "payload": payload, "payloadTransfer": transfer });
+            let err = gate_envelope(&invoke_with("updateCellBatch", fields), BOUND).unwrap_err();
+            assert!(err.contains("ERR_NATIVE_ENVELOPE_MALFORMED") && err.contains("never both"), "{err}");
+        }
+        // The transfer's own shape.
+        for bad in [
+            json!(null),
+            json!([]),
+            json!("req_1"),
+            json!({ "id": "t", "length": 1 }),
+            json!({ "id": "t", "length": 1, "parts": 1, "extra": 0 }),
+            json!({ "id": "", "length": 1, "parts": 1 }),
+            json!({ "id": "a/b", "length": 1, "parts": 1 }),
+            json!({ "id": 7, "length": 1, "parts": 1 }),
+            json!({ "id": "t", "length": 0, "parts": 1 }),
+            json!({ "id": "t", "length": 5, "parts": 0 }),
+            json!({ "id": "t", "length": 5, "parts": 6 }),
+            json!({ "id": "t", "length": MAX_TRANSFER_UNITS + 1, "parts": 1 }),
+            json!({ "id": "t", "length": 1.5, "parts": 1 }),
+            json!({ "id": "t", "length": "5", "parts": 1 }),
+        ] {
+            let fields = json!({ "payloadTransfer": bad });
+            let err = gate_envelope(&invoke_with("deleteRows", fields), BOUND).unwrap_err();
+            assert!(err.contains("ERR_NATIVE_ENVELOPE_MALFORMED"), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -4053,7 +5565,7 @@ mod tests {
         close_all_inner(&manager, "test over");
     }
 
-    // -- Capstone QA: adversarial probes of the envelope gate + registry -----
+    // -- Adversarial probes of the envelope gate + registry -----------------
 
     /// The gate parses the envelope with serde_json; the sidecar parses the
     /// SAME bytes with `JSON.parse`. A duplicate-key differential would let
@@ -4174,7 +5686,7 @@ mod tests {
         assert!(open_ids(&manager).is_empty());
     }
 
-    /// MEASUREMENT for the ledgered MINOR #5 (T1 review), not an assertion
+    /// A MEASUREMENT, not an assertion
     /// about the shell's own code — hence `#[ignore]`.
     ///
     /// `#[tauri::command(async)]` on a SYNC body compiles to
@@ -4233,7 +5745,7 @@ mod tests {
             .expect("the queued task must run once a worker frees up");
     }
 
-    // -- Capstone fixes ------------------------------------------------------
+    // -- Fixes from the adversarial probes -----------------------------------
 
     /// BUG-1(a), the regression the ignored measurement above motivates.
     ///
@@ -4493,7 +6005,7 @@ mod tests {
         // Window "main" opens it in WASM: a provisional hold at read time…
         hold_for_read(&files, &db, "main").expect("free");
         // …confirmed by the push that follows.
-        assert_eq!(sync_reported(&files, "main", std::slice::from_ref(&db)).unwrap(), 1);
+        assert_eq!(sync_reported(&files, "main", std::slice::from_ref(&db)).unwrap().installed, 1);
         assert_eq!(holder_of(&files, &db).as_deref(), Some("main"));
 
         // The second window is refused on BOTH engines.
@@ -4509,12 +6021,12 @@ mod tests {
         // doing so must not downgrade its confirmed hold to an expiring one.
         hold_for_read(&files, &db, "main").expect("a refresh is not a second opener");
         assert_eq!(
-            sync_reported_at(&files, "main", std::slice::from_ref(&db), Instant::now()).unwrap(),
+            sync_reported_at(&files, "main", std::slice::from_ref(&db), Instant::now()).unwrap().installed,
             1
         );
 
         // THE case the naive design broke: close it here, open it there.
-        assert_eq!(sync_reported(&files, "main", &[]).unwrap(), 0);
+        assert_eq!(sync_reported(&files, "main", &[]).unwrap().installed, 0);
         assert_eq!(holder_of(&files, &db), None, "a close releases the file");
         hold_for_read(&files, &db, "db-0").expect("reopenable in the other window");
         assert_eq!(holder_of(&files, &db).as_deref(), Some("db-0"));
@@ -4525,6 +6037,68 @@ mod tests {
         let err = hold_for_read(&files, &spelled, "main").unwrap_err();
         assert!(err.contains("ERR_NATIVE_DB_ALREADY_OPEN"), "{err}");
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A window holding a WAL database natively keeps a log beside it through
+    /// its own sidecar. Another window's WebAssembly read must name the open
+    /// window, not send the user to close a program that is SQLite Explorer
+    /// itself.
+    #[test]
+    fn a_file_open_in_another_window_is_named_as_that_even_with_a_log_beside_it() {
+        let dir = scratch("open-elsewhere-with-log");
+        let db = dir.join("shared.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        fs::write(dir.join("shared.db-wal"), [0u8; 4096]).unwrap();
+        let canonical = fs::canonicalize(&db).unwrap();
+        let files = OpenFiles::default();
+
+        let native = claim_native(&files, &canonical, "main").unwrap();
+        let err = admit_wasm_read(&files, &db, "db-0").unwrap_err();
+        assert_eq!(err, already_open_error(&canonical, "main", "db-0"));
+        // The owning window's own read is told about the log.
+        let err = admit_wasm_read(&files, &db, "main").unwrap_err();
+        assert!(err.starts_with("ERR_DATABASE_HAS_WAL"), "{err}");
+        drop(native);
+
+        // Nothing open anywhere: the log is the reason, and the refused read
+        // claims nothing another window would then wait out.
+        let err = admit_wasm_read(&files, &db, "db-0").unwrap_err();
+        assert!(err.starts_with("ERR_DATABASE_HAS_WAL"), "{err}");
+        assert_eq!(holder_of(&files, &db), None);
+        fs::remove_file(dir.join("shared.db-wal")).unwrap();
+        admit_wasm_read(&files, &db, "db-0").expect("no log, nothing open");
+        assert_eq!(holder_of(&files, &db).as_deref(), Some("db-0"), "an admitted read holds the file");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_webassembly_read_gate_names_an_open_file_before_its_log_and_holds_last() {
+        let source = include_str!("native.rs");
+        let gate = source.split("pub(crate) fn admit_wasm_read").nth(1).expect("admit_wasm_read");
+        let gate = &gate[..gate.find("\n}\n").expect("end")];
+        let peek = gate.find("refuse_if_open_elsewhere(").expect("looks for another window's hold");
+        let log = gate.find("snapshot_refusal(").expect("checks for a log");
+        let hold = gate.find("hold_for_read(").expect("holds the file");
+        assert!(peek < log && log < hold, "order: open elsewhere, log, hold");
+    }
+
+    #[test]
+    fn the_open_elsewhere_look_claims_nothing_and_ignores_an_expired_hold() {
+        let dir = scratch("open-elsewhere-ttl");
+        let db = dir.join("stranded.db");
+        fs::write(&db, b"SQLite format 3\0").unwrap();
+        let canonical = fs::canonicalize(&db).unwrap();
+        let files = OpenFiles::default();
+        let t0 = Instant::now();
+        refuse_if_open_elsewhere_at(&files, &canonical, "db-0", t0).expect("nothing open");
+        assert_eq!(holder_of(&files, &db), None, "the look claims nothing");
+        hold_for_read_at(&files, &canonical, "main", t0).expect("free");
+        refuse_if_open_elsewhere_at(&files, &canonical, "main", t0).expect("the owner's own refresh");
+        let err = refuse_if_open_elsewhere_at(&files, &canonical, "db-0", t0).unwrap_err();
+        assert_eq!(err, already_open_error(&canonical, "main", "db-0"));
+        refuse_if_open_elsewhere_at(&files, &canonical, "db-0", t0 + PROVISIONAL_HOLD_TTL)
+            .expect("an expired provisional hold refuses nothing");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -4556,7 +6130,7 @@ mod tests {
 
         // A CONFIRMED hold has no deadline: the push is event-driven, not a
         // heartbeat, so a database open and idle for a day is still open.
-        assert_eq!(sync_reported(&files, "db-0", std::slice::from_ref(&db)).unwrap(), 1);
+        assert_eq!(sync_reported(&files, "db-0", std::slice::from_ref(&db)).unwrap().installed, 1);
         let err = hold_for_read_at(
             &files,
             &canonical,
@@ -4619,7 +6193,7 @@ mod tests {
         // A path that cannot be resolved is dropped rather than held: it
         // names no file, so it can collide with nothing.
         let gone = dir.join("deleted.db");
-        assert_eq!(sync_reported(&files, "main", &[mine.clone(), gone]).unwrap(), 1);
+        assert_eq!(sync_reported(&files, "main", &[mine.clone(), gone]).unwrap().installed, 1);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -4982,21 +6556,21 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    // -- live sidecar (requires synced artifacts; run with --ignored) ------
+    // -- live sidecar (requires built artifacts; run with --ignored) -------
 
     /// End-to-end against the REAL binary + committed bundle: spawn through
     /// the production launch path (env allowlist, cwd pin, handshake),
     /// initializeDatabase + fetchSchema through the production gate+submit
     /// flow, layer-3 refusal of a retarget, then clean EOF shutdown (exit 0).
     #[test]
-    #[ignore = "needs viewer-dist/native artifacts (npm run sync-viewer); run: cargo test --lib -- --ignored"]
+    #[ignore = "needs viewer-dist/native artifacts (npm run build:viewer); run: cargo test --lib -- --ignored"]
     fn live_sidecar_end_to_end() {
         let native_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("viewer-dist")
             .join("native");
         let paths = locate_native_dir(&[native_dir])
-            .expect("sync the native artifacts first: npm run sync-viewer -- --local --source <upstream>");
+            .expect("build the native artifacts first: npm run build:viewer");
 
         let dir = scratch("live");
         let db = dir.join("live 東京 space.db");
@@ -5058,14 +6632,14 @@ mod tests {
     /// The two databases are given disjoint schemas so every answer names the
     /// connection it came from.
     #[test]
-    #[ignore = "needs viewer-dist/native artifacts (npm run sync-viewer); run: cargo test --lib -- --ignored"]
+    #[ignore = "needs viewer-dist/native artifacts (npm run build:viewer); run: cargo test --lib -- --ignored"]
     fn live_two_sidecars_serve_their_own_databases() {
         let native_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("viewer-dist")
             .join("native");
         let paths = locate_native_dir(&[native_dir])
-            .expect("sync the native artifacts first: npm run sync-viewer -- --local --source <upstream>");
+            .expect("build the native artifacts first: npm run build:viewer");
 
         let dir = scratch("live-two");
         // Zero-byte files are valid empty SQLite databases; each sidecar
@@ -5181,8 +6755,8 @@ mod tests {
     }
 
     /// The full export route against the REAL sidecar (requires a bundle that
-    /// carries the Task-1 shell-export handler — sync with
-    /// `npm run sync-viewer -- --ref 7c367c2` or later): a > 16 MiB database
+    /// carries the shell-export handler, as every build from viewer/ does —
+    /// `npm run build:viewer`): a > 16 MiB database
     /// is exported BOTH ways end to end through the production
     /// `export_to_dest` flow, proving the bytes never rode a frame (the frame
     /// cap is 16 MiB), the dest files are valid, and the temp dirs are gone.
@@ -5197,7 +6771,7 @@ mod tests {
             .join("viewer-dist")
             .join("native");
         let paths = locate_native_dir(&[native_dir])
-            .expect("sync the native artifacts first: npm run sync-viewer -- --ref 7c367c2");
+            .expect("build the native artifacts first: npm run build:viewer");
 
         let dir = scratch("live-export");
         let db = dir.join("big.db");

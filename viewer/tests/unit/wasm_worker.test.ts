@@ -1,0 +1,8890 @@
+import './vscode_mock_setup';
+
+import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { existsSync, readFileSync } from 'node:fs';
+import { createHash, webcrypto } from 'node:crypto';
+import path from 'node:path';
+import vm from 'node:vm';
+import { Worker as NodeWorker } from 'node:worker_threads';
+import esbuild from 'esbuild';
+import initSqlJs from '../../vendor/sql.js/sql-wasm.js';
+import {
+    CellEditPolicyError,
+    DEFAULT_MAX_CELL_EDIT_BYTES,
+    fromCellEditRpcErrorData
+} from '../../src/core/cell-edit-policy';
+import { MAX_WEBVIEW_BINARY_VALUE_BYTES } from '../../src/core/webview-transport';
+import { MAX_TABLE_PAGE_ROWS } from '../../src/core/query-builder';
+import { parseImport } from '../../src/core/bulk-import';
+import { projectDeletedRowEntryBytes } from '../../src/core/delete-history';
+import { estimateUndoMemoryBytes } from '../../src/core/undo-history';
+import {
+    encodePrimaryKeyRecordId,
+    isReadOnlyPrimaryKeyRecordId
+} from '../../src/core/row-identity';
+import type { PrimaryKeyColumn, RecordId } from '../../src/core/types';
+
+/**
+ * A scratch database to seed a test with, on the bundled sql.js: the two
+ * calls the seeds make, executed as plain SQL.
+ */
+async function createSeedDatabase() {
+    const SQL = await initSqlJs({
+        wasmBinary: new Uint8Array(readFileSync(path.resolve(process.cwd(), 'vendor/sql.js/sql-wasm.wasm'))).buffer
+    });
+    const db = new SQL.Database();
+    return {
+        executeQuery: async (sql: string) => { db.exec(sql); },
+        serializeDatabase: async () => db.export()
+    };
+}
+
+interface WorkerHarness {
+    invoke(method: string, ...payload: unknown[]): Promise<any>;
+    invokeWithPayload(method: string, payload: unknown): Promise<any>;
+    dispatchRaw(data: unknown): Promise<void>;
+}
+
+const authoredWorkerPath = path.resolve(
+    process.cwd(),
+    'worker/worker.js'
+);
+// The worker this app ships: the build's output, committed in viewer-dist/.
+const bundledWorkerPath = path.resolve(
+    process.cwd(),
+    '../viewer-dist/web/worker.js'
+);
+const BUNDLED_SQLJS_SQLITE_VERSION = '3.54.1';
+const DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION: Record<string, string> = {
+    '3.49.1': '9.6529377952985e+282',
+    '3.54.1': '9.6529377952984946e+282'
+};
+
+let currentWorkerBundle: Promise<string> | undefined;
+
+function readCurrentWorkerBundle(): Promise<string> {
+    currentWorkerBundle ??= (async () => {
+    assert.ok(
+        existsSync(bundledWorkerPath),
+        'viewer-dist/web/worker.js is missing; run npm run build:viewer'
+    );
+    const rendered = await esbuild.build({
+        entryPoints: [authoredWorkerPath],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        target: 'es2020',
+        minify: true,
+        write: false,
+        define: {
+            // Mirrors bundleWebDemoWorker in scripts/build.mjs (this rebuild is
+            // byte-compared against its committed output): false folds the
+            // worker's desktop-native engine branch away.
+            'import.meta.env.DESKTOP_NATIVE_ENGINE': 'false'
+        }
+    });
+    assert.strictEqual(rendered.outputFiles.length, 1);
+    const renderedSource = rendered.outputFiles[0].text;
+    // Source-only development runs are explicit; the default/full-suite lane
+    // continues to enforce the committed bundle byte-for-byte.
+    if (process.env.SQLITE_EXPLORER_TEST_AUTHORED_WORKER === '1') {
+        return renderedSource;
+    }
+    const expectedHash = createHash('sha256').update(renderedSource).digest('hex');
+    const bundledSource = readFileSync(bundledWorkerPath, 'utf8');
+    const bundledHash = bundledSource.match(
+        /sqlite-viewer-bundle-sha256:([a-f0-9]{64})/
+    )?.[1];
+    const freshnessFailure =
+        'worker bundle is stale or esbuild output/version drifted; ' +
+        'run npm run build:viewer';
+    assert.strictEqual(
+        bundledHash,
+        expectedHash,
+        freshnessFailure
+    );
+    assert.strictEqual(
+        bundledSource,
+        `/*! sqlite-viewer-bundle-sha256:${expectedHash} */\n${renderedSource}`,
+        freshnessFailure
+    );
+    return bundledSource;
+    })();
+    return currentWorkerBundle;
+}
+
+async function createWorkerHarness(options: {
+    content?: Uint8Array;
+    queryTimeout?: number;
+    now?: () => number;
+    readOnlyMode?: boolean;
+    cellReadSessionIdleTimeoutMs?: number;
+    cellReadSessionAbsoluteTimeoutMs?: number;
+    useBundledWasm?: boolean;
+    initSqlJs?: (config: any) => Promise<any>;
+    onImportScripts?: (url: string) => void;
+    onSql?: (kind: 'exec' | 'prepare', sql: string) => void;
+    onSqlResult?: (kind: 'exec' | 'prepare', sql: string, result: unknown) => void;
+    onWarn?: (...args: unknown[]) => void;
+    onError?: (...args: unknown[]) => void;
+    coerceBigIntsToNumbers?: boolean;
+} = {}): Promise<WorkerHarness> {
+    const source = await readCurrentWorkerBundle();
+    const responses: any[] = [];
+    const initializeSqlJs = options.initSqlJs ?? initSqlJs;
+    const workerGlobal: any = {
+        initSqlJs: async (config: any) => {
+            const sqlJs = await initializeSqlJs(config);
+            if (!options.onSql && !options.onSqlResult && !options.coerceBigIntsToNumbers) return sqlJs;
+            const ObservedDatabase = new Proxy(sqlJs.Database, {
+                construct(Target: any, args: any[]): object {
+                    const database = Reflect.construct(Target, args) as Record<string, any>;
+                    for (const kind of ['exec', 'prepare'] as const) {
+                        const original = database[kind].bind(database);
+                        database[kind] = (sql: string, ...methodArgs: unknown[]) => {
+                            options.onSql?.(kind, sql);
+                            const result = original(sql, ...methodArgs);
+                            options.onSqlResult?.(kind, sql, result);
+                            if (kind !== 'exec' || !options.coerceBigIntsToNumbers) {
+                                return result;
+                            }
+                            return result.map((resultSet: any) => ({
+                                ...resultSet,
+                                values: resultSet.values.map((row: unknown[]) => row.map(
+                                    value => typeof value === 'bigint' ? Number(value) : value
+                                ))
+                            }));
+                        };
+                    }
+                    return database;
+                }
+            });
+            return { ...sqlJs, Database: ObservedDatabase };
+        },
+        postMessage(message: unknown) {
+            responses.push(message);
+        }
+    };
+    const context = vm.createContext({
+        self: workerGlobal,
+        importScripts(url: string) { options.onImportScripts?.(url); },
+        console: {
+            log() {},
+            warn: options.onWarn ?? (() => {}),
+            error: options.onError ?? (() => {})
+        },
+        Uint8Array,
+        Int32Array,
+        ArrayBuffer,
+        SharedArrayBuffer,
+        Atomics,
+        DataView,
+        crypto: webcrypto,
+        TextEncoder,
+        TextDecoder,
+        Date: options.now ? { now: options.now } : Date,
+        setTimeout,
+        clearTimeout
+    });
+    new vm.Script(source, { filename: 'worker.js' })
+        .runInContext(context);
+
+    let messageId = 0;
+    const invokeWithPayload = async (method: string, payload: unknown) => {
+        const id = `test_${++messageId}`;
+        await workerGlobal.onmessage({
+            data: {
+                channel: 'rpc',
+                content: {
+                    kind: 'invoke',
+                    messageId: id,
+                    targetMethod: method,
+                    payload
+                }
+            }
+        });
+        const responseIndex = responses.findIndex(message => message.content?.messageId === id);
+        assert.notStrictEqual(responseIndex, -1, `worker did not respond to ${method}`);
+        const [response] = responses.splice(responseIndex, 1);
+        if (!response.content.success) {
+            throw fromCellEditRpcErrorData(response.content.error)
+                ?? new Error(response.content.errorMessage);
+        }
+        return response.content.data;
+    };
+    const invoke = (method: string, ...payload: unknown[]) => invokeWithPayload(method, payload);
+
+    const initConfig: Record<string, unknown> = {
+        content: options.content ?? null,
+        queryTimeout: options.queryTimeout,
+        readOnlyMode: options.readOnlyMode,
+        cellReadSessionIdleTimeoutMs: options.cellReadSessionIdleTimeoutMs,
+        cellReadSessionAbsoluteTimeoutMs: options.cellReadSessionAbsoluteTimeoutMs
+    };
+    if (options.useBundledWasm !== false) {
+        initConfig.wasmBinary = new Uint8Array(readFileSync(
+            path.resolve(process.cwd(), 'vendor/sql.js/sql-wasm.wasm')
+        ));
+    }
+    await invoke('initializeDatabase', 'test.db', initConfig);
+    return {
+        invoke,
+        invokeWithPayload,
+        dispatchRaw: async data => workerGlobal.onmessage({ data })
+    };
+}
+
+async function workerScalar(worker: WorkerHarness, sql: string): Promise<unknown> {
+    const result = await worker.invoke('runQuery', sql);
+    return result[0]?.rows?.[0]?.[0];
+}
+
+describe('WASM worker SQL editor queries', () => {
+    it('runs parameterized reads with exact integers, NULL and BLOB values', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('executeReadQuery',
+            "SELECT ? AS label, CAST(? AS INTEGER) AS exact, NULL AS empty, x'0102' AS bytes",
+            '["hello", "9223372036854775807"]');
+        assert.deepStrictEqual(Array.from(result.headers), ['label', 'exact', 'empty', 'bytes']);
+        assert.strictEqual(result.rows[0][0], 'hello');
+        assert.strictEqual(result.exactIntegerTexts[0][1], '9223372036854775807');
+        assert.strictEqual(result.rows[0][2], null);
+        assert.deepStrictEqual(result.rows[0][3], new Uint8Array([1, 2]));
+    });
+
+    it('keeps read-only databases queryable and cleans up after errors', async () => {
+        const worker = await createWorkerHarness({ readOnlyMode: true });
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT 1 AS value')).rows[0][0], 1);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT * FROM missing_table'), /missing_table/);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT query_only FROM pragma_query_only')).rows[0][0], 1);
+        assert.strictEqual((await worker.invoke('executeReadQuery',
+            "SELECT count(*) FROM sqlite_temp_schema WHERE name LIKE 'query_columns_%'")).rows[0][0], 0);
+        await assert.rejects(worker.invoke('runQuery', 'CREATE TABLE items (id INTEGER)'), /read-only/);
+    });
+
+    it('rejects writes, multiple statements and invalid bindings without changing the database', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', "CREATE TABLE items (label TEXT); INSERT INTO items VALUES ('original')");
+        for (const sql of ["UPDATE items SET label = 'changed'", 'SELECT 1; SELECT 2']) {
+            await assert.rejects(worker.invoke('executeReadQuery', sql));
+        }
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[]'), /Expected 1/);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[true]'), /null, string/);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[9223372036854775808]'), /64-bit/);
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '{'), /JSON/);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT label FROM items')).rows[0][0], 'original');
+    });
+
+    it('binds integer parameters exactly and keeps reals and text, as the extension console does', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)');
+        await worker.invoke('runQuery', "INSERT INTO t VALUES (3000000000, 'big'), (9007199254740993, 'past53')");
+        await worker.invoke('runQuery', "CREATE TABLE s (code TEXT); INSERT INTO s VALUES ('3000000000')");
+        const typed: Array<[string, string, string]> = [
+            ['3000000000', 'integer', '3000000000'],
+            ['9007199254740993', 'integer', '9007199254740993'],
+            ['-9223372036854775808', 'integer', '-9223372036854775808'],
+            ['9223372036854775807', 'integer', '9223372036854775807'],
+            ['7', 'integer', '7'],
+            ['1.0', 'real', '1.0'],
+            ['1e3', 'real', '1000.0'],
+            ['2.5', 'real', '2.5'],
+            ['"7"', 'text', "'7'"],
+            ['null', 'null', 'NULL']
+        ];
+        const result = await worker.invoke('executeReadQuery',
+            'SELECT ' + typed.map((_, index) => `typeof(?${index + 1}) AS t${index}, quote(?${index + 1}) AS q${index}`).join(', '),
+            `[${typed.map(([text]) => text).join(', ')}]`);
+        assert.deepStrictEqual(Array.from(result.rows[0]), typed.flatMap(([, type, quoted]) => [type, quoted]));
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT label FROM t WHERE id=?', '[9007199254740993]')).rows[0][0], 'past53');
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT count(*) FROM s WHERE code = ?', '[3000000000]')).rows[0][0], 1);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT ? / 2', '[1.0]')).rows[0][0], 0.5);
+        assert.strictEqual((await worker.invoke('executeReadQuery', "SELECT '3000000000' = ?", '[3000000000]')).rows[0][0], 0);
+        assert.deepStrictEqual(Array.from((await worker.invoke('executeReadQuery', 'SELECT typeof(?)', '[3000000000]')).headers),
+            Array.from((await worker.invoke('executeReadQuery', 'SELECT typeof(?)', '[7]')).headers));
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT ?', '[9223372036854775808]'), /64-bit/);
+    });
+
+    it('bounds rows, columns and bytes before transporting results', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('executeReadQuery',
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<1200) SELECT x, zeroblob(10000) AS payload FROM n');
+        assert.strictEqual(result.rows.length, 1001, 'one extra row signals truncation at 1000');
+        assert.ok(result.oversizedCells[0][1]);
+        assert.ok(result.rows.reduce((bytes: number, row: [number, Uint8Array]) => bytes + row[1].byteLength, 0) <= 4 * 1024 * 1024);
+        await assert.rejects(worker.invoke('executeReadQuery',
+            `SELECT ${Array.from({ length: 129 }, (_, i) => `${i} AS c${i}`).join(',')}`), /128/);
+        const clipped = await worker.invoke('executeReadQuery', 'SELECT zeroblob(70000) AS payload');
+        assert.strictEqual(clipped.oversizedCells[0][0].byteLength, 70000);
+        assert.ok(clipped.rows[0][0].byteLength <= 65536);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+    });
+
+    it('clears the VM deadline after a timed-out query', async () => {
+        let expired = false;
+        let clock = 0;
+        const worker = await createWorkerHarness({ queryTimeout: 10, now: () => expired ? (clock += 20) : clock });
+        expired = true;
+        await assert.rejects(worker.invoke('executeReadQuery',
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n'), /timed out/);
+        expired = false;
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT 1')).rows[0][0], 1);
+    });
+
+    it('steps reads under query_only and restores the connection', async () => {
+        // SELECTs that write when stepped.
+        const spellings = [
+            'SELECT * FROM pragma_optimize(0x10002)',
+            'SELECT * FROM "pragma_optimize"(0x10002)',
+            'SELECT * FROM [pragma_optimize](0x10002)',
+            'SELECT * FROM `pragma_optimize`(0x10002)',
+            'SELECT * FROM main.pragma_optimize(0x10002)',
+            'SELECT * FROM "MAIN"."Pragma_Optimize"(0x10002)',
+            'SELECT * FROM PrAgMa_OpTiMiZe',
+            'WITH t AS MATERIALIZED (SELECT * FROM pragma_optimize(0x10002)) SELECT count(*) AS n FROM t',
+            'SELECT (SELECT count(*) FROM pragma_optimize(0x10002)) AS n',
+            'SELECT optimize(docs) AS merged FROM docs LIMIT 1'
+        ];
+        const longRead = 'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n';
+        const cancellationFlag = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+        const worker = await createWorkerHarness({
+            // Cancel once the console's own statement is prepared for stepping.
+            onSql: (kind, sql) => {
+                if (kind === 'prepare' && sql.includes('x<100000000') && !sql.startsWith('CREATE')) {
+                    Atomics.store(cancellationFlag, 0, 1);
+                }
+            }
+        });
+        await worker.invoke('runQuery',
+            'CREATE TABLE analyzed (id INTEGER PRIMARY KEY, label TEXT); ' +
+            'CREATE INDEX analyzed_label ON analyzed(label); ' +
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 200) INSERT INTO analyzed(label) SELECT 'label' || (x % 7) FROM n; " +
+            'CREATE VIRTUAL TABLE docs USING fts4(body)');
+        // One segment per statement, so optimize() has segments to merge.
+        for (const body of ['one', 'two', 'three']) await worker.invoke('runQuery', 'INSERT INTO docs VALUES (?)', [body]);
+        const image = async () => Buffer.from(await worker.invoke('exportDatabase', 'test.db'));
+        const outcomes = [];
+        for (const sql of spellings) {
+            const before = await image();
+            const error = await worker.invoke('executeReadQuery', sql).then(
+                () => '',
+                (e: unknown) => e instanceof Error ? e.message : String(e)
+            );
+            const changed = !before.equals(await image());
+            const stat1 = await workerScalar(worker, "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'");
+            // Judge every spelling against an unanalyzed database.
+            if (stat1) await worker.invoke('runQuery', 'DROP TABLE sqlite_stat1');
+            outcomes.push({ sql, refused: /readonly database/.test(error), stat1, changed });
+        }
+        assert.deepStrictEqual(outcomes, spellings.map(sql => ({ sql, refused: true, stat1: 0, changed: false })));
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+
+        // TEMP objects, CTEs and reading table-valued pragmas still work; the
+        // statement itself steps under query_only.
+        await worker.invoke('runQuery', "CREATE TEMP TABLE session_note (note TEXT); INSERT INTO session_note VALUES ('temporary')");
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT note FROM temp.session_note')).rows[0][0], 'temporary');
+        assert.deepStrictEqual(Array.from((await worker.invoke('executeReadQuery',
+            "SELECT name FROM pragma_table_info('analyzed') ORDER BY cid")).rows, (row: unknown[]) => row[0]), ['id', 'label']);
+        assert.strictEqual((await worker.invoke('executeReadQuery',
+            "WITH c AS (SELECT id FROM analyzed WHERE label = 'label3') SELECT count(*) AS n FROM c")).rows[0][0], 29);
+        assert.strictEqual((await worker.invoke('executeReadQuery', 'SELECT query_only FROM pragma_query_only')).rows[0][0], 1);
+
+        // The previous state returns after a failing step and a cancellation.
+        await assert.rejects(worker.invoke('executeReadQuery', 'SELECT abs(-9223372036854775807 - 1) AS value'), /integer overflow/);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        await assert.rejects(worker.invoke('executeReadQuery', longRead, '[]', cancellationFlag), /cancelled/);
+        assert.strictEqual(Atomics.load(cancellationFlag, 0), 1, 'cancellation arrived after the statement was prepared');
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        await worker.invoke('runQuery', "INSERT INTO analyzed(label) VALUES ('written after the console')");
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM analyzed'), 201);
+
+        let expired = false;
+        let clock = 0;
+        const timed = await createWorkerHarness({
+            queryTimeout: 10,
+            now: () => expired ? (clock += 20) : clock,
+            // Expire the deadline once the console's own statement is prepared.
+            onSql: (kind, sql) => {
+                if (kind === 'prepare' && sql.includes('x<100000000') && !sql.startsWith('CREATE')) expired = true;
+            }
+        });
+        await assert.rejects(timed.invoke('executeReadQuery', longRead), /timed out/);
+        assert.strictEqual(expired, true, 'the deadline expired after the statement was prepared');
+        expired = false;
+        assert.strictEqual(await workerScalar(timed, 'PRAGMA query_only'), 0);
+
+        // A read-only connection is already query_only and stays so.
+        const readOnly = await createWorkerHarness({ readOnlyMode: true, content: new Uint8Array(await image()) });
+        await assert.rejects(readOnly.invoke('executeReadQuery', spellings[0]), /readonly database/);
+        assert.strictEqual((await readOnly.invoke('executeReadQuery', 'SELECT count(*) AS n FROM analyzed')).rows[0][0], 201);
+        assert.strictEqual((await readOnly.invoke('executeReadQuery', 'SELECT query_only FROM pragma_query_only')).rows[0][0], 1);
+        assert.strictEqual((await readOnly.invoke('executeReadQuery',
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'")).rows[0][0], 0);
+    });
+});
+
+describe('WASM worker views', () => {
+    it('bounds database-controlled errors before response and diagnostic delivery', async () => {
+        const diagnostics: unknown[][] = [];
+        const worker = await createWorkerHarness({
+            onError: (...args) => diagnostics.push(args)
+        });
+        const attackerText = 'x'.repeat(20_000);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE error_target (id INTEGER); ' +
+            'CREATE TRIGGER huge_error BEFORE INSERT ON error_target BEGIN ' +
+            `SELECT RAISE(ABORT, '${attackerText}'); END;`
+        );
+
+        await assert.rejects(worker.invoke('runQuery', 'INSERT INTO error_target VALUES (1)'), error => {
+            assert.ok(error instanceof Error);
+            assert.ok(error.message.length < 8400);
+            assert.match(error.message, /truncated from .* characters/i);
+            return true;
+        });
+        assert.strictEqual(diagnostics.length, 1, 'one failed RPC should produce one bounded diagnostic');
+        assert.ok(JSON.stringify(diagnostics).length < 8500);
+    });
+
+    it('does not retain or print hostile invalid-message payloads', async () => {
+        const warnings: unknown[][] = [];
+        const worker = await createWorkerHarness({
+            onWarn: (...args) => warnings.push(args)
+        });
+        const hostileEnvelope = {
+            secret: 'private-cell-value',
+            payload: new Uint8Array(1024 * 1024)
+        };
+
+        await worker.dispatchRaw(hostileEnvelope);
+
+        assert.strictEqual(warnings.length, 1);
+        assert.ok(!warnings[0].includes(hostileEnvelope));
+        assert.doesNotMatch(JSON.stringify(warnings), /private-cell-value/);
+    });
+
+    it('rejects inherited object properties as worker RPC methods', async () => {
+        const worker = await createWorkerHarness();
+
+        await assert.rejects(worker.invoke('constructor'), /Unknown method: constructor/);
+        await assert.rejects(worker.invoke('toString'), /Unknown method: toString/);
+    });
+
+    it('rejects a non-array worker RPC payload before dispatch', async () => {
+        const worker = await createWorkerHarness();
+
+        await assert.rejects(
+            worker.invokeWithPayload('ping', 'attacker-controlled-string'),
+            /payload must be an array/i
+        );
+    });
+
+    it('preserves format-specific output for empty-table exports', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_empty_export (id INTEGER, note TEXT)'
+        );
+        const exportEmpty = (format: string) => worker.invoke(
+            'exportTable',
+            { table: 'demo_empty_export' },
+            ['id', 'note'],
+            {},
+            {},
+            { format }
+        );
+
+        const csv = await exportEmpty('csv');
+        const excel = await exportEmpty('excel');
+        const json = await exportEmpty('json');
+        const sql = await exportEmpty('sql');
+
+        assert.strictEqual(Array.from(csv.contentChunks).join(''), 'id,note');
+        assert.strictEqual(csv.mimeType, 'text/csv');
+        assert.strictEqual(csv.filename, 'demo_empty_export.csv');
+        assert.strictEqual(Array.from(excel.contentChunks).join(''), 'id,note');
+        assert.strictEqual(excel.mimeType, 'text/csv');
+        assert.strictEqual(excel.filename, 'demo_empty_export.csv');
+        assert.strictEqual(Array.from(json.contentChunks).join(''), '[]');
+        assert.strictEqual(json.mimeType, 'application/json');
+        assert.strictEqual(Array.from(sql.contentChunks).join(''), '');
+        assert.strictEqual(sql.mimeType, 'text/sql');
+    });
+
+    it('returns bounded exports as chunks while preserving CSV, JSON, and SQL bytes', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_stage_e_export (id INTEGER, note TEXT, payload BLOB)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_stage_e_export VALUES (?, ?, ?), (?, ?, ?)',
+            [
+                1,
+                'comma, "quote"\nline',
+                new Uint8Array([1, 2, 3, 4]),
+                2,
+                null,
+                new Uint8Array()
+            ]
+        );
+        const invokeExport = (format: string, options: Record<string, unknown> = {}) => worker.invoke(
+            'exportTable',
+            { table: 'demo_stage_e_export' },
+            ['id', 'note', 'payload'],
+            {},
+            {},
+            { format, ...options }
+        );
+
+        const csv = await invokeExport('csv');
+        assert.strictEqual('content' in csv, false);
+        assert.ok(Array.isArray(csv.contentChunks));
+        assert.strictEqual(
+            Array.from(csv.contentChunks).join(''),
+            'id,note,payload\n' +
+            '1,"comma, ""quote""\nline",[BLOB]\n' +
+            '2,,[BLOB]'
+        );
+
+        const json = await invokeExport('json');
+        assert.strictEqual('content' in json, false);
+        assert.strictEqual(
+            Array.from(json.contentChunks).join(''),
+            JSON.stringify([
+                { id: 1, note: 'comma, "quote"\nline', payload: 'AQIDBA==' },
+                { id: 2, note: null, payload: '' }
+            ], null, 2)
+        );
+
+        const sql = await invokeExport('sql', { includeTableName: false });
+        assert.strictEqual('content' in sql, false);
+        assert.strictEqual(
+            Array.from(sql.contentChunks).join(''),
+            'INSERT INTO "table_name" ("id", "note", "payload") VALUES ' +
+            '(1, \'comma, "quote"\nline\', X\'01020304\');\n' +
+            'INSERT INTO "table_name" ("id", "note", "payload") VALUES (2, NULL, X\'\');'
+        );
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_export_int64 (value); ' +
+            'INSERT INTO demo_export_int64 VALUES ' +
+            '(9007199254740993), (9223372036854775807), (-9223372036854775808)'
+        );
+        const invokeInt64Export = (format: string) => worker.invoke(
+            'exportTable',
+            { table: 'demo_export_int64' },
+            ['value'],
+            {},
+            {},
+            { format }
+        );
+        const decimalLines =
+            '9007199254740993\n' +
+            '9223372036854775807\n' +
+            '-9223372036854775808';
+        for (const format of ['csv', 'excel']) {
+            const exported = await invokeInt64Export(format);
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), `value\n${decimalLines}`);
+        }
+        const int64Json = await invokeInt64Export('json');
+        assert.strictEqual(
+            Array.from(int64Json.contentChunks).join(''),
+            '[\n' +
+            '  {\n    "value": 9007199254740993\n  },\n' +
+            '  {\n    "value": 9223372036854775807\n  },\n' +
+            '  {\n    "value": -9223372036854775808\n  }\n' +
+            ']'
+        );
+        const int64Sql = await invokeInt64Export('sql');
+        const int64SqlText = Array.from(int64Sql.contentChunks).join('');
+        assert.strictEqual(
+            int64SqlText,
+            'INSERT INTO "demo_export_int64" ("value") VALUES (9007199254740993);\n' +
+            'INSERT INTO "demo_export_int64" ("value") VALUES (9223372036854775807);\n' +
+            'INSERT INTO "demo_export_int64" ("value") VALUES (-9223372036854775808);'
+        );
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_int64_copy (value)');
+        await worker.invoke(
+            'runQuery',
+            int64SqlText.replaceAll('"demo_export_int64"', '"demo_export_int64_copy"')
+        );
+        const restoredInt64 = await worker.invoke(
+            'runQuery',
+            'SELECT typeof(value), CAST(value AS TEXT) FROM demo_export_int64_copy ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(restoredInt64[0].rows, (row: unknown[]) => Array.from(row)),
+            [
+                ['integer', '9007199254740993'],
+                ['integer', '9223372036854775807'],
+                ['integer', '-9223372036854775808']
+            ]
+        );
+    });
+
+    it('leaves generated columns out of SQL exports so they load back', async () => {
+        const createSql = 'CREATE TABLE g (a INTEGER, d INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL, ' +
+            "s TEXT GENERATED ALWAYS AS ('s' || a) STORED, b TEXT)";
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', createSql);
+        await worker.invoke('runQuery', "INSERT INTO g (a, b) VALUES (1, 'x'), (2, NULL)");
+        const exportText = async (columns: string[], options: Record<string, unknown>) => Array.from(
+            (await worker.invoke('exportTable', { table: 'g' }, columns, {}, {}, options)).contentChunks
+        ).join('');
+        const contents = async (harness: WorkerHarness) => Array.from(
+            (await harness.invoke('runQuery', 'SELECT a, d, s, b FROM g ORDER BY rowid'))[0].rows,
+            (row: unknown[]) => Array.from(row)
+        );
+
+        for (const columns of [[], ['a', 'd', 's', 'b']]) {
+            const sql = await exportText(columns, { format: 'sql' });
+            const reloaded = await createWorkerHarness();
+            await reloaded.invoke('runQuery', createSql);
+            await reloaded.invoke('runQuery', sql);
+            assert.deepStrictEqual(await contents(reloaded), [[1, 2, 's1', 'x'], [2, 4, 's2', null]]);
+            assert.strictEqual(
+                sql,
+                'INSERT INTO "g" ("a", "b") VALUES (1, \'x\');\n' +
+                'INSERT INTO "g" ("a", "b") VALUES (2, NULL);'
+            );
+        }
+        assert.strictEqual(
+            await exportText(['a', 'D'], { format: 'sql' }),
+            'INSERT INTO "g" ("a") VALUES (1);\nINSERT INTO "g" ("a") VALUES (2);'
+        );
+        assert.strictEqual(await exportText([], { format: 'csv' }), 'a,d,s,b\n1,2,s1,x\n2,4,s2,');
+        assert.deepStrictEqual(JSON.parse(await exportText([], { format: 'json' })), [
+            { a: 1, d: 2, s: 's1', b: 'x' }, { a: 2, d: 4, s: 's2', b: null }
+        ]);
+        await assert.rejects(exportText(['d', 's'], { format: 'sql' }), /generated/);
+    });
+
+    it('writes a CSV record of one empty field as "" so it imports back', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE single (a); INSERT INTO single VALUES (NULL), ('x'), (''), (NULL); " +
+            'CREATE TABLE unnamed (""); INSERT INTO unnamed VALUES (\'x\')'
+        );
+        const exportCsv = async (table: string, columns: string[], format = 'csv') => Array.from(
+            (await worker.invoke('exportTable', { table }, columns, {}, {}, { format })).contentChunks
+        ).join('');
+
+        const csv = await exportCsv('single', ['a']);
+        assert.deepStrictEqual(parseImport(csv, 'csv').rows, [{ a: '' }, { a: 'x' }, { a: '' }, { a: '' }]);
+        assert.strictEqual(csv, 'a\n""\nx\n""\n""');
+        assert.strictEqual(await exportCsv('single', ['a'], 'excel'), csv);
+        assert.strictEqual(await exportCsv('unnamed', ['']), '""\nx');
+    });
+
+    it('exports prototype-spelled columns as own enumerable JSON properties', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_proto_export (' +
+            '"__proto__" TEXT, "constructor" TEXT, "prototype" TEXT)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_proto_export VALUES (?, ?, ?)',
+            ['proto-value', 'constructor-value', 'prototype-value']
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_proto_export' },
+            ['__proto__', 'constructor', 'prototype'],
+            {},
+            {},
+            { format: 'json' }
+        );
+        const json = Array.from(exported.contentChunks).join('');
+
+        assert.strictEqual(
+            json,
+            '[\n  {\n    "__proto__": "proto-value",\n' +
+            '    "constructor": "constructor-value",\n' +
+            '    "prototype": "prototype-value"\n  }\n]'
+        );
+        const [row] = JSON.parse(json);
+        assert.strictEqual(Object.prototype.propertyIsEnumerable.call(row, '__proto__'), true);
+        assert.deepStrictEqual(Object.keys(row), ['__proto__', 'constructor', 'prototype']);
+    });
+
+    it('neutralizes formula-bearing TEXT values and headers in bundled CSV exports', async () => {
+        const worker = await createWorkerHarness();
+        const dangerousHeader = '=WEBSERVICE(A1)';
+        const dangerousText = '\uFEFF+SUM(A1:A2)';
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_csv_formula ("${dangerousHeader}" TEXT)`
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_csv_formula VALUES (?)',
+            [dangerousText]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_csv_formula' },
+            [dangerousHeader],
+            {},
+            {},
+            { format: 'csv' }
+        );
+
+        assert.strictEqual(
+            Array.from(exported.contentChunks).join(''),
+            `"'${dangerousHeader}"\n"'${dangerousText}"`
+        );
+    });
+
+    it('exports a 2000-column demo table within SQLite result width', async () => {
+        const worker = await createWorkerHarness();
+        const columns = Array.from({ length: 2000 }, (_, index) => `c${index}`);
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_wide_export (` +
+            columns.map(column => `"${column}"`).join(', ') +
+            ')'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_wide_export ("c0", "c1999") VALUES (?, ?)',
+            ['first', 'last']
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_wide_export' },
+            columns,
+            {},
+            {},
+            { format: 'csv' }
+        );
+        const [header, row] = Array.from(exported.contentChunks).join('').split('\n');
+
+        assert.deepStrictEqual(header.split(','), columns);
+        const values = row.split(',');
+        assert.strictEqual(values.length, 2000);
+        assert.strictEqual(values[0], 'first');
+        assert.strictEqual(values[1999], 'last');
+        assert.strictEqual(values.slice(1, -1).every(value => value === ''), true);
+    });
+
+    it('exports malformed TEXT bytes faithfully in all four demo formats', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_invalid_text_export (value TEXT); ' +
+            "INSERT INTO demo_invalid_text_export VALUES (CAST(X'80' AS TEXT))"
+        );
+        const expected: Record<string, string> = {
+            csv: 'value\n[SQLite TEXT bytes; encoding=utf-8; base64=gA==]',
+            excel: 'value\n[SQLite TEXT bytes; encoding=utf-8; base64=gA==]',
+            json:
+                '[\n' +
+                '  {\n' +
+                '    "value": {"$sqliteExplorerTextBytes":{"encoding":"utf-8","base64":"gA=="}}\n' +
+                '  }\n' +
+                ']',
+            sql: 'INSERT INTO "demo_invalid_text_export" ("value") VALUES (CAST(X\'80\' AS TEXT));'
+        };
+
+        for (const format of ['csv', 'excel', 'json', 'sql']) {
+            const exported = await worker.invoke(
+                'exportTable',
+                { table: 'demo_invalid_text_export' },
+                ['value'],
+                {},
+                {},
+                { format }
+            );
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), expected[format]);
+        }
+    });
+
+    it('round-trips demo SQL exports without losing BLOB, embedded NUL text, or int64 values', async () => {
+        const worker = await createWorkerHarness({ coerceBigIntsToNumbers: true });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_sql_roundtrip (payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_sql_roundtrip VALUES (?, CAST(? AS TEXT), 9007199254740993)',
+            [new Uint8Array([0, 1, 2, 253, 254]), new TextEncoder().encode('before\0after')]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_sql_roundtrip' },
+            ['payload', 'nul_text', 'exact_int'],
+            {},
+            {},
+            { format: 'sql' }
+        );
+        const sql = Array.from(exported.contentChunks).join('');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_sql_roundtrip_copy ' +
+            '(payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            sql.replaceAll('"demo_sql_roundtrip"', '"demo_sql_roundtrip_copy"')
+        );
+
+        const restored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(payload), hex(CAST(nul_text AS BLOB)), typeof(exact_int), ' +
+            'CAST(exact_int AS TEXT) FROM demo_sql_roundtrip_copy'
+        );
+        assert.deepStrictEqual(Array.from(restored[0].rows[0]), [
+            '000102FDFE',
+            '6265666F7265006166746572',
+            'integer',
+            '9007199254740993'
+        ]);
+    });
+
+    it('round-trips demo JSON exports without losing BLOB, embedded NUL text, or int64 values', async () => {
+        const worker = await createWorkerHarness({ coerceBigIntsToNumbers: true });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_json_roundtrip (payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_json_roundtrip VALUES (?, CAST(? AS TEXT), 9007199254740993)',
+            [new Uint8Array([0, 1, 2, 253, 254]), new TextEncoder().encode('before\0after')]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_json_roundtrip' },
+            ['payload', 'nul_text', 'exact_int'],
+            {},
+            {},
+            { format: 'json' }
+        );
+        const json = Array.from(exported.contentChunks).join('');
+        assert.match(json, /"exact_int": 9007199254740993/);
+        const [row] = JSON.parse(json);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_json_roundtrip_copy ' +
+            '(payload BLOB, nul_text TEXT, exact_int INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_json_roundtrip_copy VALUES ' +
+            '(?, CAST(? AS TEXT), json_extract(?, \'$[0].exact_int\'))',
+            [
+                new Uint8Array(Buffer.from(row.payload, 'base64')),
+                new TextEncoder().encode(row.nul_text),
+                json
+            ]
+        );
+
+        const restored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(payload), hex(CAST(nul_text AS BLOB)), typeof(exact_int), ' +
+            'CAST(exact_int AS TEXT) FROM demo_json_roundtrip_copy'
+        );
+        assert.deepStrictEqual(Array.from(restored[0].rows[0]), [
+            '000102FDFE',
+            '6265666F7265006166746572',
+            'integer',
+            '9007199254740993'
+        ]);
+    });
+
+    it('splits bounded web-demo output into assembly chunks instead of one response string', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_stage_e_chunks (value TEXT)');
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_stage_e_chunks VALUES (?)',
+            ['x'.repeat(160 * 1024)]
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_stage_e_chunks' },
+            ['value'],
+            {},
+            {},
+            { format: 'json' }
+        );
+
+        assert.strictEqual('content' in exported, false);
+        assert.ok(exported.contentChunks.length > 1);
+        assert.ok(Array.from(exported.contentChunks).every(
+            (chunk: unknown) => typeof chunk === 'string' && chunk.length <= 64 * 1024
+        ));
+        assert.strictEqual(
+            JSON.parse(Array.from(exported.contentChunks).join(''))[0].value.length,
+            160 * 1024
+        );
+    });
+
+    it('refuses oversized web-demo exports before fetching whole cell content', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (_kind, sql) => observedSql.push(sql)
+        });
+        await worker.invoke('runQuery', 'CREATE TABLE demo_stage_e_cap (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_stage_e_cap VALUES (zeroblob(${16 * 1024 * 1024 + 1}))`
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_stage_e_cap' },
+                ['payload'],
+                {},
+                {},
+                { format: 'json' }
+            ),
+            /limited to 16 MiB \(16,777,216 bytes\).*worker RPC cannot stream downloads/i
+        );
+        assert.ok(
+            observedSql.every(sql => !/^SELECT\s+"payload"\s+FROM\s+"demo_stage_e_cap"/i.test(sql)),
+            `oversized export fetched the whole cell: ${observedSql.join('\n')}`
+        );
+    });
+
+    it('lets a raised maxExportBytes complete an export whose real output exceeds the 16 MiB demo cap', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_raised_cap (payload BLOB)');
+        // 13 MiB of real bytes base64-encodes to ~17.3 MiB of JSON output --
+        // over the 16 MiB demo ceiling with a comfortable margin -- while its
+        // estimate (JSON's blob estimate is the ~4/3 base64 expansion, not
+        // CSV/Excel's flat 64) stays well under the raised 64 MiB cap. Kept as
+        // small as a safe margin allows: the worker's hex transport decode is
+        // O(bytes) with real per-byte cost, so this single value already
+        // dominates this file's runtime at any larger size.
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_export_raised_cap VALUES (zeroblob(${13 * 1024 * 1024}))`
+        );
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_export_raised_cap' },
+            ['payload'],
+            {},
+            {},
+            { format: 'json', maxExportBytes: 64 * 1024 * 1024 }
+        );
+
+        assert.ok(
+            Array.from(exported.contentChunks).join('').length > 16 * 1024 * 1024,
+            'raised-cap export did not actually produce more than 16 MiB of output'
+        );
+    });
+
+    it('throws the parameterized, non-demo message when maxExportBytes is set below the default cap', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_export_tiny_cap (v INTEGER); INSERT INTO demo_export_tiny_cap VALUES (1)'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_export_tiny_cap' },
+                ['v'],
+                {},
+                {},
+                { format: 'csv', maxExportBytes: 1024 }
+            ),
+            (error: Error) => {
+                assert.match(error.message, /1024 bytes/);
+                assert.doesNotMatch(error.message, /web demo/i);
+                assert.doesNotMatch(error.message, /desktop extension/i);
+                return true;
+            }
+        );
+    });
+
+    it('falls back to the default 16 MiB demo cap for a non-positive-integer maxExportBytes', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_bad_cap (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_export_bad_cap VALUES (zeroblob(${16 * 1024 * 1024 + 1}))`
+        );
+
+        // Pin the legacy demo wording byte-exact once: the regex loop below only
+        // checks that the disqualifying substrings are present, not that nothing
+        // in the sentence has drifted (e.g. the trailing "use the desktop
+        // extension" clause, which neither regex anchors on).
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_export_bad_cap' },
+                ['payload'],
+                {},
+                {},
+                { format: 'json', maxExportBytes: NaN }
+            ),
+            (error: Error) => {
+                assert.strictEqual(
+                    error.message,
+                    'Web demo exports are limited to 16 MiB (16,777,216 bytes) because the ' +
+                    'worker RPC cannot stream downloads; use the desktop extension for larger exports.'
+                );
+                return true;
+            }
+        );
+
+        for (const invalid of [-5, 0, 3.5]) {
+            await assert.rejects(
+                worker.invoke(
+                    'exportTable',
+                    { table: 'demo_export_bad_cap' },
+                    ['payload'],
+                    {},
+                    {},
+                    { format: 'json', maxExportBytes: invalid }
+                ),
+                /limited to 16 MiB \(16,777,216 bytes\).*worker RPC cannot stream downloads/i,
+                `maxExportBytes: ${invalid} did not fall back to the default demo cap`
+            );
+        }
+    });
+
+    it('clamps a maxExportBytes above 1 GiB down to the 1 GiB hard ceiling', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_export_ceiling (payload TEXT)');
+        // TEXT's estimate multiplier is 6x real bytes, so ~180 MiB of real text
+        // (safely under SQLite's ~954 MiB single-value SQLITE_MAX_LENGTH ceiling)
+        // produces a ~1.08 GiB estimate -- above the 1 GiB hard sanity ceiling
+        // even though the requested cap below is 2 GiB.
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_export_ceiling VALUES (CAST(zeroblob(${180 * 1024 * 1024}) AS TEXT))`
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'exportTable',
+                { table: 'demo_export_ceiling' },
+                ['payload'],
+                {},
+                {},
+                { format: 'csv', maxExportBytes: 2 * 1024 * 1024 * 1024 }
+            ),
+            (error: Error) => {
+                // 1 GiB, not the requested 2 GiB -- proves the clamp, not just a cap.
+                assert.match(error.message, /1073741824 bytes/);
+                assert.doesNotMatch(error.message, /web demo/i);
+                assert.doesNotMatch(error.message, /desktop extension/i);
+                return true;
+            }
+        );
+    });
+
+    it('exports oversized CSV/Excel BLOB placeholders without transporting source bytes', async () => {
+        const projectionResults: unknown[] = [];
+        const worker = await createWorkerHarness({
+            onSqlResult: (kind, sql, result) => {
+                if (
+                    kind === 'exec'
+                    && sql.includes('FROM main."demo_format_blob_placeholder"')
+                    && !/COUNT\s*\(\s*\*\s*\)/i.test(sql)
+                ) {
+                    projectionResults.push(result);
+                }
+            }
+        });
+        await worker.invoke('runQuery', 'CREATE TABLE demo_format_blob_placeholder (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_format_blob_placeholder VALUES (zeroblob(${16 * 1024 * 1024 + 1}))`
+        );
+
+        for (const format of ['csv', 'excel']) {
+            const exported = await worker.invoke(
+                'exportTable',
+                { table: 'demo_format_blob_placeholder' },
+                ['payload'],
+                {},
+                {},
+                { format }
+            );
+            assert.strictEqual(
+                Array.from(exported.contentChunks).join(''),
+                'payload\n[BLOB]'
+            );
+        }
+        assert.strictEqual(projectionResults.length, 2);
+        const containsBlobBytes = (value: unknown): boolean => {
+            if (value instanceof Uint8Array) return value.byteLength > 0;
+            if (Array.isArray(value)) return value.some(containsBlobBytes);
+            if (value && typeof value === 'object') {
+                return Object.values(value as Record<string, unknown>).some(containsBlobBytes);
+            }
+            return false;
+        };
+        assert.strictEqual(projectionResults.some(containsBlobBytes), false);
+    });
+
+    it('rejects JSON base64 and SQL hex expansion before fetching BLOB bytes', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => {
+                if (kind === 'exec') observedSql.push(sql);
+            }
+        });
+        await worker.invoke('runQuery', 'CREATE TABLE demo_format_blob_expansion (payload BLOB)');
+        await worker.invoke(
+            'runQuery',
+            `INSERT INTO demo_format_blob_expansion VALUES (zeroblob(${13 * 1024 * 1024}))`
+        );
+
+        for (const format of ['json', 'sql']) {
+            const projectionCountBefore = observedSql.filter(
+                sql => /^SELECT\s+CASE\s+typeof\("payload"\)/i.test(sql)
+            ).length;
+            await assert.rejects(
+                worker.invoke(
+                    'exportTable',
+                    { table: 'demo_format_blob_expansion' },
+                    ['payload'],
+                    {},
+                    {},
+                    { format }
+                ),
+                /limited to 16 MiB \(16,777,216 bytes\)/i
+            );
+            const projectionCountAfter = observedSql.filter(
+                sql => /^SELECT\s+CASE\s+typeof\("payload"\)/i.test(sql)
+            ).length;
+            assert.strictEqual(
+                projectionCountAfter,
+                projectionCountBefore,
+                `${format} fetched BLOB bytes before enforcing encoded output size`
+            );
+        }
+    });
+
+    it('chunks a 5000-row seven-column selected export below the SQLite bind limit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_wide_selected_export (' +
+            'a INTEGER, b INTEGER, c INTEGER, d INTEGER, e INTEGER, f INTEGER, g INTEGER, ' +
+            'value TEXT, PRIMARY KEY (a, b, c, d, e, f, g)' +
+            ') WITHOUT ROWID; ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 5000' +
+            ') INSERT INTO demo_wide_selected_export ' +
+            "SELECT value, 0, 0, 0, 0, 0, 0, printf('row-%d', value) FROM ids"
+        );
+        const keyColumns: PrimaryKeyColumn[] = 'abcdefg'.split('').map((identifier, index) => ({
+            identifier,
+            declaredType: 'INTEGER',
+            position: index + 1
+        }));
+        const rowIds = Array.from({ length: 5000 }, (_, index) => (
+            encodePrimaryKeyRecordId(keyColumns, [index + 1, 0, 0, 0, 0, 0, 0])
+        ));
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_wide_selected_export' },
+            ['value'],
+            {},
+            {},
+            { format: 'csv', rowIds }
+        );
+        const values = Array.from(exported.contentChunks).join('').split('\n').slice(1);
+        assert.strictEqual(values.length, 5000);
+        assert.strictEqual(new Set(values).size, 5000);
+        assert.ok(values.includes('row-1'));
+        assert.ok(values.includes('row-5000'));
+    });
+
+    it('refuses demo multi-row operations whose INTEGER identity names a row in a column later declared TEXT', async () => {
+        // The fixture holds INTEGER 1 beside TEXT '1' in a column declared
+        // TEXT. Each identity must name only its own row.
+        const seed = await createSeedDatabase();
+        await seed.executeQuery(
+            'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted VALUES (1, 'integer'), ('1', 'text'), ('2', 'other'); " +
+            'CREATE TABLE crafted_pair (a, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_pair VALUES (1, 5, 'integer'), ('1', 5, 'text'), ('2', 5, 'other')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted'"
+        );
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted_pair (a TEXT, b, v TEXT, PRIMARY KEY (a, b)) WITHOUT ROWID' " +
+            "WHERE name = 'crafted_pair'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const worker = await createWorkerHarness({ content: await seed.serializeDatabase() });
+        const single: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'TEXT', position: 1 }];
+        const pair: PrimaryKeyColumn[] = [
+            { identifier: 'a', declaredType: 'TEXT', position: 1 },
+            { identifier: 'b', declaredType: '', position: 2 }
+        ];
+        for (const [table, integerKey, otherKey] of [
+            ['crafted', encodePrimaryKeyRecordId(single, [1n]), encodePrimaryKeyRecordId(single, ['2'])],
+            ['crafted_pair', encodePrimaryKeyRecordId(pair, [1n, 5n]), encodePrimaryKeyRecordId(pair, ['2', 5n])]
+        ] as const) {
+            const stored = async () => (await worker.invoke(
+                'runQuery',
+                `SELECT typeof(${table === 'crafted' ? 'k' : 'a'}), v FROM ${table} ORDER BY v`
+            ))[0].rows;
+            const before = await stored();
+            assert.deepStrictEqual(before, [['integer', 'integer'], ['text', 'other'], ['text', 'text']]);
+            const exported = await worker.invoke(
+                'exportTable',
+                { table },
+                ['v'],
+                {},
+                {},
+                { format: 'csv', rowIds: [integerKey] }
+            );
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v');
+            await assert.rejects(worker.invoke('deleteRows', table, [integerKey]));
+            await assert.rejects(worker.invoke('deleteRows', table, [integerKey, otherKey]));
+            assert.deepStrictEqual(await stored(), before);
+        }
+    });
+
+    it('refuses demo REAL identities that name a row in a column later declared TEXT', async () => {
+        // A REAL identity binds as a number, which a column declared TEXT
+        // compares as text. Each identity must name only its own row.
+        const seed = await createSeedDatabase();
+        await seed.executeQuery(
+            'CREATE TABLE crafted (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted VALUES (1.0, 'real'), ('1', 'text'), ('2', 'other'); " +
+            "CREATE TABLE text_key (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; INSERT INTO text_key VALUES ('x', 'row')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const worker = await createWorkerHarness({ content: await seed.serializeDatabase() });
+        const single: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'TEXT', position: 1 }];
+        const realKey = encodePrimaryKeyRecordId(single, [1]);
+        const stored = async () => (await worker.invoke(
+            'runQuery',
+            'SELECT typeof(k), v FROM crafted ORDER BY v'
+        ))[0].rows;
+        const before = await stored();
+        assert.deepStrictEqual(before, [['text', 'other'], ['real', 'real'], ['text', 'text']]);
+        await assert.rejects(worker.invoke('getCellMetadata', { table: 'crafted', rowId: realKey, column: 'v' }));
+        await assert.rejects(worker.invoke('updateCell', 'crafted', realKey, 'v', 'edited'));
+        await assert.rejects(worker.invoke('deleteRows', 'crafted', [realKey]));
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'crafted' },
+            ['v'],
+            {},
+            {},
+            { format: 'csv', rowIds: [realKey] }
+        );
+        assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v');
+        assert.deepStrictEqual(await stored(), before);
+
+        // The identity re-read after a key edit carries the class of the
+        // value written, which the column's affinity changed.
+        const edited = await worker.invoke(
+            'updateCell',
+            'text_key',
+            encodePrimaryKeyRecordId(single, ['x']),
+            'k',
+            5
+        );
+        assert.match(decodeURIComponent(edited), /\["text","5"\]/);
+        assert.deepStrictEqual(
+            (await worker.invoke('runQuery', 'SELECT typeof(k), k, v FROM text_key'))[0].rows,
+            [['text', '5', 'row']]
+        );
+    });
+
+    it('keeps demo TEXT identities off a numeric twin and refuses a delete that does not match one row per identity', async () => {
+        // A TEXT identity binds as text, which a column declared INTEGER
+        // compares as a number; and a key declared COLLATE NOCASE over rows
+        // stored under BINARY holds 'A' and 'a'. Each identity must match
+        // exactly one row, its own.
+        const seed = await createSeedDatabase();
+        await seed.executeQuery(
+            'CREATE TABLE crafted_int (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO crafted_int VALUES (1, 'number'), ('1', 'text'), (2, 'other'); " +
+            'CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a)) WITHOUT ROWID; ' +
+            "INSERT INTO folded VALUES ('A', 'upper'), ('a', 'lower'), ('c', 'other')"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = ON');
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE crafted_int (k INTEGER PRIMARY KEY, v TEXT) WITHOUT ROWID' " +
+            "WHERE name = 'crafted_int'"
+        );
+        await seed.executeQuery(
+            "UPDATE sqlite_schema SET sql = 'CREATE TABLE folded (a TEXT, v TEXT, PRIMARY KEY (a COLLATE NOCASE)) WITHOUT ROWID' " +
+            "WHERE name = 'folded'"
+        );
+        await seed.executeQuery('PRAGMA writable_schema = OFF');
+        const worker = await createWorkerHarness({ content: await seed.serializeDatabase() });
+        const single: PrimaryKeyColumn[] = [{ identifier: 'k', declaredType: 'INTEGER', position: 1 }];
+        const textKey = encodePrimaryKeyRecordId(single, ['1']);
+        const stored = async () => (await worker.invoke(
+            'runQuery',
+            'SELECT typeof(k), v FROM crafted_int ORDER BY v'
+        ))[0].rows;
+        const before = await stored();
+        assert.deepStrictEqual(before, [['integer', 'number'], ['integer', 'other'], ['text', 'text']]);
+        await assert.rejects(worker.invoke('updateCell', 'crafted_int', textKey, 'v', 'edited'));
+        await assert.rejects(worker.invoke('getCellMetadata', { table: 'crafted_int', rowId: textKey, column: 'v' }));
+        await assert.rejects(worker.invoke('deleteRows', 'crafted_int', [textKey]));
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'crafted_int' },
+            ['v'],
+            {},
+            {},
+            { format: 'csv', rowIds: [textKey] }
+        );
+        assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v');
+        assert.deepStrictEqual(await stored(), before);
+
+        const foldedKey: PrimaryKeyColumn[] = [{ identifier: 'a', declaredType: 'TEXT', position: 1 }];
+        const folded = async () => (await worker.invoke('runQuery', 'SELECT a, v FROM folded ORDER BY v'))[0].rows;
+        const foldedBefore = await folded();
+        const lower = encodePrimaryKeyRecordId(foldedKey, ['a']);
+        await assert.rejects(worker.invoke('deleteRows', 'folded', [lower, encodePrimaryKeyRecordId(foldedKey, [5n])]));
+        assert.deepStrictEqual(await folded(), foldedBefore);
+        await assert.rejects(worker.invoke('deleteRows', 'folded', [lower]));
+        assert.deepStrictEqual(await folded(), foldedBefore);
+    });
+
+    it('edits, exports and deletes demo TEXT keys under the TEXT storage check', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_text_keys (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID; " +
+            "INSERT INTO demo_text_keys VALUES ('1', 'text'), ('b', 'other'); " +
+            'CREATE TABLE demo_typeless_text_keys (k PRIMARY KEY, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO demo_typeless_text_keys VALUES ('1', 'text'), (1, 'integer'), ('b', 'other')"
+        );
+        for (const [table, declaredType] of [['demo_text_keys', 'TEXT'], ['demo_typeless_text_keys', '']] as const) {
+            const rows = async () => (await worker.invoke(
+                'runQuery',
+                `SELECT typeof(k), CAST(k AS TEXT), v FROM ${table} ORDER BY v`
+            ))[0].rows;
+            const before = await rows();
+            const textKey = encodePrimaryKeyRecordId([{ identifier: 'k', declaredType, position: 1 }], ['1']);
+            const exported = await worker.invoke(
+                'exportTable',
+                { table },
+                ['v'],
+                {},
+                {},
+                { format: 'csv', rowIds: [textKey] }
+            );
+            assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v\ntext');
+            await worker.invoke('updateCell', table, textKey, 'v', 'text-edited');
+            assert.ok((await rows()).some((row: unknown[]) => row[2] === 'text-edited'));
+            await worker.invoke('updateCell', table, textKey, 'v', 'text');
+            assert.deepStrictEqual(await rows(), before);
+            assert.strictEqual((await worker.invoke('deleteRows', table, [textKey])).length, 1);
+            assert.deepStrictEqual(await rows(), before.filter((row: unknown[]) => row[2] !== 'text'));
+        }
+    });
+
+    it('addresses and pages a demo key whose collation is stricter than its column', async () => {
+        // 'A' and 'a' are distinct keys under the key's BINARY collation and
+        // equal under the column's NOCASE. Each identity must name one row,
+        // and a page turn must show both.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_cased (a TEXT COLLATE NOCASE, g INTEGER, v TEXT, PRIMARY KEY (a COLLATE BINARY)) WITHOUT ROWID; ' +
+            "INSERT INTO demo_cased VALUES ('A', 1, 'A'), ('a', 1, 'a'), ('B', 2, 'B'), ('b', 1, 'b'), " +
+            "('c', 2, 'c'), ('C', 2, 'C'), ('d', 1, 'd')"
+        );
+        const stored = async () => (await worker.invoke(
+            'runQuery',
+            'SELECT v FROM demo_cased ORDER BY a COLLATE BINARY'
+        ))[0].rows.map((row: unknown[]) => row[0]);
+        const before = await stored();
+
+        for (const [sort, oracleOrder] of [
+            [{}, 'a COLLATE BINARY ASC'],
+            [{ orderBy: 'a', orderDir: 'DESC' }, 'a COLLATE BINARY DESC'],
+            [{ orderBy: 'g', orderDir: 'ASC' }, 'g ASC, a COLLATE BINARY ASC']
+        ] as const) {
+            const oracle = (await worker.invoke(
+                'runQuery',
+                `SELECT v FROM demo_cased ORDER BY ${oracleOrder}`
+            ))[0].rows.map((row: unknown[]) => row[0]);
+            const options = (page: number, keyset?: unknown) => ({
+                columns: ['rowid', 'a', 'g', 'v'],
+                ...sort,
+                limit: 1,
+                offset: page,
+                ...(keyset ? { keyset } : {})
+            });
+            const forward: unknown[] = [];
+            let anchor: string | undefined;
+            for (let page = 0; page < oracle.length; page++) {
+                const result = await worker.invoke('fetchTableData', 'demo_cased', options(
+                    page,
+                    page === 0 ? { mode: 'first' } : { mode: 'after', anchor }
+                ));
+                forward.push(...result.rows.map((row: unknown[]) => row[3]));
+                anchor = result.keysetAnchors?.last;
+                assert.ok(anchor, `${oracleOrder}: anchor on page ${page}`);
+            }
+            assert.deepStrictEqual(forward, oracle, `${oracleOrder}: Next walk`);
+            const backward: unknown[] = [];
+            for (let page = oracle.length - 1; page >= 0; page--) {
+                const result = await worker.invoke('fetchTableData', 'demo_cased', options(
+                    page,
+                    page === oracle.length - 1
+                        ? { mode: 'last', lastPageRowCount: 1 }
+                        : { mode: 'before', anchor }
+                ));
+                backward.unshift(...result.rows.map((row: unknown[]) => row[3]));
+                anchor = result.keysetAnchors?.first;
+            }
+            assert.deepStrictEqual(backward, oracle, `${oracleOrder}: Prev walk`);
+            const offsetPages: unknown[] = [];
+            for (let page = 0; page < oracle.length; page++) {
+                const result = await worker.invoke('fetchTableData', 'demo_cased', options(page));
+                offsetPages.push(...result.rows.map((row: unknown[]) => row[3]));
+            }
+            assert.deepStrictEqual(offsetPages, oracle, `${oracleOrder}: OFFSET pages`);
+        }
+
+        const keyColumns: PrimaryKeyColumn[] = [{ identifier: 'a', declaredType: 'TEXT', position: 1 }];
+        const lower = encodePrimaryKeyRecordId(keyColumns, ['a']);
+        const missing = encodePrimaryKeyRecordId(keyColumns, ['zz']);
+        await assert.rejects(worker.invoke('deleteRows', 'demo_cased', [lower, missing]));
+        assert.deepStrictEqual(await stored(), before);
+        const metadata = await worker.invoke('getCellMetadata', { table: 'demo_cased', rowId: lower, column: 'v' });
+        assert.deepStrictEqual(
+            [metadata.storageClass, metadata.byteLength],
+            ['text', 1]
+        );
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_cased' },
+            ['v'],
+            {},
+            {},
+            { format: 'csv', rowIds: [lower] }
+        );
+        assert.strictEqual(Array.from(exported.contentChunks).join(''), 'v\na');
+        await worker.invoke('updateCell', 'demo_cased', lower, 'v', 'a-edited');
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                "SELECT a, v FROM demo_cased WHERE a IN ('A', 'a') ORDER BY a COLLATE BINARY"
+            ))[0].rows,
+            [['A', 'A'], ['a', 'a-edited']]
+        );
+        assert.strictEqual((await worker.invoke('deleteRows', 'demo_cased', [lower])).length, 1);
+        assert.deepStrictEqual(await stored(), before.filter((value: unknown) => value !== 'a'));
+    });
+
+    it('chunks a demo rowid delete above the SQLite bind limit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_bulk_rowid_delete (value INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 32768' +
+            ') INSERT INTO demo_bulk_rowid_delete SELECT value FROM ids'
+        );
+        const rowIds = Array.from({ length: 32_768 }, (_, index) => index + 1);
+
+        const deleted = await worker.invoke('deleteRows', 'demo_bulk_rowid_delete', rowIds);
+        assert.strictEqual(deleted.length, 32_768);
+        assert.strictEqual(new Set(deleted.map((row: { rowId: RecordId }) => (
+            String(row.rowId)
+        ))).size, 32_768);
+        const remaining = await worker.invoke(
+            'runQuery',
+            'SELECT count(*) FROM demo_bulk_rowid_delete'
+        );
+        assert.deepStrictEqual(remaining[0].rows, [[0]]);
+    });
+
+    it('chunks a demo rowid batch update above the SQLite bind limit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_bulk_rowid_update (value INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 32768' +
+            ') INSERT INTO demo_bulk_rowid_update SELECT 0 FROM ids'
+        );
+        const updates = Array.from({ length: 32_768 }, (_, index) => ({
+            rowId: index + 1,
+            column: 'value',
+            value: 1,
+            originalValue: 0
+        }));
+
+        const outcomes = await worker.invoke(
+            'updateCellBatch',
+            'demo_bulk_rowid_update',
+            updates
+        );
+        assert.strictEqual(outcomes.length, 32_768);
+        const result = await worker.invoke(
+            'runQuery',
+            'SELECT count(*), sum(value) FROM demo_bulk_rowid_update'
+        );
+        assert.deepStrictEqual(result[0].rows, [[32_768, 32_768]]);
+    });
+
+    it('refuses an unreturnable demo delete snapshot before mutating the row', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_oversized_delete_snapshot (payload BLOB); ' +
+            `INSERT INTO demo_oversized_delete_snapshot VALUES (` +
+            `zeroblob(${MAX_WEBVIEW_BINARY_VALUE_BYTES + 1}))`
+        );
+
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_oversized_delete_snapshot', [1]),
+            /delete snapshot.*web transport|web transport.*delete snapshot/i
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT count(*) FROM demo_oversized_delete_snapshot'
+            ),
+            1
+        );
+    });
+
+    it('keeps demo table reads, full-cell reads, and exports on main through a TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_read_shadow (value TEXT); ' +
+            "INSERT INTO main.demo_main_read_shadow VALUES ('main-cell'); " +
+            'CREATE TEMP TABLE demo_main_read_shadow (value TEXT); ' +
+            "INSERT INTO temp.demo_main_read_shadow VALUES ('temporary-cell'), ('temporary-extra')"
+        );
+
+        // Arbitrary SQL keeps SQLite's normal TEMP-first name resolution.
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_main_read_shadow LIMIT 1'),
+            'temporary-cell'
+        );
+
+        const page = await worker.invoke('fetchTableData', 'demo_main_read_shadow', {
+            columns: ['rowid', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            Array.from(page.rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'main-cell']]
+        );
+        const count = await worker.invoke('fetchTableCount', 'demo_main_read_shadow', {});
+        assert.strictEqual(count.count, 1);
+        assert.strictEqual(count.isExact, true);
+
+        const metadata = await worker.invoke('getCellMetadata', {
+            table: 'demo_main_read_shadow',
+            rowId: 1,
+            column: 'value'
+        });
+        assert.strictEqual(metadata.byteLength, new TextEncoder().encode('main-cell').byteLength);
+        const session = await worker.invoke('openCellReadSession', {
+            table: 'demo_main_read_shadow',
+            rowId: 1,
+            column: 'value'
+        });
+        const chunk = await worker.invoke('readCellChunk', session.sessionId, 0, 64);
+        assert.strictEqual(new TextDecoder().decode(chunk.bytes), 'main-cell');
+        await worker.invoke('closeCellReadSession', session.sessionId);
+
+        const exported = await worker.invoke(
+            'exportTable',
+            { table: 'demo_main_read_shadow' },
+            ['value'],
+            {},
+            {},
+            { format: 'json' }
+        );
+        const exportedJson = Array.from(exported.contentChunks).join('');
+        assert.match(exportedJson, /main-cell/);
+        assert.doesNotMatch(exportedJson, /temporary-/);
+    });
+
+    it('keeps demo table mutations on main through a TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_write_shadow (' +
+            'id INTEGER PRIMARY KEY, value TEXT, payload BLOB); ' +
+            "INSERT INTO main.demo_main_write_shadow VALUES " +
+            "(1, 'main-update', X'01'), " +
+            "(2, 'main-batch', X'02'), " +
+            "(3, 'main-replace', X'010203040506'), " +
+            "(5, 'main-delete', X'05'); " +
+            'CREATE TEMP TABLE demo_main_write_shadow (' +
+            'id INTEGER PRIMARY KEY, value TEXT, payload BLOB); ' +
+            "INSERT INTO temp.demo_main_write_shadow VALUES " +
+            "(1, 'temp-update', X'11'), " +
+            "(2, 'temp-batch', X'12'), " +
+            "(3, 'temp-replace', X'11121314151617'), " +
+            "(5, 'temp-delete', X'15')"
+        );
+
+        await worker.invoke(
+            'updateCell',
+            'demo_main_write_shadow',
+            1,
+            'value',
+            'main-updated'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_main_write_shadow WHERE id = 1'),
+            'main-updated'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_main_write_shadow WHERE id = 1'),
+            'temp-update'
+        );
+
+        await worker.invoke('updateCellBatch', 'demo_main_write_shadow', [{
+            rowId: 2,
+            column: 'value',
+            value: 'main-batched'
+        }]);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_main_write_shadow WHERE id = 2'),
+            'main-batched'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_main_write_shadow WHERE id = 2'),
+            'temp-batch'
+        );
+
+        await worker.invoke(
+            'replaceOversizedCell',
+            'demo_main_write_shadow',
+            3,
+            'payload',
+            Uint8Array.from([9]),
+            { storageClass: 'blob', byteLength: 6 },
+            4
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT hex(payload) FROM main.demo_main_write_shadow WHERE id = 3'),
+            '09'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT hex(payload) FROM temp.demo_main_write_shadow WHERE id = 3'),
+            '11121314151617'
+        );
+
+        assert.strictEqual(
+            await worker.invoke('insertRow', 'demo_main_write_shadow', {
+                id: 4,
+                value: 'main-inserted',
+                payload: Uint8Array.from([4])
+            }),
+            4
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_main_write_shadow WHERE id = 4'),
+            'main-inserted'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM temp.demo_main_write_shadow WHERE id = 4'),
+            0
+        );
+
+        await worker.invoke('deleteRows', 'demo_main_write_shadow', [5]);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM main.demo_main_write_shadow WHERE id = 5'),
+            0
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM temp.demo_main_write_shadow WHERE id = 5'),
+            1
+        );
+
+        await worker.invoke('addColumn', 'demo_main_write_shadow', 'main_only', 'TEXT');
+        const mainInfo = await worker.invoke(
+            'runQuery',
+            'PRAGMA main.table_info(demo_main_write_shadow)'
+        );
+        const tempInfo = await worker.invoke(
+            'runQuery',
+            'PRAGMA temp.table_info(demo_main_write_shadow)'
+        );
+        assert.ok(mainInfo[0].rows.some((row: unknown[]) => row[1] === 'main_only'));
+        assert.ok(tempInfo[0].rows.every((row: unknown[]) => row[1] !== 'main_only'));
+    });
+
+    it('preflights main trigger programs through a same-named TEMP table', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_probe_shadow (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO main.demo_main_probe_shadow VALUES (1, 'one'), (2, 'two'); " +
+            'CREATE TRIGGER demo_main_probe_update ' +
+            'AFTER UPDATE OF value ON demo_main_probe_shadow BEGIN ' +
+            "UPDATE demo_main_probe_shadow SET value = 'side-update' WHERE id = 2; END; " +
+            'CREATE TRIGGER demo_main_probe_insert ' +
+            'AFTER INSERT ON demo_main_probe_shadow BEGIN ' +
+            "INSERT INTO demo_main_probe_shadow VALUES (NEW.id + 100, 'side-insert'); END; " +
+            'CREATE TRIGGER demo_main_probe_delete ' +
+            'AFTER DELETE ON demo_main_probe_shadow BEGIN ' +
+            'DELETE FROM demo_main_probe_shadow WHERE id = 2; END; ' +
+            'CREATE TEMP TABLE demo_main_probe_shadow (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO temp.demo_main_probe_shadow VALUES (1, 'temp-one'), (2, 'temp-two')"
+        );
+
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_main_probe_shadow', 1, 'value', 'changed'),
+            /UPDATE trigger.*target table.*rolled back/i
+        );
+        await assert.rejects(
+            worker.invoke('insertRow', 'demo_main_probe_shadow', { id: 3, value: 'three' }),
+            /INSERT trigger.*undo history/i
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_main_probe_shadow', [1]),
+            /DELETE trigger.*undo history/i
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT id, value FROM main.demo_main_probe_shadow ORDER BY id'
+            ))[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'one'], [2, 'two']]
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT id, value FROM temp.demo_main_probe_shadow ORDER BY id'
+            ))[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'temp-one'], [2, 'temp-two']]
+        );
+    });
+
+    it('reads demo JSON undo state from main through a TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_main_history_shadow (document TEXT); ' +
+            `INSERT INTO main.demo_main_history_shadow VALUES (` +
+            `'${JSON.stringify({ a: 1, untouched: 'main' })}'); ` +
+            'CREATE TEMP TABLE demo_main_history_shadow (document TEXT); ' +
+            `INSERT INTO temp.demo_main_history_shadow VALUES (` +
+            `'${JSON.stringify({ a: 2, untouched: 'temp' })}')`
+        );
+
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_main_history_shadow',
+            [{
+                rowId: 1,
+                column: 'document',
+                value: JSON.stringify({ a: 2 }),
+                operation: 'json_patch'
+            }]
+        );
+        await worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 'demo_main_history_shadow',
+            affectedCells
+        });
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT document FROM main.demo_main_history_shadow WHERE rowid = 1'
+            ),
+            JSON.stringify({ a: 1, untouched: 'main' })
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT document FROM temp.demo_main_history_shadow WHERE rowid = 1'
+            ),
+            JSON.stringify({ a: 2, untouched: 'temp' })
+        );
+    });
+
+    it('rejects demo cell-history replay after the edited cell changes externally', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_cell_history_conflict (value TEXT); " +
+            "INSERT INTO demo_cell_history_conflict VALUES ('before')"
+        );
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_cell_history_conflict',
+            [{ rowId: 1, column: 'value', value: 'after' }]
+        );
+        await worker.invoke(
+            'runQuery',
+            "UPDATE demo_cell_history_conflict SET value = 'external' WHERE rowid = 1"
+        );
+
+        await assert.rejects(
+            worker.invoke('undoModification', {
+                modificationType: 'cell_update',
+                targetTable: 'demo_cell_history_conflict',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history.*not applied/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_cell_history_conflict'),
+            'external'
+        );
+    });
+
+    it('rejects demo JSON undo when an externally changed path overlaps the patch', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_json_history_conflict (document TEXT); ` +
+            `INSERT INTO demo_json_history_conflict VALUES (` +
+            `'${JSON.stringify({ changed: 1, untouched: 'before' })}')`
+        );
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_json_history_conflict',
+            [{
+                rowId: 1,
+                column: 'document',
+                value: JSON.stringify({ changed: 2 }),
+                operation: 'json_patch'
+            }]
+        );
+        const external = JSON.stringify({ changed: 3, untouched: 'external' });
+        await worker.invoke(
+            'runQuery',
+            'UPDATE demo_json_history_conflict SET document = ?',
+            [external]
+        );
+
+        await assert.rejects(
+            worker.invoke('undoModification', {
+                modificationType: 'cell_update',
+                targetTable: 'demo_json_history_conflict',
+                affectedCells
+            }),
+            /changed outside SQLite Explorer history.*not applied/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT document FROM demo_json_history_conflict'),
+            external
+        );
+    });
+
+    it('rejects duplicate canonical demo batch targets before writing', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_duplicate_rowid_batch (value TEXT); ' +
+            "INSERT INTO demo_duplicate_rowid_batch VALUES ('rowid-before'); " +
+            'CREATE TABLE demo_duplicate_pk_batch (' +
+            'id TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO demo_duplicate_pk_batch VALUES ('a', 'pk-before')"
+        );
+
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 'demo_duplicate_rowid_batch', [
+                { rowId: 1, column: 'value', value: 'first' },
+                { rowId: '+1', column: 'VALUE', value: 'second' }
+            ]),
+            /duplicate.*row identity.*column/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_duplicate_rowid_batch'),
+            'rowid-before'
+        );
+
+        const primaryKey = encodePrimaryKeyRecordId(
+            [{ identifier: 'id', declaredType: 'TEXT', position: 1 }],
+            ['a']
+        );
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 'demo_duplicate_pk_batch', [
+                { rowId: primaryKey, column: 'value', value: 'first' },
+                { rowId: primaryKey, column: 'VALUE', value: 'second' }
+            ]),
+            /duplicate.*row identity.*column/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_duplicate_pk_batch'),
+            'pk-before'
+        );
+    });
+
+    it('preserves an untouched unsafe typeless key member across guarded replacement and PK edits', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_typeless_key_update (' +
+            'id, shard TEXT, payload BLOB, PRIMARY KEY (id, shard)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_typeless_key_update VALUES (9007199254740993, 'a', X'01020304')"
+        );
+        const keyColumns: PrimaryKeyColumn[] = [
+            { identifier: 'id', declaredType: '', position: 1 },
+            { identifier: 'shard', declaredType: 'TEXT', position: 2 }
+        ];
+        const rowId = encodePrimaryKeyRecordId(keyColumns, [9007199254740993n, 'a']);
+
+        assert.strictEqual(
+            await worker.invoke(
+                'replaceOversizedCell',
+                'demo_typeless_key_update',
+                rowId,
+                'payload',
+                new Uint8Array([9]),
+                { storageClass: 'blob', byteLength: 4 },
+                2
+            ),
+            rowId
+        );
+        const changedRowId = await worker.invoke(
+            'updateCell',
+            'demo_typeless_key_update',
+            rowId,
+            'shard',
+            'b'
+        );
+        assert.match(changedRowId, /^pk:/);
+        const row = await worker.invoke(
+            'runQuery',
+            'SELECT typeof(id), CAST(id AS TEXT), shard, hex(payload) ' +
+            'FROM demo_typeless_key_update'
+        );
+        assert.deepStrictEqual(row[0].rows, [[
+            'integer',
+            '9007199254740993',
+            'b',
+            '09'
+        ]]);
+    });
+
+    it('enforces typed new-value limits and guarded oversized replacement', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (_kind, sql) => observedSql.push(sql)
+        });
+        const limit = 1024;
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_stage_d (payload BLOB); ' +
+            `INSERT INTO demo_stage_d VALUES (zeroblob(${limit + 1}))`
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_stage_d',
+                1,
+                'payload',
+                new Uint8Array(limit + 1),
+                undefined,
+                limit
+            ),
+            error => {
+                assert.ok(error instanceof CellEditPolicyError);
+                assert.strictEqual(error.actualBytes, limit + 1);
+                assert.strictEqual(error.limitBytes, limit);
+                return true;
+            }
+        );
+
+        observedSql.length = 0;
+        await worker.invoke(
+            'replaceOversizedCell',
+            'demo_stage_d',
+            1,
+            'payload',
+            'bounded',
+            { storageClass: 'blob', byteLength: limit + 1 },
+            limit
+        );
+        assert.ok(
+            observedSql.every(sql => !/^\s*SELECT\s+"payload"\b/i.test(sql)),
+            `demo replacement selected the prior payload: ${observedSql.join('\n')}`
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_stage_d'),
+            'bounded'
+        );
+
+        const legacyValue = new Uint8Array(DEFAULT_MAX_CELL_EDIT_BYTES + 1);
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_stage_d', 1, 'payload', legacyValue),
+            CellEditPolicyError
+        );
+        const legacyModification = {
+            modificationType: 'cell_update',
+            description: 'legacy oversized prior',
+            targetTable: 'demo_stage_d',
+            targetRowId: 1,
+            targetColumn: 'payload',
+            priorValue: legacyValue,
+            newValue: 'bounded'
+        };
+        await assert.rejects(
+            worker.invoke('undoModification', legacyModification),
+            /predates guarded cell history/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_stage_d'),
+            'bounded'
+        );
+        await assert.rejects(
+            worker.invoke('redoModification', legacyModification),
+            /predates guarded cell history/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_stage_d'),
+            'bounded'
+        );
+    });
+
+    it('rejects a demo JSON patch whose resulting stored value is oversized', async () => {
+        const worker = await createWorkerHarness();
+        const prior = JSON.stringify({ a: 'x'.repeat(32) });
+        const patch = JSON.stringify({ b: 'y'.repeat(32) });
+        const limit = 64;
+        await worker.invoke('runQuery', 'CREATE TABLE demo_patch_limits (payload TEXT)');
+        await worker.invoke('insertRow', 'demo_patch_limits', { payload: prior }, limit);
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCellBatch',
+                'demo_patch_limits',
+                [{ rowId: 1, column: 'payload', value: patch, operation: 'json_patch' }],
+                undefined,
+                limit
+            ),
+            error => {
+                assert.ok(error instanceof CellEditPolicyError);
+                assert.strictEqual(error.storageClass, 'text');
+                assert.ok(error.actualBytes > limit);
+                return true;
+            }
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT payload FROM demo_patch_limits'),
+            prior
+        );
+    });
+
+    it('loads the patched sql.js release from self-hosted files', async () => {
+        const importedUrls: string[] = [];
+        let wasmUrl = '';
+
+        await createWorkerHarness({
+            useBundledWasm: false,
+            onImportScripts: url => importedUrls.push(url),
+            initSqlJs: async config => {
+                wasmUrl = config.locateFile('sql-wasm.wasm');
+                // initializeDatabase configures the connection as soon as it is
+                // open (PRAGMA foreign_keys, then the rolled-back write probe),
+                // so the loader stub needs a no-op run()/exec().
+                return {
+                    Database: class {
+                        run() { return this; }
+                        exec() { return []; }
+                    }
+                };
+            }
+        });
+
+        assert.deepStrictEqual(importedUrls, [
+            './sql-wasm.js'
+        ]);
+        assert.strictEqual(
+            wasmUrl,
+            './sql-wasm.wasm'
+        );
+    });
+
+    it('deletes a column using the demo worker table-info shape', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_delete (id INTEGER, kept TEXT, removed TEXT); " +
+            "INSERT INTO demo_delete VALUES (1, 'survives', 'gone')"
+        );
+
+        await worker.invoke('deleteColumns', 'demo_delete', ['removed']);
+
+        const tableInfo = await worker.invoke('getTableInfo', 'demo_delete');
+        assert.deepStrictEqual(
+            Array.from(tableInfo, (column: any) => column.identifier),
+            ['id', 'kept']
+        );
+        const rows = await worker.invoke('runQuery', 'SELECT id, kept FROM demo_delete');
+        assert.deepStrictEqual(Array.from(rows[0].rows[0]), [1, 'survives']);
+    });
+
+    it('surfaces demo generated columns as read-only metadata', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_metadata (' +
+            'base INTEGER, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 2) VIRTUAL, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 3) STORED)'
+        );
+
+        const info = await worker.invoke('getTableInfo', 'demo_generated_metadata');
+        assert.deepStrictEqual(
+            Array.from(info, (column: any) => [column.identifier, column.isGenerated]),
+            [
+                ['base', false],
+                ['virtual_value', true],
+                ['stored_value', true]
+            ]
+        );
+    });
+
+    it('tracks demo INTEGER PRIMARY KEY rowid changes through history', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_remapped_rowid_history (' +
+            'id INTEGER PRIMARY KEY, ' +
+            'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED, ' +
+            'note TEXT, payload TEXT); ' +
+            "INSERT INTO demo_remapped_rowid_history(id, note, payload) " +
+            "VALUES (3, 'before', '{\"n\":9007199254740993}')"
+        );
+
+        const singleCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_remapped_rowid_history',
+            [{ rowId: 3, column: 'id', value: 34 }]
+        );
+        const remapped = singleCells[0].newRowId;
+        assert.strictEqual(remapped, 34);
+        const singleModification = {
+            modificationType: 'cell_update',
+            targetTable: 'demo_remapped_rowid_history',
+            affectedCells: singleCells
+        };
+        await worker.invoke('undoModification', singleModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [3, 3, 6, 'before', '{"n":9007199254740993}']
+        );
+        await worker.invoke('redoModification', singleModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [34, 34, 68, 'before', '{"n":9007199254740993}']
+        );
+        await worker.invoke('undoModification', singleModification);
+
+        const affectedCells = await worker.invoke(
+            'updateCellBatch',
+            'demo_remapped_rowid_history',
+            [
+                { rowId: 3, column: 'id', value: 44 },
+                { rowId: 3, column: 'note', value: 'after' },
+                {
+                    rowId: 3,
+                    column: 'payload',
+                    value: '{"added":true}',
+                    operation: 'json_patch'
+                }
+            ]
+        );
+        assert.deepStrictEqual(
+            Array.from(affectedCells, (cell: any) => cell.newRowId),
+            [44, 44, 44]
+        );
+        const batchModification = {
+            modificationType: 'cell_update',
+            targetTable: 'demo_remapped_rowid_history',
+            affectedCells
+        };
+        await worker.invoke('undoModification', batchModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [3, 3, 6, 'before', '{"n":9007199254740993}']
+        );
+        await worker.invoke('redoModification', batchModification);
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT rowid, id, doubled, note, payload FROM demo_remapped_rowid_history'
+            ))[0].rows[0]),
+            [44, 44, 88, 'after', '{"n":9007199254740993,"added":true}']
+        );
+    });
+
+    it('canonicalizes a demo exact int64 alias edit from rowid zero', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_coerced_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO demo_coerced_rowid_alias(id, value) VALUES (0, 'kept')"
+        );
+        const newRowId = await worker.invoke(
+            'updateCell',
+            'demo_coerced_rowid_alias',
+            0,
+            'id',
+            '09223372036854775807'
+        );
+        assert.strictEqual(newRowId, '9223372036854775807');
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT CAST(rowid AS TEXT), CAST(id AS TEXT), value ' +
+                'FROM demo_coerced_rowid_alias'
+            ))[0].rows[0]),
+            ['9223372036854775807', '9223372036854775807', 'kept']
+        );
+    });
+
+    it('rolls back a demo alias edit with a substituting trigger', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO demo_triggered_rowid_alias VALUES (5, 'target'), (8, 'decoy'); " +
+            'CREATE TRIGGER demo_substitute_rowid_alias ' +
+            'AFTER UPDATE OF id ON demo_triggered_rowid_alias BEGIN ' +
+            'UPDATE demo_triggered_rowid_alias SET id = 107 WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_rowid_alias SET id = NEW.id WHERE rowid = 8; ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_triggered_rowid_alias', 5, 'id', '0007'),
+            /rowid identity.*UPDATE trigger|UPDATE trigger.*rowid identity/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, value FROM demo_triggered_rowid_alias ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, 'target'], [8, 8, 'decoy']]
+        );
+    });
+
+    it('rolls back a demo non-alias edit when a trigger substitutes a decoy rowid', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_non_alias ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            "INSERT INTO demo_triggered_non_alias VALUES (5, 'target'), (8, 'decoy'); " +
+            'CREATE TRIGGER demo_substitute_non_alias ' +
+            'AFTER UPDATE OF note ON demo_triggered_non_alias BEGIN ' +
+            'UPDATE demo_triggered_non_alias SET id = 105 WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_non_alias SET id = NEW.id WHERE rowid = 8; ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_triggered_non_alias', 5, 'note', 'changed'),
+            /UPDATE trigger.*target table.*rowid identity/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, note FROM demo_triggered_non_alias ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, 'target'], [8, 8, 'decoy']]
+        );
+    });
+
+    it('guards demo batch and oversized edits against rowid substitution', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_batch_substitution ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            "INSERT INTO demo_triggered_batch_substitution VALUES " +
+            "(5, 'target'), (8, 'decoy'); " +
+            'CREATE TRIGGER demo_substitute_batch_rowid ' +
+            'AFTER UPDATE OF note ON demo_triggered_batch_substitution BEGIN ' +
+            'UPDATE demo_triggered_batch_substitution SET id = 105 ' +
+            'WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_batch_substitution SET id = NEW.id WHERE rowid = 8; ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 'demo_triggered_batch_substitution', [
+                { rowId: 5, column: 'note', value: 'changed' }
+            ]),
+            /UPDATE trigger.*target table.*rowid identity/i
+        );
+        let rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, note FROM demo_triggered_batch_substitution ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, 'target'], [8, 8, 'decoy']]
+        );
+
+        const original = 'x'.repeat(32);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_triggered_replacement_substitution ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            `INSERT INTO demo_triggered_replacement_substitution VALUES ` +
+            `(5, '${original}'), (8, 'decoy'); ` +
+            'CREATE TRIGGER demo_substitute_replacement_rowid ' +
+            'AFTER UPDATE OF note ON demo_triggered_replacement_substitution BEGIN ' +
+            'UPDATE demo_triggered_replacement_substitution SET id = 105 ' +
+            'WHERE rowid = NEW.rowid; ' +
+            'UPDATE demo_triggered_replacement_substitution SET id = NEW.id ' +
+            'WHERE rowid = 8; END'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'replaceOversizedCell',
+                'demo_triggered_replacement_substitution',
+                5,
+                'note',
+                'new',
+                { storageClass: 'text', byteLength: 32 },
+                8
+            ),
+            /UPDATE trigger.*target table.*rowid identity/i
+        );
+        rows = await worker.invoke(
+            'runQuery',
+            'SELECT rowid, id, note ' +
+            'FROM demo_triggered_replacement_substitution ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 5, original], [8, 8, 'decoy']]
+        );
+    });
+
+    it('rejects a demo non-alias edit whose trigger side effect cannot be undone', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_harmless_audit_target ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            'CREATE TABLE demo_harmless_audit_events (target_id INTEGER, note TEXT); ' +
+            "INSERT INTO demo_harmless_audit_target VALUES (5, 'before'); " +
+            'CREATE TRIGGER demo_record_harmless_audit ' +
+            'AFTER UPDATE OF note ON demo_harmless_audit_target BEGIN ' +
+            'INSERT INTO demo_harmless_audit_events VALUES (NEW.id, NEW.note); ' +
+            'END'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_harmless_audit_target',
+                5,
+                'note',
+                'after'
+            ),
+            /UPDATE trigger.*undo history/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT id, note, (SELECT count(*) FROM demo_harmless_audit_events) ' +
+            'FROM demo_harmless_audit_target'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 'before', 0]]
+        );
+    });
+
+    it('rejects a demo rowid-alias edit whose trigger side effect cannot be undone', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_alias_audit_target ' +
+            '(id INTEGER PRIMARY KEY, note TEXT); ' +
+            'CREATE TABLE demo_alias_audit_events (target_id INTEGER); ' +
+            "INSERT INTO demo_alias_audit_target VALUES (5, 'kept'); " +
+            'CREATE TRIGGER demo_record_alias_audit ' +
+            'AFTER UPDATE OF id ON demo_alias_audit_target BEGIN ' +
+            'INSERT INTO demo_alias_audit_events VALUES (NEW.id); END'
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_alias_audit_target', 5, 'id', 6),
+            /UPDATE trigger.*undo history/i
+        );
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT id, note, (SELECT count(*) FROM demo_alias_audit_events) ' +
+            'FROM demo_alias_audit_target'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 'kept', 0]]
+        );
+    });
+
+    it('rejects demo INSERT/DELETE side effects that cannot be represented in history', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'PRAGMA foreign_keys = ON; ' +
+            'CREATE TABLE demo_insert_target (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE demo_insert_audit (id INTEGER); ' +
+            'CREATE TRIGGER demo_insert_trigger AFTER INSERT ON demo_insert_target ' +
+            'BEGIN INSERT INTO demo_insert_audit VALUES (NEW.id); END; ' +
+            'CREATE TABLE demo_delete_target (id INTEGER PRIMARY KEY); ' +
+            'INSERT INTO demo_delete_target VALUES (1); ' +
+            'CREATE TRIGGER demo_delete_trigger BEFORE DELETE ON demo_delete_target ' +
+            'BEGIN SELECT RAISE(IGNORE); END; ' +
+            'CREATE TABLE demo_cascade_parent (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE demo_cascade_child (' +
+            'parent_id INTEGER REFERENCES demo_cascade_parent(id) ON DELETE CASCADE); ' +
+            'INSERT INTO demo_cascade_parent VALUES (1); ' +
+            'INSERT INTO demo_cascade_child VALUES (1)'
+        );
+
+        await assert.rejects(
+            worker.invoke('insertRow', 'demo_insert_target', { id: 1 }),
+            /INSERT trigger.*undo history/i
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_delete_target', [1]),
+            /DELETE trigger.*undo history/i
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 'demo_cascade_parent', [1]),
+            /foreign-key.*DELETE.*undo history/i
+        );
+
+        const result = await worker.invoke(
+            'runQuery',
+            'SELECT ' +
+            '(SELECT count(*) FROM demo_insert_target), ' +
+            '(SELECT count(*) FROM demo_insert_audit), ' +
+            '(SELECT count(*) FROM demo_delete_target), ' +
+            '(SELECT count(*) FROM demo_cascade_parent), ' +
+            '(SELECT count(*) FROM demo_cascade_child)'
+        );
+        assert.deepStrictEqual(
+            Array.from(result[0].rows, (row: unknown[]) => Array.from(row)),
+            [[0, 0, 1, 1, 1]]
+        );
+    });
+
+    it('marks only demo SQLite rowid aliases in table metadata', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_metadata_rowid_alias (id INTEGER PRIMARY KEY, value TEXT); ' +
+            'CREATE TABLE demo_metadata_desc_pk (id INTEGER PRIMARY KEY DESC, value TEXT); ' +
+            'CREATE TABLE demo_metadata_table_desc ' +
+            '(id INTEGER, value TEXT, PRIMARY KEY(id DESC)); ' +
+            'CREATE TABLE demo_metadata_named_rowid ' +
+            '("rowid" INTEGER PRIMARY KEY, value TEXT); ' +
+            'CREATE TABLE demo_metadata_named_rowid_desc ' +
+            '("rowid" INTEGER PRIMARY KEY DESC, value TEXT)'
+        );
+        const alias = await worker.invoke('getTableInfo', 'demo_metadata_rowid_alias');
+        const descending = await worker.invoke('getTableInfo', 'demo_metadata_desc_pk');
+        const tableDescending = await worker.invoke(
+            'getTableInfo',
+            'demo_metadata_table_desc'
+        );
+        const namedRowid = await worker.invoke('getTableInfo', 'demo_metadata_named_rowid');
+        const namedRowidDescending = await worker.invoke(
+            'getTableInfo',
+            'demo_metadata_named_rowid_desc'
+        );
+        assert.strictEqual(
+            alias.find((column: any) => column.identifier === 'id')?.isRowidAlias,
+            true
+        );
+        assert.strictEqual(
+            descending.find((column: any) => column.identifier === 'id')?.isRowidAlias,
+            false
+        );
+        assert.strictEqual(
+            tableDescending.find((column: any) => column.identifier === 'id')?.isRowidAlias,
+            true
+        );
+        assert.strictEqual(
+            namedRowid.find((column: any) => column.identifier === 'rowid')?.isRowidAlias,
+            true
+        );
+        assert.strictEqual(
+            namedRowidDescending.find(
+                (column: any) => column.identifier === 'rowid'
+            )?.isRowidAlias,
+            false
+        );
+    });
+
+    it('preserves legal schema identifiers and rejects NUL names in the authored demo', async () => {
+        const worker = await createWorkerHarness();
+        const table = ' ui "table" 🚀 ';
+        const firstColumn = ' id "column" 🧩 ';
+        const addedColumn = ' added "column" ✨ ';
+        const view = ' ui "view" 🚀 ';
+
+        await worker.invoke('createTable', table, [{
+            name: firstColumn,
+            type: 'TEXT',
+            pk: false,
+            notnull: false
+        }]);
+        await worker.invoke('addColumn', table, addedColumn, 'TEXT');
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO " ui ""table"" 🚀 " ' +
+            '(" id ""column"" 🧩 ", " added ""column"" ✨ ") VALUES (?, ?)',
+            ['first', 'second']
+        );
+        const columns = await worker.invoke('getTableInfo', table);
+        assert.deepStrictEqual(
+            Array.from(columns, (column: any) => column.identifier),
+            [firstColumn, addedColumn]
+        );
+
+        await worker.invoke('validateViewDefinition', view, 'SELECT 7 AS value', 'create');
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            view,
+            'SELECT 7 AS value',
+            10,
+            'create'
+        );
+        assert.deepStrictEqual(Array.from(preview.rows[0]), [7]);
+        const definition = await worker.invoke('createView', view, 'SELECT 7 AS value');
+        assert.strictEqual(definition.identifier, view);
+
+        await assert.rejects(
+            worker.invoke('createTable', 'bad\0table', [{
+                name: 'value', type: 'TEXT', pk: false, notnull: false
+            }]),
+            /Table name cannot contain NUL/
+        );
+        await assert.rejects(
+            worker.invoke('addColumn', table, 'bad\0column', 'TEXT'),
+            /Column name cannot contain NUL/
+        );
+        await assert.rejects(
+            worker.invoke('validateViewDefinition', 'bad\0view', 'SELECT 1', 'create'),
+            /View name cannot contain NUL/
+        );
+        await assert.rejects(
+            worker.invoke('previewViewDefinition', '', 'SELECT 1', 10, 'create'),
+            /View name is required/
+        );
+        await assert.rejects(
+            worker.invoke('createView', 'bad\0view', 'SELECT 1'),
+            /View name cannot contain NUL/
+        );
+    });
+
+    it('honors the Create Table UI column flags in the authored demo', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createTable', 'demo_ui_create_shape', [
+            {
+                name: 'id',
+                type: 'INTEGER',
+                primaryKey: true,
+                notNull: false
+            },
+            {
+                name: 'required_value',
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: true
+            }
+        ]);
+
+        const columns = await worker.invoke('getTableInfo', 'demo_ui_create_shape');
+        assert.strictEqual(
+            columns.find((column: any) => column.identifier === 'id')?.primaryKeyPosition,
+            1
+        );
+        assert.strictEqual(
+            columns.find((column: any) => column.identifier === 'required_value')?.isRequired,
+            1
+        );
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO demo_ui_create_shape VALUES (1, 'present')"
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_ui_create_shape VALUES (1, 'duplicate')"
+            ),
+            /UNIQUE constraint failed/
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                'INSERT INTO demo_ui_create_shape (id) VALUES (2)'
+            ),
+            /NOT NULL constraint failed/
+        );
+    });
+
+    it('creates composite keys and defaults with the shared main-schema DDL contract', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TABLE demo_composite_create (shadow TEXT)'
+        );
+
+        await worker.invoke('createTable', 'demo_composite_create', [
+            {
+                name: 'tenant',
+                type: 'TEXT',
+                primaryKey: true,
+                notNull: true
+            },
+            {
+                name: 'sequence',
+                type: 'INTEGER',
+                primaryKey: true,
+                notNull: true
+            },
+            {
+                name: 'note',
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: false,
+                defaultValue: "O'Reilly"
+            },
+            {
+                name: 'quantity',
+                type: 'INTEGER',
+                primaryKey: false,
+                notNull: false,
+                defaultValue: '3'
+            }
+        ]);
+
+        const tableSql = String(await workerScalar(
+            worker,
+            "SELECT sql FROM main.sqlite_schema " +
+            "WHERE type = 'table' AND name = 'demo_composite_create'"
+        ));
+        assert.strictEqual((tableSql.match(/PRIMARY KEY/gi) ?? []).length, 1);
+        assert.match(tableSql, /PRIMARY KEY\s*\(\s*"tenant"\s*,\s*"sequence"\s*\)/i);
+        assert.match(tableSql, /"note"\s+TEXT\s+DEFAULT\s+'O''Reilly'/i);
+        assert.match(tableSql, /"quantity"\s+INTEGER\s+DEFAULT\s+3/i);
+
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO main.demo_composite_create (tenant, sequence) VALUES ('acme', 1)"
+        );
+        const row = await worker.invoke(
+            'runQuery',
+            'SELECT tenant, sequence, note, quantity FROM main.demo_composite_create'
+        );
+        assert.deepStrictEqual(Array.from(row[0].rows[0]), ['acme', 1, "O'Reilly", 3]);
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO main.demo_composite_create (tenant, sequence) VALUES ('acme', 1)"
+            ),
+            /UNIQUE constraint failed/i
+        );
+    });
+
+    it('rolls back demo table and view creation that would break TEMP dependencies', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "ATTACH ':memory:' AS aux; " +
+            'CREATE TABLE aux.demo_created_table_shadow (value TEXT); ' +
+            "INSERT INTO aux.demo_created_table_shadow VALUES ('aux-table'); " +
+            'CREATE TEMP VIEW demo_created_table_consumer AS ' +
+            'SELECT value FROM demo_created_table_shadow'
+        );
+
+        await assert.rejects(
+            worker.invoke('createTable', 'demo_created_table_shadow', [{
+                name: 'other',
+                type: 'TEXT',
+                primaryKey: false,
+                notNull: false
+            }]),
+            /would break existing view.*demo_created_table_consumer/is
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_created_table_consumer'),
+            'aux-table'
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM main.sqlite_schema " +
+            "WHERE type = 'table' AND name = 'demo_created_table_shadow'"
+        ), 0);
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE aux.demo_created_view_shadow (value TEXT); ' +
+            "INSERT INTO aux.demo_created_view_shadow VALUES ('aux-view'); " +
+            'CREATE TEMP VIEW demo_created_view_consumer AS ' +
+            'SELECT value FROM demo_created_view_shadow'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'createView',
+                'demo_created_view_shadow',
+                "SELECT 'main' AS other"
+            ),
+            /would break existing view.*demo_created_view_consumer/is
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_created_view_consumer'),
+            'aux-view'
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM main.sqlite_schema " +
+            "WHERE type = 'view' AND name = 'demo_created_view_shadow'"
+        ), 0);
+    });
+
+    it('discovers direct, expression, and partial indexes that depend on a demo column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_index_dependencies (kept TEXT, removed TEXT); ' +
+            'CREATE INDEX demo_idx_direct ON demo_index_dependencies(removed); ' +
+            'CREATE INDEX demo_idx_expression ON demo_index_dependencies(lower(removed)); ' +
+            'CREATE INDEX demo_idx_partial ON demo_index_dependencies(kept) ' +
+            'WHERE removed IS NOT NULL; ' +
+            'CREATE INDEX demo_idx_kept ON demo_index_dependencies(kept)'
+        );
+
+        const dependencies = await worker.invoke(
+            'findDependentIndexes',
+            'demo_index_dependencies',
+            ['removed']
+        );
+
+        assert.deepStrictEqual(
+            Array.from(dependencies, (dependency: any) => dependency.identifier),
+            ['demo_idx_direct', 'demo_idx_expression', 'demo_idx_partial']
+        );
+        assert.ok(dependencies.every((dependency: any) => (
+            typeof dependency.sql === 'string' && dependency.sql.includes(dependency.identifier)
+        )));
+    });
+
+    it('requires a current dependent-index snapshot before deleting a demo column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_confirmed_index_drop (kept TEXT, removed TEXT); ' +
+            'CREATE INDEX demo_confirmed_removed ON demo_confirmed_index_drop(removed); ' +
+            'CREATE INDEX demo_confirmed_kept ON demo_confirmed_index_drop(kept)'
+        );
+
+        const stale = await worker.invoke(
+            'findDependentIndexes',
+            'demo_confirmed_index_drop',
+            ['removed']
+        );
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'demo_confirmed_index_drop', ['removed']),
+            /confirmation.*demo_confirmed_removed/i
+        );
+        await worker.invoke(
+            'runQuery',
+            'DROP INDEX demo_confirmed_removed; ' +
+            'CREATE INDEX demo_confirmed_removed ' +
+            'ON demo_confirmed_index_drop(removed COLLATE NOCASE)'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'deleteColumns',
+                'demo_confirmed_index_drop',
+                ['removed'],
+                stale
+            ),
+            /changed while the confirmation was open/i
+        );
+
+        const current = await worker.invoke(
+            'findDependentIndexes',
+            'demo_confirmed_index_drop',
+            ['removed']
+        );
+        await worker.invoke(
+            'deleteColumns',
+            'demo_confirmed_index_drop',
+            ['removed'],
+            current
+        );
+
+        const columns = await worker.invoke('getTableInfo', 'demo_confirmed_index_drop');
+        assert.deepStrictEqual(
+            Array.from(columns, (column: any) => column.identifier),
+            ['kept']
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT count(*) FROM sqlite_schema " +
+                "WHERE type = 'index' AND name = 'demo_confirmed_kept'"
+            ),
+            1
+        );
+    });
+
+    it('refuses to report a worker-local demo reload as successful', async () => {
+        const worker = await createWorkerHarness();
+
+        await assert.rejects(
+            worker.invoke('refreshFile'),
+            /demo host.*reinitialize|reinitialize.*demo host/i
+        );
+    });
+
+    it('drops a demo column without changing surviving schema contracts', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'PRAGMA foreign_keys = ON; ' +
+            'CREATE TABLE demo_parent (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE demo_audit (message TEXT); ' +
+            'CREATE TABLE demo_constraints (' +
+            'id INTEGER PRIMARY KEY, ' +
+            'code TEXT NOT NULL UNIQUE, ' +
+            'qty INTEGER NOT NULL CHECK (qty > 0), ' +
+            'parent_id INTEGER REFERENCES demo_parent(id), ' +
+            'removed TEXT, ' +
+            'generated TEXT GENERATED ALWAYS AS (code || \':\' || qty) STORED' +
+            ') WITHOUT ROWID; ' +
+            'CREATE INDEX demo_constraints_qty ON demo_constraints(qty); ' +
+            'CREATE INDEX demo_constraints_removed ON demo_constraints(removed); ' +
+            'CREATE TRIGGER demo_constraints_audit AFTER UPDATE OF qty ON demo_constraints ' +
+            'BEGIN INSERT INTO demo_audit VALUES (NEW.code); END; ' +
+            "INSERT INTO demo_parent VALUES (1); " +
+            "INSERT INTO demo_constraints(id, code, qty, parent_id, removed) " +
+            "VALUES (1, 'kept', 2, 1, 'gone')"
+        );
+        const untouchedBefore = await worker.invoke(
+            'runQuery',
+            "SELECT type, name, sql FROM sqlite_master " +
+            "WHERE name IN ('demo_constraints_qty', 'demo_constraints_audit') ORDER BY type, name"
+        );
+        const dependentIndexes = await worker.invoke(
+            'findDependentIndexes',
+            'demo_constraints',
+            ['removed']
+        );
+
+        await worker.invoke(
+            'deleteColumns',
+            'demo_constraints',
+            ['removed'],
+            dependentIndexes
+        );
+
+        const untouchedAfter = await worker.invoke(
+            'runQuery',
+            "SELECT type, name, sql FROM sqlite_master " +
+            "WHERE name IN ('demo_constraints_qty', 'demo_constraints_audit') ORDER BY type, name"
+        );
+        assert.deepStrictEqual(
+            Array.from(untouchedAfter[0]?.rows ?? [], (row: unknown[]) => Array.from(row)),
+            Array.from(untouchedBefore[0].rows, (row: unknown[]) => Array.from(row))
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT count(*) FROM sqlite_master " +
+                "WHERE type = 'index' AND name = 'demo_constraints_removed'"
+            ),
+            0
+        );
+        const tableSql = String(await workerScalar(
+            worker,
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'demo_constraints'"
+        ));
+        assert.match(tableSql, /PRIMARY KEY/i);
+        assert.match(tableSql, /UNIQUE/i);
+        assert.match(tableSql, /CHECK\s*\(qty\s*>\s*0\)/i);
+        assert.match(tableSql, /REFERENCES\s+demo_parent/i);
+        assert.match(tableSql, /GENERATED ALWAYS/i);
+        assert.match(tableSql, /WITHOUT ROWID/i);
+        assert.doesNotMatch(tableSql, /\bremoved\b/i);
+
+        await worker.invoke(
+            'runQuery',
+            'UPDATE demo_constraints SET qty = 3 WHERE id = 1'
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT message FROM demo_audit'), 'kept');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT generated FROM demo_constraints WHERE id = 1'),
+            'kept:3'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_constraints(id, code, qty, parent_id) VALUES (2, 'kept', 1, 1)"
+            ),
+            /UNIQUE constraint failed/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_constraints(id, code, qty, parent_id) VALUES (2, 'bad-check', 0, 1)"
+            ),
+            /CHECK constraint failed/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_constraints(id, code, qty, parent_id) VALUES (2, 'bad-fk', 1, 99)"
+            ),
+            /FOREIGN KEY constraint failed/i
+        );
+    });
+
+    it('does not execute a trailing statement smuggled through preview', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE preview_sentinel (id INTEGER)');
+
+        await assert.rejects(() => worker.invoke(
+            'previewViewDefinition',
+            'unsafe_preview',
+            'SELECT 1) LIMIT 1; DROP TABLE preview_sentinel; --',
+            10,
+            'create'
+        ));
+
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'preview_sentinel'"
+        ), 1);
+    });
+
+    it('preserves duplicate explicit columns through an edit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW duplicate_names (a, a) AS SELECT 1, 2');
+
+        await worker.invoke('editView', 'duplicate_names', 'SELECT 3, 4', true);
+
+        const storedSql = await workerScalar(
+            worker,
+            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'duplicate_names'"
+        );
+        assert.match(String(storedSql), /\(a, a\)/);
+        assert.doesNotMatch(String(storedSql), /a:1/);
+    });
+
+    it('rejects a stale expected view definition without replacing the newer demo view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW shared_view AS SELECT 1 AS value');
+        const stale = await worker.invoke('getViewDefinition', 'shared_view');
+        await worker.invoke(
+            'runQuery',
+            'DROP VIEW shared_view; CREATE VIEW shared_view AS SELECT 2 AS value'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'shared_view',
+                'SELECT 3 AS value',
+                true,
+                stale.sql
+            ),
+            /changed outside this editor/i
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT value FROM shared_view'), 2);
+    });
+
+    it('rejects a stale trigger snapshot before discarding demo triggers', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW trigger_cas_view AS SELECT 1 AS value');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER trigger_cas_first INSTEAD OF INSERT ON trigger_cas_view ' +
+            'BEGIN SELECT 1; END'
+        );
+        const stale = await worker.invoke('getViewDefinition', 'trigger_cas_view');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER trigger_cas_second INSTEAD OF UPDATE ON trigger_cas_view ' +
+            'BEGIN SELECT 2; END'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'trigger_cas_view',
+                'SELECT 2 AS value',
+                false,
+                stale.sql,
+                stale.triggers
+            ),
+            /changed outside this editor/i
+        );
+        const current = await worker.invoke('getViewDefinition', 'trigger_cas_view');
+        assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['trigger_cas_first', 'trigger_cas_second']
+        );
+    });
+
+    it('rejects demo view-history undo and redo when the installed state changed', async () => {
+        const worker = await createWorkerHarness();
+        const before = await worker.invoke('createView', 'demo_history_cas', 'SELECT 1 AS value');
+        const edit = await worker.invoke(
+            'editView',
+            'demo_history_cas',
+            'SELECT 2 AS value',
+            true
+        );
+        const modification = {
+            description: 'Edit demo_history_cas',
+            modificationType: 'view_edit',
+            targetTable: 'demo_history_cas',
+            viewDefBefore: before,
+            viewDefAfter: edit.after
+        };
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_history_undo_external ' +
+            'INSTEAD OF INSERT ON demo_history_cas BEGIN SELECT 1; END'
+        );
+        await assert.rejects(
+            worker.invoke('undoModification', modification),
+            /changed outside this editor/i
+        );
+        let current = await worker.invoke('getViewDefinition', 'demo_history_cas');
+        assert.strictEqual(current.selectSql, 'SELECT 2 AS value');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['demo_history_undo_external']
+        );
+
+        await worker.invoke('runQuery', 'DROP TRIGGER demo_history_undo_external');
+        await worker.invoke('undoModification', modification);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_history_redo_external ' +
+            'INSTEAD OF UPDATE ON demo_history_cas BEGIN SELECT 2; END'
+        );
+        await assert.rejects(
+            worker.invoke('redoModification', modification),
+            /changed outside this editor/i
+        );
+        current = await worker.invoke('getViewDefinition', 'demo_history_cas');
+        assert.strictEqual(current.selectSql, 'SELECT 1 AS value');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['demo_history_redo_external']
+        );
+    });
+
+    it('fails closed when demo view history lacks its authoritative definition', async () => {
+        const worker = await createWorkerHarness();
+        for (const direction of ['undoModification', 'redoModification']) {
+            for (const modificationType of ['view_create', 'view_edit', 'view_drop']) {
+                await assert.rejects(
+                    worker.invoke(direction, {
+                        modificationType,
+                        targetTable: 'missing_history_view'
+                    }),
+                    /missing view definition/i
+                );
+            }
+        }
+    });
+
+    it('rejects a demo drop whose confirmed trigger snapshot became stale', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'demo_drop_cas', 'SELECT 1 AS value');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_drop_first ' +
+            'INSTEAD OF INSERT ON demo_drop_cas BEGIN SELECT 1; END'
+        );
+        const confirmed = await worker.invoke('getViewDefinition', 'demo_drop_cas');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TRIGGER demo_drop_second ' +
+            'INSTEAD OF UPDATE ON demo_drop_cas BEGIN SELECT 2; END'
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'dropView',
+                'demo_drop_cas',
+                confirmed.sql,
+                confirmed.triggers
+            ),
+            /changed outside this editor/i
+        );
+        const current = await worker.invoke('getViewDefinition', 'demo_drop_cas');
+        assert.deepStrictEqual(
+            Array.from(current.triggers, (trigger: any) => trigger.identifier),
+            ['demo_drop_first', 'demo_drop_second']
+        );
+    });
+
+    it('previews an edited view through its preserved explicit column list', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE VIEW preview_columns (public_id, public_name) AS " +
+            "SELECT 1 AS internal_id, 'before' AS internal_name"
+        );
+
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'preview_columns',
+            "SELECT 2 AS replacement_id, 'after' AS replacement_name",
+            10
+        );
+
+        assert.deepStrictEqual(Array.from(preview.headers), ['public_id', 'public_name']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [[2, 'after']]
+        );
+    });
+
+    it('previews an edit in the target-name context instead of reading the old demo view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'self_shadowed_view', 'SELECT 7 AS value');
+
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'self_shadowed_view',
+                'SELECT value FROM main.self_shadowed_view',
+                10
+            ),
+            /circular/i
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT value FROM self_shadowed_view'), 7);
+    });
+
+    it('edits and drops main views without touching same-named TEMP views', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'demo_shadowed_view', "SELECT 'main-before' AS value");
+        await worker.invoke(
+            'runQuery',
+            "CREATE TEMP VIEW demo_shadowed_view AS SELECT 'temp-value' AS value"
+        );
+
+        await worker.invoke(
+            'editView',
+            'demo_shadowed_view',
+            "SELECT 'main-after' AS value",
+            true
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_shadowed_view'),
+            'main-after'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_shadowed_view'),
+            'temp-value'
+        );
+
+        await worker.invoke('dropView', 'demo_shadowed_view');
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'demo_shadowed_view'"
+        ), 0);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_shadowed_view'),
+            'temp-value'
+        );
+    });
+
+    it('compiles created and edited main views through broken TEMP shadows', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_create_compile_source (value TEXT NOT NULL)'
+        );
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO demo_create_compile_source VALUES ('main-created')"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_create_compile_source AS ' +
+            'SELECT value FROM missing_demo_create_source'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_create_compile_shadow AS ' +
+            'SELECT value FROM missing_demo_create_source'
+        );
+
+        await worker.invoke(
+            'createView',
+            'demo_create_compile_shadow',
+            'SELECT value FROM demo_create_compile_source'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_create_compile_shadow'),
+            'main-created'
+        );
+
+        await worker.invoke(
+            'createView',
+            'demo_edit_compile_shadow',
+            "SELECT 'main-before' AS value"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_edit_compile_source (value TEXT NOT NULL)'
+        );
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO demo_edit_compile_source VALUES ('main-after')"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_edit_compile_source AS ' +
+            'SELECT value FROM missing_demo_edit_source'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_edit_compile_shadow AS ' +
+            'SELECT value FROM missing_demo_edit_source'
+        );
+        await worker.invoke(
+            'editView',
+            'demo_edit_compile_shadow',
+            'SELECT value FROM demo_edit_compile_source',
+            true
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_edit_compile_shadow'),
+            'main-after'
+        );
+    });
+
+    it('validates and previews the main demo view through a same-named TEMP shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('createView', 'demo_dry_run_shadow', "SELECT 'main-before' AS value");
+        await worker.invoke(
+            'runQuery',
+            "CREATE TEMP VIEW demo_dry_run_shadow AS SELECT 'temp-value' AS value"
+        );
+
+        await worker.invoke(
+            'validateViewDefinition',
+            'demo_dry_run_shadow',
+            "SELECT 'candidate' AS value",
+            'edit'
+        );
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_dry_run_shadow',
+            "SELECT 'candidate' AS value",
+            10,
+            'edit'
+        );
+
+        assert.deepStrictEqual(Array.from(preview.headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [['candidate']]
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_dry_run_shadow'),
+            'main-before'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_dry_run_shadow'),
+            'temp-value'
+        );
+    });
+
+    it('treats percent and underscore filters as literal LIKE text', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE literal_filters (value TEXT); " +
+            "INSERT INTO literal_filters VALUES ('100% literal'), ('1000 literal'), " +
+            "('under_score'), ('underXscore')"
+        );
+
+        const percent = await worker.invoke('fetchTableData', 'literal_filters', {
+            columns: ['value'],
+            filters: [{ column: 'value', value: '%' }],
+            limit: 100,
+            offset: 0
+        });
+        const underscore = await worker.invoke('fetchTableData', 'literal_filters', {
+            columns: ['value'],
+            globalFilter: '_',
+            limit: 100,
+            offset: 0
+        });
+        const underscoreCount = await worker.invoke('fetchTableCount', 'literal_filters', {
+            columns: ['value'],
+            globalFilter: '_'
+        });
+
+        assert.deepStrictEqual(
+            Array.from(percent.rows, (row: unknown[]) => Array.from(row)),
+            [['100% literal']]
+        );
+        assert.deepStrictEqual(
+            Array.from(underscore.rows, (row: unknown[]) => Array.from(row)),
+            [['under_score']]
+        );
+        assert.deepStrictEqual({ ...underscoreCount }, { count: 1, isExact: true });
+    });
+
+    it('bounds malformed and excessive demo table-page requests', async () => {
+        const sql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, statement) => {
+                if (kind === 'prepare' && statement.includes('FROM main."demo_page_bounds"')) {
+                    sql.push(statement);
+                }
+            }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_page_bounds (value TEXT); INSERT INTO demo_page_bounds VALUES (\'one\')'
+        );
+
+        for (const limit of [-1, 0, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+            await assert.rejects(
+                worker.invoke('fetchTableData', 'demo_page_bounds', { limit, offset: 0 }),
+                /page limit must be a positive safe integer/i
+            );
+        }
+        for (const offset of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+            await assert.rejects(
+                worker.invoke('fetchTableData', 'demo_page_bounds', { limit: 1, offset }),
+                /page offset must be a non-negative safe integer/i
+            );
+        }
+
+        const page = await worker.invoke('fetchTableData', 'demo_page_bounds', {
+            columns: ['value'],
+            limit: MAX_TABLE_PAGE_ROWS + 1,
+            offset: 0
+        });
+        assert.deepStrictEqual(Array.from(page.rows, (row: unknown[]) => Array.from(row)), [['one']]);
+        assert.ok(sql.some(statement => statement.includes(`LIMIT ${MAX_TABLE_PAGE_ROWS} OFFSET 0`)));
+        assert.ok(sql.every(statement => !statement.includes('LIMIT -1')));
+    });
+
+    it('matches native/WASM bounded TEXT and BLOB grid previews', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_contained_cells (text_value TEXT, blob_value BLOB); ' +
+            "INSERT INTO demo_contained_cells VALUES ('😀😀😀', x'000102030405060708090a0b'); " +
+            "INSERT INTO demo_contained_cells VALUES ('ok', x'0102')"
+        );
+
+        const page = await worker.invoke('fetchTableData', 'demo_contained_cells', {
+            columns: ['rowid', 'text_value', 'blob_value'],
+            orderBy: 'rowid',
+            limit: 2,
+            offset: 0,
+            maxInlineCellBytes: 8,
+            maxPageResponseBytes: 64
+        });
+
+        assert.deepStrictEqual(Array.from(page.rows[0].slice(0, 2)), [1, '😀😀']);
+        assert.deepStrictEqual(Array.from(page.rows[0][2]), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert.deepStrictEqual(Array.from(page.rows[1].slice(0, 2)), [2, 'ok']);
+        assert.deepStrictEqual(Array.from(page.rows[1][2]), [1, 2]);
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(page.oversizedCells)), {
+            0: {
+                1: { storageClass: 'text', byteLength: 12 },
+                2: { storageClass: 'blob', byteLength: 12 }
+            }
+        });
+
+        const small = await worker.invoke('fetchTableData', 'demo_contained_cells', {
+            columns: ['rowid', 'text_value', 'blob_value'],
+            filters: [{ column: 'text_value', value: 'ok' }],
+            limit: 1,
+            offset: 0,
+            maxInlineCellBytes: 8,
+            maxPageResponseBytes: 64
+        });
+        assert.deepStrictEqual(Array.from(small.rows[0].slice(0, 2)), [2, 'ok']);
+        assert.deepStrictEqual(Array.from(small.rows[0][2]), [1, 2]);
+        assert.strictEqual(small.oversizedCells, undefined);
+    });
+
+    it('clips aggregate BLOB previews before demo worker transport', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_predecode_page_bound (a BLOB, b BLOB, c BLOB, d BLOB); ' +
+            'INSERT INTO demo_predecode_page_bound VALUES ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300)), ' +
+            '(zeroblob(300), zeroblob(300), zeroblob(300), zeroblob(300))'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_predecode_page_bound', {
+            columns: ['rowid', 'a', 'b', 'c', 'd'],
+            orderBy: 'rowid',
+            limit: 4,
+            offset: 0,
+            maxInlineCellBytes: 1024 * 1024,
+            maxPageResponseBytes: 80
+        });
+
+        assert.strictEqual(page.rows.length, 4);
+        for (let rowIndex = 0; rowIndex < page.rows.length; rowIndex++) {
+            for (let columnIndex = 1; columnIndex < 5; columnIndex++) {
+                assert.strictEqual(page.rows[rowIndex][columnIndex].byteLength, 4);
+                assert.deepStrictEqual(
+                    JSON.parse(JSON.stringify(page.oversizedCells[rowIndex][columnIndex])),
+                    { storageClass: 'blob', byteLength: 300 }
+                );
+            }
+        }
+    });
+
+    it('keeps demo cell chunks on one snapshot and preserves multibyte byte boundaries', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_cell_read_sessions (blob_value BLOB, text_value TEXT); ' +
+            "INSERT INTO demo_cell_read_sessions VALUES (x'4141414142424242', 'A😀Bé𝄞Z')"
+        );
+
+        const blobSession = await worker.invoke('openCellReadSession', {
+            table: 'demo_cell_read_sessions',
+            rowId: 1,
+            column: 'blob_value'
+        });
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(blobSession.metadata)), {
+            storageClass: 'blob',
+            byteLength: 8
+        });
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke('readCellChunk', blobSession.sessionId, 0, 4)).bytes),
+            [65, 65, 65, 65]
+        );
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_cell_read_sessions',
+                1,
+                'blob_value',
+                Uint8Array.from([67, 67, 67, 67, 68, 68, 68, 68])
+            ),
+            /cell read snapshot is active/i
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke('readCellChunk', blobSession.sessionId, 4, 4)).bytes),
+            [66, 66, 66, 66]
+        );
+        await worker.invoke('closeCellReadSession', blobSession.sessionId);
+
+        const textSession = await worker.invoke('openCellReadSession', {
+            table: 'demo_cell_read_sessions',
+            rowId: 1,
+            column: 'text_value'
+        });
+        const expected = new TextEncoder().encode('A😀Bé𝄞Z');
+        const assembled: number[] = [];
+        for (let offset = 0; offset < expected.byteLength; offset += 2) {
+            const chunk = await worker.invoke('readCellChunk', textSession.sessionId, offset, 2);
+            assembled.push(...Array.from(chunk.bytes as Uint8Array));
+        }
+        assert.deepStrictEqual(Uint8Array.from(assembled), expected);
+        await worker.invoke('closeCellReadSession', textSession.sessionId);
+    });
+
+    it('answers getCellMetadata exactly, and refuses a target it cannot resolve', async () => {
+        // Coverage gap closure: getCellMetadata had NO test on either engine,
+        // despite being the gate desktop-api.js consults before every single
+        // cell edit (it decides whether the edit is ordinary or needs the
+        // oversized-replacement confirmation). A wrong byteLength there is a
+        // wrong prompt; a swallowed failure is an edit that silently takes the
+        // wrong branch.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_cell_metadata (blob_value BLOB, text_value TEXT, num INTEGER, empty TEXT); ' +
+            "INSERT INTO demo_cell_metadata VALUES (x'4141414142424242', 'A😀Bé𝄞Z', 42, NULL)"
+        );
+        const target = (column: string, rowId: number | string = 1) =>
+            ({ table: 'demo_cell_metadata', rowId, column });
+
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('blob_value')))),
+            { storageClass: 'blob', byteLength: 8 }
+        );
+        // TEXT reports its encoding as well as its BYTE length — the character
+        // count would be 6 here, and using it would truncate every multibyte
+        // cell the chunk reader then walks.
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('text_value')))),
+            {
+                storageClass: 'text',
+                byteLength: new TextEncoder().encode('A😀Bé𝄞Z').byteLength,
+                textEncoding: 'utf-8'
+            }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('num')))),
+            { storageClass: 'integer', byteLength: 2 }
+        );
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(await worker.invoke('getCellMetadata', target('empty')))),
+            { storageClass: 'null', byteLength: 0 }
+        );
+
+        // The failure paths must SAY something, not answer a default.
+        await assert.rejects(
+            worker.invoke('getCellMetadata', target('blob_value', 987654)),
+            /no longer exists/
+        );
+        await assert.rejects(
+            worker.invoke('getCellMetadata', { table: 'demo_cell_metadata', rowId: 1, column: '' }),
+            /column must be a non-empty string/
+        );
+        await assert.rejects(
+            worker.invoke('getCellMetadata', { rowId: 1, column: 'blob_value' }),
+            /table must be a non-empty string/
+        );
+    });
+
+    it('keeps ping honest and refuses a worker-local refreshFile without touching the database', async () => {
+        // ping is a liveness probe the host uses. refreshFile exists so the
+        // VS Code contract has a callee on this engine, and it REFUSES: only a
+        // host that still holds the original source can reload (the desktop
+        // answers ⌘R in desktop-host.js and never forwards it). Pinned so the
+        // refusal cannot quietly become "reports a refresh it did not do" —
+        // or start mutating the database. fireEditEvent is no longer in the
+        // dispatch table at all; the desktop host answered it locally and no
+        // shared caller remains.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_inert (v TEXT); INSERT INTO demo_inert VALUES ('kept')"
+        );
+
+        assert.strictEqual(await worker.invoke('ping'), true);
+
+        await assert.rejects(
+            worker.invoke('refreshFile'),
+            /Reload must be handled by the demo host/
+        );
+        // A hostile or surplus argument changes nothing about that answer.
+        await assert.rejects(
+            worker.invoke('refreshFile', { __proto__: { polluted: true } }, 'extra'),
+            /Reload must be handled by the demo host/
+        );
+        await assert.rejects(worker.invoke('fireEditEvent', { label: 'x' }), /Unknown method: fireEditEvent/);
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT v FROM demo_inert WHERE rowid = 1'),
+            'kept'
+        );
+        assert.strictEqual(await worker.invoke('ping'), true);
+    });
+
+    it('expires demo cell read sessions and releases their savepoint', async () => {
+        const worker = await createWorkerHarness({
+            cellReadSessionIdleTimeoutMs: 20,
+            cellReadSessionAbsoluteTimeoutMs: 100
+        });
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_expiring_cell (value TEXT); INSERT INTO demo_expiring_cell VALUES ('old')"
+        );
+        const session = await worker.invoke('openCellReadSession', {
+            table: 'demo_expiring_cell',
+            rowId: 1,
+            column: 'value'
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 40));
+        await assert.rejects(
+            worker.invoke('readCellChunk', session.sessionId, 0, 2),
+            /closed or expired/i
+        );
+        await worker.invoke('updateCell', 'demo_expiring_cell', 1, 'value', 'new');
+        assert.strictEqual(await workerScalar(
+            worker,
+            'SELECT value FROM demo_expiring_cell WHERE rowid = 1'
+        ), 'new');
+    });
+
+    it('marks an oversized demo WITHOUT ROWID primary key read-only', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_oversized_identity ' +
+            '(key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO demo_oversized_identity VALUES ('abcdefghijklmnopqrstuvwxyz012345', 'visible')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_oversized_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 1,
+            offset: 0,
+            maxInlineCellBytes: 8,
+            maxPageResponseBytes: 64
+        });
+        const identity = page.rows[0][0];
+
+        assert.match(String(identity), /^readonly-pk:/);
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(page.oversizedCells)), {
+            0: { 1: { storageClass: 'text', byteLength: 32 } }
+        });
+        assert.match(
+            page.readOnlyRowReasons?.[0] ?? '',
+            /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+        );
+        await assert.rejects(
+            worker.invoke('updateCell', 'demo_oversized_identity', identity, 'value', 'changed'),
+            /WITHOUT ROWID primary-key column "key".*32 bytes.*identity was not transported/
+        );
+    });
+
+    it('orders a declared demo rowid column as data across keyset pages', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_declared_rowid_order (' +
+            'pk INTEGER PRIMARY KEY, rowid TEXT NOT NULL, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_declared_rowid_order VALUES " +
+            "(1, 'zulu', 'one'), (2, 'alpha', 'two'), (3, 'alpha', 'three')"
+        );
+        const options = {
+            columns: ['rowid', 'pk', 'rowid', 'value'],
+            orderBy: 'rowid',
+            orderDir: 'ASC',
+            limit: 2,
+            offset: 0
+        };
+
+        const offsetPage = await worker.invoke(
+            'fetchTableData',
+            'demo_declared_rowid_order',
+            options
+        );
+        assert.deepStrictEqual(
+            Array.from(offsetPage.rows, (row: unknown[]) => [row[1], row[2]]),
+            [[2, 'alpha'], [3, 'alpha']]
+        );
+        const first = await worker.invoke('fetchTableData', 'demo_declared_rowid_order', {
+            ...options,
+            keyset: { mode: 'first' }
+        });
+        assert.deepStrictEqual(
+            Array.from(first.rows, (row: unknown[]) => [row[1], row[2]]),
+            [[2, 'alpha'], [3, 'alpha']]
+        );
+        assert.ok(first.keysetAnchors?.last);
+        const second = await worker.invoke('fetchTableData', 'demo_declared_rowid_order', {
+            ...options,
+            offset: 2,
+            keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+        });
+        assert.deepStrictEqual(
+            Array.from(second.rows, (row: unknown[]) => [row[1], row[2]]),
+            [[1, 'zulu']]
+        );
+    });
+
+    it('round-trips signed infinite REAL identities in the demo', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_infinite_real_identity (' +
+            'key REAL PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_infinite_real_identity VALUES " +
+            "(-1e999, 'negative'), (1e999, 'positive')"
+        );
+        const options = {
+            columns: ['rowid', 'key', 'value'],
+            orderBy: 'key',
+            orderDir: 'ASC',
+            limit: 1,
+            offset: 0
+        };
+
+        const first = await worker.invoke('fetchTableData', 'demo_infinite_real_identity', {
+            ...options,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(first.rows[0][1], Number.NEGATIVE_INFINITY);
+        assert.ok(first.keysetAnchors?.last);
+        const second = await worker.invoke('fetchTableData', 'demo_infinite_real_identity', {
+            ...options,
+            offset: 1,
+            keyset: { mode: 'after', anchor: first.keysetAnchors.last }
+        });
+        assert.strictEqual(second.rows[0][1], Number.POSITIVE_INFINITY);
+        await worker.invoke(
+            'updateCell',
+            'demo_infinite_real_identity',
+            second.rows[0][0],
+            'value',
+            'edited'
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT value FROM demo_infinite_real_identity WHERE key = 1e999'
+            ),
+            'edited'
+        );
+        assert.deepStrictEqual(
+            Array.from((await worker.invoke(
+                'runQuery',
+                'SELECT typeof(0.0/0.0), 0.0/0.0 IS NULL'
+            ))[0].rows[0]),
+            ['null', 1]
+        );
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                "INSERT INTO demo_infinite_real_identity VALUES (0.0/0.0, 'nan')"
+            ),
+            /NOT NULL constraint failed/
+        );
+    });
+
+    it('keeps malformed UTF-8 demo TEXT identities viewable but read-only', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_identity (' +
+            'key TEXT PRIMARY KEY, value TEXT' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_malformed_text_identity VALUES " +
+            "(CAST(X'80' AS TEXT), 'malformed'), " +
+            "(CAST(X'EFBFBD' AS TEXT), 'replacement-character')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_malformed_text_identity', {
+            columns: ['rowid', 'key', 'value'],
+            limit: 10,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+        const rows = Array.from(page.rows, (row: unknown[]) => Array.from(row));
+        const malformedIndex = rows.findIndex(row => row[2] === 'malformed');
+        const validIndex = rows.findIndex(row => row[2] === 'replacement-character');
+        assert.notStrictEqual(malformedIndex, -1);
+        assert.notStrictEqual(validIndex, -1);
+        const malformedIdentity = rows[malformedIndex][0];
+        const validIdentity = rows[validIndex][0];
+
+        assert.match(String(malformedIdentity), /^readonly-pk:/);
+        assert.match(String(validIdentity), /^pk:/);
+        assert.notStrictEqual(malformedIdentity, validIdentity);
+        assert.match(page.readOnlyRowReasons?.[malformedIndex] ?? '', /not valid UTF-8/i);
+        if (malformedIndex === 0) assert.strictEqual(page.keysetAnchors?.first, undefined);
+        if (malformedIndex === rows.length - 1) {
+            assert.strictEqual(page.keysetAnchors?.last, undefined);
+        }
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_malformed_text_identity',
+                malformedIdentity,
+                'value',
+                'bad-edit'
+            ),
+            /not valid UTF-8/i
+        );
+        await worker.invoke(
+            'updateCell',
+            'demo_malformed_text_identity',
+            validIdentity,
+            'value',
+            'valid-edit'
+        );
+        const stored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(CAST(key AS BLOB)), value FROM demo_malformed_text_identity ORDER BY 1'
+        );
+        assert.deepStrictEqual(
+            Array.from(stored[0].rows, (row: unknown[]) => Array.from(row)),
+            [['80', 'malformed'], ['EFBFBD', 'valid-edit']]
+        );
+    });
+
+    it('routes malformed ordinary demo TEXT to byte-faithful inspector metadata', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_value (value TEXT); ' +
+            "INSERT INTO demo_malformed_text_value VALUES " +
+            "(CAST(X'80' AS TEXT)), (CAST(X'EFBFBD' AS TEXT)); " +
+            'CREATE VIEW demo_malformed_text_view AS ' +
+            'SELECT value FROM demo_malformed_text_value WHERE rowid = 1'
+        );
+
+        const page = await worker.invoke('fetchTableData', 'demo_malformed_text_value', {
+            columns: ['rowid', 'value'],
+            orderBy: 'rowid',
+            orderDir: 'ASC',
+            limit: 10,
+            offset: 0
+        });
+
+        assert.deepStrictEqual(
+            Array.from(page.rows, (row: unknown[]) => Array.from(row)),
+            [[1, Uint8Array.of(0x80)], [2, '�']]
+        );
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(page.oversizedCells)), {
+            0: { 1: { storageClass: 'text', byteLength: 1 } }
+        });
+
+        const viewPage = await worker.invoke('fetchTableData', 'demo_malformed_text_view', {
+            columns: ['value'],
+            limit: 1,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            Array.from(viewPage.rows, (row: unknown[]) => Array.from(row)),
+            [[Uint8Array.of(0x80)]]
+        );
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(viewPage.oversizedCells)), {
+            0: { 0: { storageClass: 'text', byteLength: 1 } }
+        });
+    });
+
+    it('replays demo malformed TEXT history from exact database bytes', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'80' AS TEXT)))"
+        );
+        const insertedRow = await worker.invoke(
+            'insertRowWithHistory',
+            'demo_malformed_text_history',
+            { id: 1 }
+        );
+        const insertion = {
+            modificationType: 'row_insert',
+            targetTable: 'demo_malformed_text_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert demo malformed TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await worker.invoke('undoModification', insertion);
+        await worker.invoke('redoModification', insertion);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) ' +
+                'FROM demo_malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_malformed_text_history',
+            [1]
+        );
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_malformed_text_history',
+            description: 'Delete demo malformed TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)) ' +
+                'FROM demo_malformed_text_history'
+            ))[0].rows,
+            [['text', '80']]
+        );
+    });
+
+    it('replays demo row history on FTS5 and language-id FTS4 tables', async () => {
+        const worker = await createWorkerHarness();
+        for (const [ddl, table, row, columns] of [
+            ['CREATE VIRTUAL TABLE demo_fts5 USING fts5(body)', 'demo_fts5', { body: 'alpha' }, 'body'],
+            ['CREATE VIRTUAL TABLE demo_fts4 USING fts4(body, languageid="lid")', 'demo_fts4', { body: 'beta', lid: 7 }, 'body, lid']
+        ] as const) {
+            await worker.invoke('runQuery', ddl);
+            const contents = async () => (await worker.invoke(
+                'runQuery',
+                `SELECT rowid, ${columns} FROM ${table}`
+            ))[0]?.rows.map((values: unknown[]) => Array.from(values)) ?? [];
+            const insertedRow = await worker.invoke('insertRowWithHistory', table, row);
+            const one = await contents();
+            assert.strictEqual(one.length, 1);
+            const insertion = {
+                modificationType: 'row_insert', targetTable: table, targetRowId: insertedRow.rowId,
+                description: `Insert into ${table}`, rowData: insertedRow.row, insertedRow
+            };
+            await worker.invoke('undoModification', insertion);
+            assert.deepStrictEqual(await contents(), []);
+            await worker.invoke('redoModification', insertion);
+            assert.deepStrictEqual(await contents(), one);
+            const deletedRows = await worker.invoke('deleteRows', table, [insertedRow.rowId]);
+            const deletion = {
+                modificationType: 'row_delete', targetTable: table,
+                description: `Delete from ${table}`, deletedRows
+            };
+            await worker.invoke('undoModification', deletion);
+            assert.deepStrictEqual(await contents(), one);
+            await worker.invoke('redoModification', deletion);
+            assert.deepStrictEqual(await contents(), []);
+        }
+    });
+
+    it('replays demo malformed UTF-16LE TEXT without transcoding', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'PRAGMA encoding = "UTF-16le"; ' +
+            'CREATE TABLE demo_malformed_utf16_history (' +
+            "id INTEGER PRIMARY KEY, value TEXT DEFAULT (CAST(X'00D8' AS TEXT)), " +
+            "note TEXT DEFAULT 'snowman ☃')"
+        );
+        assert.strictEqual(
+            (await worker.invoke('runQuery', 'PRAGMA encoding'))[0].rows[0][0],
+            'UTF-16le'
+        );
+        const insertedRow = await worker.invoke(
+            'insertRowWithHistory',
+            'demo_malformed_utf16_history',
+            { id: 1 }
+        );
+        const insertion = {
+            modificationType: 'row_insert',
+            targetTable: 'demo_malformed_utf16_history',
+            targetRowId: insertedRow.rowId,
+            description: 'Insert demo malformed UTF-16LE TEXT',
+            rowData: insertedRow.row,
+            insertedRow
+        };
+
+        await worker.invoke('undoModification', insertion);
+        await worker.invoke('redoModification', insertion);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM demo_malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
+
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_malformed_utf16_history',
+            [1]
+        );
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_malformed_utf16_history',
+            description: 'Delete demo malformed UTF-16LE TEXT',
+            deletedRows
+        });
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), hex(CAST(value AS BLOB)), note ' +
+                'FROM demo_malformed_utf16_history'
+            ))[0].rows,
+            [['text', '00D8', 'snowman ☃']]
+        );
+    });
+
+    it('suppresses demo keyset anchors for malformed ordinary TEXT sort keys', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_malformed_text_sort (' +
+            'id INTEGER PRIMARY KEY, sort_value TEXT NOT NULL' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_malformed_text_sort VALUES " +
+            "(1, CAST(X'80' AS TEXT)), " +
+            "(2, CAST(X'C0' AS TEXT)), " +
+            "(3, CAST(X'EFBFBD' AS TEXT))"
+        );
+        const first = await worker.invoke('fetchTableData', 'demo_malformed_text_sort', {
+            columns: ['rowid', 'id', 'sort_value'],
+            orderBy: 'sort_value',
+            orderDir: 'ASC',
+            limit: 1,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(first.rows[0][1], 1);
+        assert.strictEqual(first.keysetAnchors, undefined);
+        const second = await worker.invoke('fetchTableData', 'demo_malformed_text_sort', {
+            columns: ['rowid', 'id', 'sort_value'],
+            orderBy: 'sort_value',
+            orderDir: 'ASC',
+            limit: 1,
+            offset: 1
+        });
+        assert.strictEqual(second.rows[0][1], 2);
+        assert.strictEqual(second.keysetAnchors, undefined);
+    });
+
+    it('rolls back a demo insert whose generated TEXT key is not byte-faithful', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_malformed_identity (' +
+            "key TEXT PRIMARY KEY DEFAULT (CAST(X'80' AS TEXT)), value TEXT" +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_generated_malformed_identity(key, value) " +
+            "VALUES (CAST(X'EFBFBD' AS TEXT), 'existing-valid')"
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'insertRow',
+                'demo_generated_malformed_identity',
+                { value: 'must-rollback' }
+            ),
+            /byte-faithful editable identity cannot be minted/i
+        );
+        const stored = await worker.invoke(
+            'runQuery',
+            'SELECT hex(CAST(key AS BLOB)), value FROM demo_generated_malformed_identity'
+        );
+        assert.deepStrictEqual(
+            Array.from(stored[0].rows, (row: unknown[]) => Array.from(row)),
+            [['EFBFBD', 'existing-valid']]
+        );
+    });
+
+    it('excludes the hidden rowid from demo data and count global filters', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE rowid_filters (value TEXT); " +
+            "INSERT INTO rowid_filters(rowid, value) VALUES (12, 'visible text')"
+        );
+
+        const data = await worker.invoke('fetchTableData', 'rowid_filters', {
+            columns: ['rowid', 'value'],
+            globalFilterColumns: ['value'],
+            globalFilter: '12',
+            limit: 100,
+            offset: 0
+        });
+        const count = await worker.invoke('fetchTableCount', 'rowid_filters', {
+            columns: ['value'],
+            globalFilterColumns: ['value'],
+            globalFilter: '12'
+        });
+
+        assert.deepStrictEqual(Array.from(data.rows), []);
+        assert.deepStrictEqual({ ...count }, { count: 0, isExact: true });
+    });
+
+    it('pages the demo grid by keyset and re-anchors every page', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_keyset (value TEXT); ' +
+            'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 11) ' +
+            "INSERT INTO demo_keyset(value) SELECT 'row-' || n FROM seq"
+        );
+        const options = (pageIndex: number, keyset?: object) => ({
+            columns: ['rowid', 'value'],
+            globalFilterColumns: ['value'],
+            limit: 4,
+            offset: pageIndex * 4,
+            ...(keyset ? { keyset } : {})
+        });
+        const offsetPages = [];
+        for (let index = 0; index < 3; index++) {
+            offsetPages.push(await worker.invoke('fetchTableData', 'demo_keyset', options(index)));
+        }
+        assert.strictEqual(offsetPages[2].rows.length, 3, 'short remainder page expected');
+
+        // Forward after-chain, reversed 'last', and 'before' must reproduce
+        // the OFFSET pages exactly through the real bundled worker.
+        let page = await worker.invoke('fetchTableData', 'demo_keyset', options(0, { mode: 'first' }));
+        assert.deepStrictEqual(Array.from(page.rows), Array.from(offsetPages[0].rows));
+        for (let index = 1; index < 3; index++) {
+            assert.ok(page.keysetAnchors?.last, `missing anchor for page ${index - 1}`);
+            page = await worker.invoke(
+                'fetchTableData',
+                'demo_keyset',
+                options(index, { mode: 'after', anchor: page.keysetAnchors.last })
+            );
+            assert.deepStrictEqual(Array.from(page.rows), Array.from(offsetPages[index].rows));
+        }
+        const last = await worker.invoke(
+            'fetchTableData',
+            'demo_keyset',
+            options(2, { mode: 'last', lastPageRowCount: 3 })
+        );
+        assert.deepStrictEqual(Array.from(last.rows), Array.from(offsetPages[2].rows));
+        assert.ok(last.keysetAnchors?.first);
+        const previous = await worker.invoke(
+            'fetchTableData',
+            'demo_keyset',
+            options(1, { mode: 'before', anchor: last.keysetAnchors.first })
+        );
+        assert.deepStrictEqual(Array.from(previous.rows), Array.from(offsetPages[1].rows));
+
+        // A stale anchor (minted under a sort) falls back to the OFFSET page.
+        const sorted = await worker.invoke('fetchTableData', 'demo_keyset', {
+            ...options(0, { mode: 'first' }),
+            orderBy: 'value',
+            orderDir: 'ASC'
+        });
+        assert.ok(sorted.keysetAnchors?.last);
+        const fallback = await worker.invoke(
+            'fetchTableData',
+            'demo_keyset',
+            options(1, { mode: 'after', anchor: sorted.keysetAnchors.last })
+        );
+        assert.deepStrictEqual(Array.from(fallback.rows), Array.from(offsetPages[1].rows));
+
+        // A declared rowid column shadows real row identity: such tables never
+        // anchor, and their keyset requests degrade to the OFFSET query.
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_keyset_shadow (rowid TEXT); " +
+            "INSERT INTO demo_keyset_shadow(rowid) VALUES ('a'), ('b')"
+        );
+        const shadow = await worker.invoke('fetchTableData', 'demo_keyset_shadow', {
+            columns: ['rowid', 'rowid'],
+            globalFilterColumns: ['rowid'],
+            limit: 1,
+            offset: 0,
+            keyset: { mode: 'first' }
+        });
+        assert.strictEqual(shadow.rows.length, 1);
+        assert.strictEqual(shadow.keysetAnchors, undefined);
+    });
+
+    it('seeks from a demo Last page bounded to its remainder, and not under another page size', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (_kind, sql) => observed.push(sql)
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_last_page (value TEXT); ' +
+            'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 23) ' +
+            "INSERT INTO demo_last_page(value) SELECT 'row-' || n FROM seq"
+        );
+        // As the grid sends it: pageSize is the rows per page it pages by, and
+        // a final page whose count this load fetched (Last) has a lower limit.
+        const request = (pageIndex: number, pageSize: number, limit: number, keyset: object) => ({
+            columns: ['rowid', 'value'],
+            globalFilterColumns: ['value'],
+            limit,
+            offset: pageIndex * pageSize,
+            pageSize,
+            keyset
+        });
+        const run = async (options: object) => {
+            observed.length = 0;
+            const page = await worker.invoke('fetchTableData', 'demo_last_page', options);
+            return { ids: Array.from(page.rows, (row: any) => Number(row[0])), anchors: page.keysetAnchors, sql: observed.join('\n') };
+        };
+        const scansTo = (sql: string, offset: number) => new RegExp(`\\bOFFSET ${offset}\\b`).test(sql);
+        const range = (from: number, to: number) => Array.from({ length: to - from + 1 }, (_, i) => from + i);
+
+        // 23 rows at 5 a page: Last is page 4, 3 rows, bounded to them.
+        const last = await run(request(4, 5, 3, { mode: 'last', lastPageRowCount: 3 }));
+        assert.deepStrictEqual(last.ids, range(21, 23));
+        assert.ok(last.anchors?.first);
+        // Prev and a refetch read a cached count and ask for a full page; a
+        // clipped-cell retry asks for the remainder again. All three seek.
+        for (const [label, options, offset, want] of [
+            ['Prev', request(3, 5, 5, { mode: 'before', anchor: last.anchors.first }), 15, range(16, 20)],
+            ['refetch', request(4, 5, 5, { mode: 'atOrAfter', anchor: last.anchors.first }), 20, range(21, 23)],
+            ['clipped retry', request(4, 5, 3, { mode: 'atOrAfter', anchor: last.anchors.first }), 20, range(21, 23)]
+        ] as const) {
+            const step = await run(options);
+            assert.deepStrictEqual(step.ids, want, `${label}: rows`);
+            assert.ok(!scansTo(step.sql, offset), `${label}: scanned to OFFSET ${offset}:\n${step.sql}`);
+            assert.ok(/\bOFFSET 0\b/.test(step.sql), `${label}: no seek:\n${step.sql}`);
+        }
+
+        // A column change lowers the page size to 3, the old remainder: page
+        // 6 of 3 is rows 19-21, and the anchor from row 21 must not seek it.
+        const resized = await run(request(6, 3, 3, { mode: 'atOrAfter', anchor: last.anchors.first }));
+        assert.deepStrictEqual(resized.ids, range(19, 21));
+        assert.ok(scansTo(resized.sql, 18), `old page size: did not fall back:\n${resized.sql}`);
+    });
+
+    it('seeks int64 anchors beyond 2^53 exactly on NONE-affinity sort columns', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_none_affinity (x, v TEXT); ' +
+            'INSERT INTO demo_none_affinity(x, v) VALUES ' +
+            "(9007199254740992, 'a'), (9007199254740993, 'b'), (9007199254740995, 'c'), " +
+            "(2, 'small'), (9007199254740997, 'd'), (12, 'safe')"
+        );
+        const options = (pageIndex: number, keyset?: object) => ({
+            columns: ['rowid', 'x', 'v'],
+            globalFilterColumns: ['x', 'v'],
+            orderBy: 'x',
+            orderDir: 'ASC',
+            limit: 2,
+            offset: pageIndex * 2,
+            ...(keyset ? { keyset } : {})
+        });
+        const offsetPages = [];
+        for (let index = 0; index < 3; index++) {
+            offsetPages.push(
+                await worker.invoke('fetchTableData', 'demo_none_affinity', options(index))
+            );
+        }
+        // 'after' across the 2^53 boundary used to return an empty page: the
+        // anchor value decoded to a decimal string, and a TEXT bind never
+        // compares equal-class with INTEGER storage on a NONE-affinity column.
+        assert.ok(offsetPages[1].keysetAnchors?.last);
+        const next = await worker.invoke(
+            'fetchTableData',
+            'demo_none_affinity',
+            options(2, { mode: 'after', anchor: offsetPages[1].keysetAnchors.last })
+        );
+        assert.deepStrictEqual(Array.from(next.rows), Array.from(offsetPages[2].rows));
+        // 'before' was worse: its predicate held for every INTEGER row, so it
+        // returned a full-length WRONG page that passed the grid retry check.
+        assert.ok(offsetPages[1].keysetAnchors?.first);
+        const previous = await worker.invoke(
+            'fetchTableData',
+            'demo_none_affinity',
+            options(0, { mode: 'before', anchor: offsetPages[1].keysetAnchors.first })
+        );
+        assert.deepStrictEqual(Array.from(previous.rows), Array.from(offsetPages[0].rows));
+    });
+
+    it('orders anchorable OFFSET pages by the full keyset key and preserves rowid-shadow fallback', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => { if (kind === 'prepare') observed.push(sql); }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_ties (s TEXT, v TEXT); ' +
+            'WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12) ' +
+            "INSERT INTO demo_ties(s, v) SELECT 'dup-' || (n % 2), 'v' || n FROM seq"
+        );
+        const options = (pageIndex: number, keyset?: object) => ({
+            columns: ['rowid', 's', 'v'],
+            globalFilterColumns: ['s', 'v'],
+            orderBy: 's',
+            orderDir: 'DESC',
+            limit: 4,
+            offset: pageIndex * 4,
+            ...(keyset ? { keyset } : {})
+        });
+        // Mixed session on duplicate DESC sort values: OFFSET pages, then a
+        // keyset Next from the OFFSET page's anchor, must continue the same
+        // total order (no skipped and no repeated rows).
+        const offsetPages = [];
+        for (let index = 0; index < 3; index++) {
+            offsetPages.push(await worker.invoke('fetchTableData', 'demo_ties', options(index)));
+        }
+        assert.ok(offsetPages[1].keysetAnchors?.last);
+        const next = await worker.invoke(
+            'fetchTableData',
+            'demo_ties',
+            options(2, { mode: 'after', anchor: offsetPages[1].keysetAnchors.last })
+        );
+        assert.deepStrictEqual(Array.from(next.rows), Array.from(offsetPages[2].rows));
+        // The fallback SELECT itself carries the full deterministic key order,
+        // in the rowid lookup's inner query that sorts the page's keys.
+        assert.ok(
+            observed.some(sql => sql.includes(
+                'FROM main."demo_ties" ORDER BY main."demo_ties"."s" DESC, main."demo_ties"."rowid" DESC LIMIT 4 OFFSET 4'
+            )),
+            `expected the deterministic fallback ORDER BY, saw:\n${observed.join('\n')}`
+        );
+
+        // A declared rowid column shadows real identity: no key derives, and
+        // the emitted SQL keeps the pre-keyset shape on the authoritative main table.
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_shadow_order (rowid TEXT); " +
+            "INSERT INTO demo_shadow_order(rowid) VALUES ('b'), ('a')"
+        );
+        observed.length = 0;
+        const shadow = await worker.invoke('fetchTableData', 'demo_shadow_order', {
+            columns: ['rowid', 'rowid'],
+            globalFilterColumns: ['rowid'],
+            limit: 10,
+            offset: 0
+        });
+        assert.strictEqual(shadow.keysetAnchors, undefined);
+        assert.ok(
+            observed.some(sql =>
+                sql === 'SELECT "rowid", "rowid" FROM main."demo_shadow_order" LIMIT 10 OFFSET 0'
+            ),
+            `expected the unchanged shadowed-table SQL, saw:\n${observed.join('\n')}`
+        );
+    });
+
+    it('keeps a declared rowid column in demo data and count global filters', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE declared_rowid_filters (rowid TEXT); " +
+            "INSERT INTO declared_rowid_filters(rowid) VALUES ('needle'), ('other')"
+        );
+        const options = {
+            // Match the table-grid request shape: the first entry is its identity
+            // projection and globalFilterColumns is the displayed schema.
+            columns: ['rowid', 'rowid'],
+            globalFilterColumns: ['rowid'],
+            globalFilter: 'needle'
+        };
+
+        const data = await worker.invoke('fetchTableData', 'declared_rowid_filters', {
+            ...options,
+            limit: 100,
+            offset: 0
+        });
+        const count = await worker.invoke('fetchTableCount', 'declared_rowid_filters', {
+            columns: ['rowid'],
+            globalFilterColumns: ['rowid'],
+            globalFilter: 'needle'
+        });
+
+        assert.strictEqual(data.rows.length, 1);
+        assert.strictEqual(isReadOnlyPrimaryKeyRecordId(data.rows[0][0]), true);
+        assert.strictEqual(data.rows[0][1], 'needle');
+        assert.match(data.readOnlyRowReasons?.[0] ?? '', /declared.*rowid.*identity/i);
+        assert.deepStrictEqual({ ...count }, { count: 1, isExact: true });
+    });
+
+    it('returns exact unsafe INTEGER text alongside rounded demo grid values', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE unsafe_integers (value INTEGER); ' +
+            'INSERT INTO unsafe_integers(value) VALUES (9007199254740993)'
+        );
+
+        const data = await worker.invoke('fetchTableData', 'unsafe_integers', {
+            columns: ['value'],
+            globalFilterColumns: ['value'],
+            globalFilter: '993',
+            limit: 100,
+            offset: 0
+        });
+
+        assert.strictEqual(data.rows[0][0], 9007199254740992);
+        assert.strictEqual(data.exactIntegerTexts[0][0], '9007199254740993');
+    });
+
+    it('keeps adjacent unsafe demo table rowids distinct and editable', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE unsafe_demo_rowids (value TEXT); ' +
+            "INSERT INTO unsafe_demo_rowids(rowid, value) VALUES " +
+            "(7, 'safe'), (9007199254740992, 'lower'), (9007199254740993, 'higher')"
+        );
+
+        const data = await worker.invoke('fetchTableData', 'unsafe_demo_rowids', {
+            columns: ['rowid', 'value'],
+            orderBy: 'rowid',
+            limit: 10,
+            offset: 0
+        });
+        assert.strictEqual(data.rows[0][0], 7);
+        assert.deepStrictEqual(
+            data.rows.slice(1).map((row: unknown[]) => row[0]),
+            ['9007199254740992', '9007199254740993']
+        );
+
+        await worker.invoke(
+            'updateCell',
+            'unsafe_demo_rowids',
+            data.rows[2][0],
+            'value',
+            'edited'
+        );
+        const values = await worker.invoke('fetchTableData', 'unsafe_demo_rowids', {
+            columns: ['rowid', 'value'],
+            orderBy: 'rowid',
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            values.rows.slice(1).map((row: unknown[]) => Array.from(row)),
+            [
+                ['9007199254740992', 'lower'],
+                ['9007199254740993', 'edited']
+            ]
+        );
+    });
+
+    it('returns an exact unsafe demo auto-rowid and undoes only that inserted row', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_unsafe_auto_rowid (value TEXT); ' +
+            "INSERT INTO demo_unsafe_auto_rowid(rowid, value) VALUES " +
+            "(9007199254740991, 'lower'), (9007199254740992, 'upper')"
+        );
+
+        const insertedRow = await worker.invoke(
+            'insertRowWithHistory',
+            'demo_unsafe_auto_rowid',
+            { value: 'inserted' }
+        );
+        assert.strictEqual(insertedRow.rowId, '9007199254740993');
+
+        await worker.invoke('undoModification', {
+            description: 'Undo unsafe demo auto-rowid insert',
+            modificationType: 'row_insert',
+            targetTable: 'demo_unsafe_auto_rowid',
+            targetRowId: insertedRow.rowId,
+            rowData: insertedRow.row,
+            insertedRow
+        });
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT CAST(rowid AS TEXT), value FROM demo_unsafe_auto_rowid ORDER BY rowid'
+        );
+        assert.deepStrictEqual(
+            rows[0].rows,
+            [
+                ['9007199254740991', 'lower'],
+                ['9007199254740992', 'upper']
+            ]
+        );
+    });
+
+    it('treats a declared demo rowid column with duplicate unsafe values as data', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_declared_rowid_dupes ("rowid" INTEGER, value TEXT); ' +
+            'INSERT INTO demo_declared_rowid_dupes("rowid", value) VALUES ' +
+            "(9007199254740993, 'first'), (9007199254740993, 'second')"
+        );
+
+        const data = await worker.invoke('fetchTableData', 'demo_declared_rowid_dupes', {
+            columns: ['rowid', 'rowid', 'value'],
+            limit: 10,
+            offset: 0
+        });
+
+        // The declared column shadows the intrinsic rowid, so it must never be
+        // promoted to identity. The synthetic slot is non-mutable while the
+        // duplicate visible data values retain exact text metadata.
+        assert.ok(data.rows.every((row: unknown[]) => (
+            isReadOnlyPrimaryKeyRecordId(row[0] as RecordId)
+        )));
+        assert.deepStrictEqual(
+            data.rows.map((row: unknown[]) => row[1]),
+            [9007199254740992, 9007199254740992]
+        );
+        assert.strictEqual(data.exactIntegerTexts[0][1], '9007199254740993');
+        assert.strictEqual(data.exactIntegerTexts[1][1], '9007199254740993');
+        assert.match(data.readOnlyRowReasons?.[0] ?? '', /read-only.*declared.*rowid/i);
+        assert.match(data.readOnlyRowReasons?.[1] ?? '', /read-only.*declared.*rowid/i);
+    });
+
+    it('rejects a unique declared demo rowid as a direct mutation identity', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_unique_declared_rowid ("rowid" INTEGER UNIQUE, value TEXT); ' +
+            "INSERT INTO demo_unique_declared_rowid(rowid, value) VALUES (7, 'preserved')"
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_unique_declared_rowid',
+                7,
+                'value',
+                'wrong row'
+            ),
+            /read-only.*declared.*rowid.*identity/i
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_unique_declared_rowid'),
+            'preserved'
+        );
+    });
+
+    it('fails clearly when a demo UPDATE trigger rewrites the primary key', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_trigger_rekey_identity (' +
+            'tenant TEXT, sequence INTEGER, value TEXT, PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_trigger_rekey_identity VALUES ('north', 1, 'before'); " +
+            'CREATE TRIGGER demo_trigger_rekey_identity_after ' +
+            'AFTER UPDATE OF value ON demo_trigger_rekey_identity BEGIN ' +
+            'UPDATE demo_trigger_rekey_identity SET sequence = sequence + 1 ' +
+            'WHERE tenant = NEW.tenant AND sequence = NEW.sequence; END'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_trigger_rekey_identity', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            limit: 1,
+            offset: 0
+        });
+
+        await assert.rejects(
+            worker.invoke(
+                'updateCell',
+                'demo_trigger_rekey_identity',
+                page.rows[0][0],
+                'value',
+                'after'
+            ),
+            /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
+        );
+        await assert.rejects(
+            worker.invoke(
+                'replaceOversizedCell',
+                'demo_trigger_rekey_identity',
+                page.rows[0][0],
+                'value',
+                'after',
+                { storageClass: 'text', byteLength: 6 },
+                5
+            ),
+            /UPDATE trigger changed or removed.*primary-key identity.*target table.*rolled back/is
+        );
+        assert.deepStrictEqual(
+            Array.from(
+                (await worker.invoke(
+                    'runQuery',
+                    'SELECT tenant, sequence, value FROM demo_trigger_rekey_identity'
+                ))[0].rows[0]
+            ),
+            ['north', 1, 'before']
+        );
+    });
+
+    it('edits and deletes rows through WITHOUT ROWID primary-key identities', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_without_rowid (' +
+            'tenant TEXT, sequence INTEGER, value TEXT, ' +
+            'PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_without_rowid VALUES " +
+            "('north', 9007199254740993, 'before')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_without_rowid', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const oldIdentity = page.rows[0][0];
+        assert.match(oldIdentity, /^pk:/);
+        assert.strictEqual(page.exactIntegerTexts[0][2], '9007199254740993');
+
+        const outcomes = await worker.invoke('updateCellBatch', 'demo_without_rowid', [
+            { rowId: oldIdentity, column: 'tenant', value: 'south' },
+            { rowId: oldIdentity, column: 'value', value: 'after' }
+        ]);
+        const newIdentity = outcomes[0].newRowId;
+        assert.ok(newIdentity);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, CAST(sequence AS TEXT), value FROM demo_without_rowid'
+            ))[0].rows,
+            [['south', '9007199254740993', 'after']]
+        );
+
+        const updateModification = {
+            modificationType: 'cell_update',
+            targetTable: 'demo_without_rowid',
+            affectedCells: outcomes
+        };
+        await worker.invoke('undoModification', updateModification);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, CAST(sequence AS TEXT), value FROM demo_without_rowid'
+            ))[0].rows,
+            [['north', '9007199254740993', 'before']]
+        );
+        await worker.invoke('redoModification', updateModification);
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, CAST(sequence AS TEXT), value FROM demo_without_rowid'
+            ))[0].rows,
+            [['south', '9007199254740993', 'after']]
+        );
+
+        const deletedRows = await worker.invoke('deleteRows', 'demo_without_rowid', [newIdentity]);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM demo_without_rowid'),
+            0
+        );
+        const deleteModification = {
+            modificationType: 'row_delete',
+            targetTable: 'demo_without_rowid',
+            affectedRowIds: [newIdentity],
+            deletedRows
+        };
+        await worker.invoke('undoModification', deleteModification);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM demo_without_rowid'),
+            1
+        );
+        await worker.invoke('redoModification', deleteModification);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM demo_without_rowid'),
+            0
+        );
+    });
+
+    it('undoes dependent demo composite-key changes in reverse transition order', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_dependent_identity (' +
+            'tenant INTEGER, sequence INTEGER, value TEXT, ' +
+            'PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID; ' +
+            "INSERT INTO demo_dependent_identity VALUES (1, 1, 'first'), (1, 2, 'second')"
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_dependent_identity', {
+            columns: ['rowid', 'tenant', 'sequence', 'value'],
+            orderBy: 'sequence',
+            limit: 10,
+            offset: 0
+        });
+        const affectedCells = await worker.invoke('updateCellBatch', 'demo_dependent_identity', [
+            { rowId: page.rows[0][0], column: 'tenant', value: 2 },
+            { rowId: page.rows[1][0], column: 'sequence', value: 1 }
+        ]);
+
+        await worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 'demo_dependent_identity',
+            affectedCells
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT tenant, sequence, value FROM demo_dependent_identity ORDER BY sequence'
+            ))[0].rows,
+            [[1, 1, 'first'], [1, 2, 'second']]
+        );
+    });
+
+    it('restores a deleted demo WITHOUT ROWID row without inserting generated columns', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_pk_row (' +
+            'id INTEGER PRIMARY KEY, base INTEGER, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO demo_generated_pk_row (id, base) VALUES (7, 5)'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_generated_pk_row', {
+            columns: ['rowid', 'id', 'base', 'stored_value', 'virtual_value'],
+            limit: 10,
+            offset: 0
+        });
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_generated_pk_row',
+            [page.rows[0][0]]
+        );
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_generated_pk_row',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT id, base, stored_value, virtual_value FROM demo_generated_pk_row'
+            ))[0].rows,
+            [[7, 5, 10, 15]]
+        );
+    });
+
+    it('restores a deleted demo rowid row without inserting generated columns', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_generated_rowid_row (' +
+            'base INTEGER, ' +
+            'stored_value INTEGER GENERATED ALWAYS AS (base * 2) STORED, ' +
+            'virtual_value INTEGER GENERATED ALWAYS AS (base * 3) VIRTUAL' +
+            '); ' +
+            'INSERT INTO demo_generated_rowid_row (rowid, base) VALUES (9, 5)'
+        );
+        const deletedRows = await worker.invoke(
+            'deleteRows',
+            'demo_generated_rowid_row',
+            [9]
+        );
+        assert.ok(deletedRows);
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_generated_rowid_row',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT rowid, base, stored_value, virtual_value FROM demo_generated_rowid_row'
+            ))[0].rows,
+            [[9, 5, 10, 15]]
+        );
+    });
+
+    it('preserves an unsafe demo INTEGER prior storage class when undoing a typeless cell', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_typeless_undo (' +
+            'id INTEGER PRIMARY KEY, value' +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO demo_typeless_undo VALUES (1, 9007199254740993)'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_typeless_undo', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        const affectedCells = await worker.invoke('updateCellBatch', 'demo_typeless_undo', [{
+            rowId: page.rows[0][0],
+            column: 'value',
+            value: 'changed'
+        }]);
+        assert.strictEqual(typeof affectedCells[0].priorValue, 'bigint');
+
+        await worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 'demo_typeless_undo',
+            affectedCells
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT typeof(value), CAST(value AS TEXT) FROM demo_typeless_undo'
+            ))[0].rows,
+            [['integer', '9007199254740993']]
+        );
+    });
+
+    it('preserves an unsafe demo INTEGER storage class when restoring a deleted typeless row', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_typeless_restore (value); ' +
+            'INSERT INTO demo_typeless_restore (rowid, value) VALUES (11, 9007199254740993)'
+        );
+        const deletedRows = await worker.invoke('deleteRows', 'demo_typeless_restore', [11]);
+        assert.strictEqual(typeof deletedRows[0].row.value, 'bigint');
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'demo_typeless_restore',
+            deletedRows
+        });
+
+        assert.deepStrictEqual(
+            (await worker.invoke(
+                'runQuery',
+                'SELECT rowid, typeof(value), CAST(value AS TEXT) FROM demo_typeless_restore'
+            ))[0].rows,
+            [[11, 'integer', '9007199254740993']]
+        );
+    });
+
+    it('loads and edits rowid-addressable demo FTS virtual and shadow tables', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE VIRTUAL TABLE demo_fts4_identity USING fts4(body); " +
+            "INSERT INTO demo_fts4_identity(body) VALUES ('before')"
+        );
+
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.tables.find((table: any) => table.identifier === 'demo_fts4_identity')?.identity?.kind,
+            'rowid'
+        );
+        const shadows = schema.tables.filter((table: any) => (
+            table.identifier.startsWith('demo_fts4_identity_')
+        ));
+        assert.ok(shadows.length > 0);
+        assert.ok(shadows.every((table: any) => table.identity?.kind === 'rowid'));
+
+        const page = await worker.invoke('fetchTableData', 'demo_fts4_identity', {
+            columns: ['rowid', 'body'],
+            limit: 10,
+            offset: 0
+        });
+        await worker.invoke(
+            'updateCell',
+            'demo_fts4_identity',
+            page.rows[0][0],
+            'body',
+            'after'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT body FROM demo_fts4_identity'),
+            'after'
+        );
+
+        const shadowPage = await worker.invoke(
+            'fetchTableData',
+            'demo_fts4_identity_content',
+            { columns: ['rowid', 'c0body'], limit: 10, offset: 0 }
+        );
+        await worker.invoke(
+            'updateCell',
+            'demo_fts4_identity_content',
+            shadowPage.rows[0][0],
+            'c0body',
+            'shadow-after'
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT c0body FROM demo_fts4_identity_content'
+            ),
+            'shadow-after'
+        );
+    });
+
+    it('loads and edits demo FTS5 when the bundled SQLite provides FTS5', async t => {
+        const worker = await createWorkerHarness();
+        try {
+            await worker.invoke(
+                'runQuery',
+                "CREATE VIRTUAL TABLE demo_fts5_identity USING fts5(body); " +
+                "INSERT INTO demo_fts5_identity(body) VALUES ('before')"
+            );
+        } catch (error) {
+            if (/no such module: fts5/i.test(String(error))) {
+                t.skip('bundled sql.js does not include FTS5');
+                return;
+            }
+            throw error;
+        }
+
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.tables.find((table: any) => table.identifier === 'demo_fts5_identity')?.identity?.kind,
+            'rowid'
+        );
+        const page = await worker.invoke('fetchTableData', 'demo_fts5_identity', {
+            columns: ['rowid', 'body'],
+            limit: 10,
+            offset: 0
+        });
+        await worker.invoke(
+            'updateCell',
+            'demo_fts5_identity',
+            page.rows[0][0],
+            'body',
+            'after'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT body FROM demo_fts5_identity'),
+            'after'
+        );
+    });
+
+    it('loads all demo table identities with one bulk metadata query', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => {
+                if (kind === 'exec') observedSql.push(sql);
+            }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_schema_rowid (value TEXT); ' +
+            'CREATE TABLE demo_schema_pk_a (id TEXT PRIMARY KEY) WITHOUT ROWID; ' +
+            'CREATE TABLE demo_schema_pk_b (' +
+            'tenant TEXT, sequence INTEGER, PRIMARY KEY (tenant, sequence)' +
+            ') WITHOUT ROWID'
+        );
+        observedSql.length = 0;
+
+        const schema = await worker.invoke('fetchSchema');
+
+        assert.strictEqual(schema.tables.length, 3);
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('pragma_table_list')).length,
+            1
+        );
+        assert.strictEqual(
+            observedSql.filter(sql => /PRAGMA\s+(?:main\.)?table_info/i.test(sql)).length,
+            0,
+            'schema identity must use one set-based metadata query'
+        );
+    });
+
+    it('enumerates and loads demo tables that shadow PRAGMA virtual-table names', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_pragma_shadow_target (id INTEGER PRIMARY KEY, value TEXT); ' +
+            "INSERT INTO demo_pragma_shadow_target VALUES (1, 'before'); " +
+            'CREATE TABLE pragma_table_info (dummy TEXT)'
+        );
+
+        const infoShadowSchema = await worker.invoke('fetchSchema');
+        assert.ok(
+            infoShadowSchema.tables.some(
+                (table: any) => table.identifier === 'demo_pragma_shadow_target'
+            )
+        );
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE pragma_table_list (dummy TEXT); ' +
+            'CREATE TABLE pragma_table_xinfo (dummy TEXT)'
+        );
+        const fullyShadowedSchema = await worker.invoke('fetchSchema');
+        const identifiers = new Set(
+            fullyShadowedSchema.tables.map((table: any) => table.identifier)
+        );
+        for (const table of [
+            'demo_pragma_shadow_target',
+            'pragma_table_info',
+            'pragma_table_list',
+            'pragma_table_xinfo'
+        ]) {
+            assert.ok(identifiers.has(table), `schema omitted ${table}`);
+        }
+
+        const page = await worker.invoke('fetchTableData', 'demo_pragma_shadow_target', {
+            columns: ['rowid', 'id', 'value'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(Array.from(page.rows[0]), [1, 1, 'before']);
+
+        await worker.invoke('insertRow', 'demo_pragma_shadow_target', { value: 'after' });
+        const rows = await worker.invoke(
+            'runQuery',
+            'SELECT id, value FROM demo_pragma_shadow_target ORDER BY id'
+        );
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: any) => Array.from(row)),
+            [[1, 'before'], [2, 'after']]
+        );
+    });
+
+    it('returns exact unsafe INTEGER text from demo view previews', async () => {
+        const worker = await createWorkerHarness();
+
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'unsafe_integer_preview',
+            'SELECT 9007199254740993 AS value',
+            10,
+            'create'
+        );
+
+        assert.strictEqual(preview.rows[0][0], 9007199254740992);
+        assert.strictEqual(preview.exactIntegerTexts[0][0], '9007199254740993');
+    });
+
+    it('returns integral REAL storage text from demo table fetches and previews', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_integral_reals (value); ' +
+            'INSERT INTO demo_integral_reals(value) VALUES (CAST(1 AS REAL))'
+        );
+
+        const data = await worker.invoke('fetchTableData', 'demo_integral_reals', {
+            columns: ['value'],
+            globalFilterColumns: ['value'],
+            globalFilter: '.',
+            limit: 100,
+            offset: 0
+        });
+        assert.strictEqual(data.rows[0][0], 1);
+        assert.strictEqual(data.exactIntegerTexts[0][0], '1.0');
+
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_integral_real_preview',
+            'SELECT CAST(1 AS REAL) AS value',
+            10,
+            'create'
+        );
+        assert.strictEqual(preview.rows[0][0], 1);
+        assert.strictEqual(preview.exactIntegerTexts[0][0], '1.0');
+    });
+
+    it('returns authoritative SQLite text for divergent non-integral demo REALs', async () => {
+        const worker = await createWorkerHarness();
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT sqlite_version()'),
+            BUNDLED_SQLJS_SQLITE_VERSION,
+            'the REAL text expectation below is pinned to the bundled SQLite version'
+        );
+        const expectedText = DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION[
+            BUNDLED_SQLJS_SQLITE_VERSION
+        ];
+        assert.ok(expectedText, 'record the REAL rendering when bundled sql.js SQLite changes');
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_divergent_real_preview',
+            'SELECT 9.652937795298495e282 AS value',
+            10,
+            'create'
+        );
+
+        assert.strictEqual(preview.rows[0][0], 9.652937795298495e282);
+        assert.strictEqual(
+            preview.exactIntegerTexts[0][0],
+            expectedText
+        );
+    });
+
+    it('degrades exact REAL companions without failing a 1001-column demo preview', async () => {
+        const worker = await createWorkerHarness();
+        const expressions = Array.from({ length: 1001 }, (_, index) => {
+            if (index === 0) return '9007199254740993 AS c0';
+            if (index === 1) return 'CAST(1 AS REAL) AS c1';
+            return `0 AS c${index}`;
+        });
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_wide_numeric_preview',
+            `SELECT ${expressions.join(', ')}`,
+            1,
+            'create'
+        );
+
+        assert.strictEqual(preview.headers.length, 1001);
+        assert.strictEqual(preview.rows[0].length, 1001);
+        assert.strictEqual(preview.rows[0][0], 9007199254740992);
+        assert.strictEqual(preview.exactIntegerTexts[0][0], '9007199254740993');
+        assert.strictEqual(preview.exactIntegerTexts[0][1], undefined);
+    });
+
+    it('loads rowid and WITHOUT ROWID demo tables at both maximum-width boundaries', async () => {
+        const worker = await createWorkerHarness();
+        for (const declaredColumnCount of [1999, 2000]) {
+            for (const withoutRowId of [false, true]) {
+                const columns = Array.from(
+                    { length: declaredColumnCount },
+                    (_, index) => `c${index}`
+                );
+                const table = `demo_containment_width_${declaredColumnCount}_${withoutRowId ? 'pk' : 'rowid'}`;
+                const definitions = columns.map((column, index) => (
+                    withoutRowId && index === 0
+                        ? `"${column}" INTEGER PRIMARY KEY`
+                        : `"${column}" TEXT`
+                ));
+                await worker.invoke(
+                    'runQuery',
+                    `CREATE TABLE "${table}" (${definitions.join(', ')})` +
+                    `${withoutRowId ? ' WITHOUT ROWID' : ''}; ` +
+                    `INSERT INTO "${table}" ("c0", "c${declaredColumnCount - 1}") ` +
+                    `VALUES (1, 'last')`
+                );
+
+                const page = await worker.invoke('fetchTableData', table, {
+                    columns: ['rowid', ...columns],
+                    globalFilterColumns: columns,
+                    limit: 1,
+                    offset: 0
+                });
+
+                assert.strictEqual(page.headers.length, declaredColumnCount + 1);
+                assert.strictEqual(page.rows[0].length, declaredColumnCount + 1);
+                assert.strictEqual(page.rows[0][1], withoutRowId ? 1 : '1');
+                assert.strictEqual(page.rows[0][declaredColumnCount], 'last');
+                assert.match(
+                    String(page.rows[0][0]),
+                    withoutRowId ? /^(?:pk|readonly-pk):/ : /^1$/
+                );
+            }
+        }
+    });
+
+    it('restores divergent REAL text for a 1001-column rowid-keyed demo table', async () => {
+        const worker = await createWorkerHarness();
+        const columnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        await worker.invoke(
+            'runQuery',
+            `CREATE TABLE demo_wide_real_rows (${columnNames.map(name => `"${name}"`).join(', ')}); ` +
+            'INSERT INTO demo_wide_real_rows(c0) VALUES (9.652937795298495e282)'
+        );
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_real_rows', {
+            columns: ['rowid', ...columnNames],
+            globalFilterColumns: columnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        assert.strictEqual(typeof result.exactIntegerTexts?.[0]?.[1], 'string');
+        assert.notStrictEqual(
+            result.exactIntegerTexts[0][1],
+            String(result.rows[0][1])
+        );
+    });
+
+    it('does not issue rowid companions for a wide demo view named rowid', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql(_kind, sql) { observedSql.push(sql); }
+        });
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const viewExpressions = [
+            '1 AS rowid',
+            '9.652937795298495e282 AS c0',
+            ...dataColumnNames.slice(1).map(name => `0 AS "${name}"`)
+        ];
+        await worker.invoke(
+            'runQuery',
+            `CREATE VIEW demo_wide_named_rowid AS SELECT ${viewExpressions.join(', ')}`
+        );
+        observedSql.length = 0;
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_named_rowid', {
+            columns: ['rowid', ...dataColumnNames],
+            globalFilterColumns: dataColumnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        // The runtime's packed REAL text column fits where one sidecar
+        // column per value would exceed SQLite's result width.
+        assert.strictEqual(
+            result.exactIntegerTexts?.[0]?.[1],
+            DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION[BUNDLED_SQLJS_SQLITE_VERSION]
+        );
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+            0
+        );
+    });
+
+    it('loads a wide demo view with a null first column without rowid companions', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql(_kind, sql) { observedSql.push(sql); }
+        });
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        const viewExpressions = [
+            'NULL AS first_value',
+            ...dataColumnNames.map(name => `0 AS "${name}"`)
+        ];
+        await worker.invoke(
+            'runQuery',
+            `CREATE VIEW demo_wide_null_first AS SELECT ${viewExpressions.join(', ')}`
+        );
+        observedSql.length = 0;
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_null_first', {
+            columns: ['first_value', ...dataColumnNames],
+            globalFilterColumns: dataColumnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        assert.strictEqual(result.rows[0][0], null);
+        assert.strictEqual(result.exactIntegerTexts, undefined);
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+            0
+        );
+    });
+
+    it('does not issue rowid companions for a wide demo WITHOUT ROWID table', async () => {
+        const observedSql: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql(_kind, sql) { observedSql.push(sql); }
+        });
+        const dataColumnNames = Array.from({ length: 1000 }, (_, index) => `c${index}`);
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_wide_without_rowid (' +
+            '"rowid" INTEGER PRIMARY KEY, ' +
+            dataColumnNames.map(name => `"${name}"`).join(', ') +
+            ') WITHOUT ROWID; ' +
+            'INSERT INTO demo_wide_without_rowid(rowid, c0) VALUES ' +
+            '(1, 9.652937795298495e282)'
+        );
+        observedSql.length = 0;
+
+        const result = await worker.invoke('fetchTableData', 'demo_wide_without_rowid', {
+            columns: ['rowid', ...dataColumnNames],
+            globalFilterColumns: dataColumnNames,
+            limit: 1,
+            offset: 0
+        });
+        assert.strictEqual(result.rows[0].length, 1001);
+        // The runtime's packed REAL text column fits where one sidecar
+        // column per value would exceed SQLite's result width.
+        assert.strictEqual(
+            result.exactIntegerTexts?.[0]?.[1],
+            DIVERGENT_REAL_TEXT_BY_SQLJS_SQLITE_VERSION[BUNDLED_SQLJS_SQLITE_VERSION]
+        );
+        assert.strictEqual(
+            observedSql.filter(sql => sql.includes('__sqlite_explorer_numeric_rowid')).length,
+            0
+        );
+    });
+
+    it('derives demo numeric sidecars from one evaluation of random expressions', async () => {
+        const worker = await createWorkerHarness();
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'demo_random_numeric_preview',
+            'WITH RECURSIVE sequence(n) AS (' +
+            'SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 24' +
+            ') SELECT CAST(random() % 1000000 AS REAL) AS value FROM sequence',
+            24,
+            'create'
+        );
+
+        assert.strictEqual(preview.rows.length, 24);
+        for (let rowIndex = 0; rowIndex < preview.rows.length; rowIndex++) {
+            const exactText = preview.exactIntegerTexts?.[rowIndex]?.[0];
+            assert.strictEqual(typeof exactText, 'string', `missing sidecar for row ${rowIndex}`);
+            assert.strictEqual(Number(exactText), preview.rows[rowIndex][0]);
+        }
+    });
+
+    it('uses the same narrowed global-filter columns for demo data and counts', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE scoped_filters (visible TEXT, hidden TEXT); " +
+            "INSERT INTO scoped_filters VALUES ('shown', 'secret')"
+        );
+        const options = {
+            columns: ['visible', 'hidden'],
+            globalFilterColumns: ['visible'],
+            globalFilter: 'secret'
+        };
+
+        const data = await worker.invoke('fetchTableData', 'scoped_filters', {
+            ...options,
+            limit: 100,
+            offset: 0
+        });
+        const count = await worker.invoke('fetchTableCount', 'scoped_filters', options);
+
+        assert.deepStrictEqual(Array.from(data.rows), []);
+        assert.deepStrictEqual({ ...count }, { count: 0, isExact: true });
+    });
+
+    it('falls back to selected columns when count globalFilterColumns is null', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE null_scoped_filters (visible TEXT, hidden TEXT); " +
+            "INSERT INTO null_scoped_filters VALUES ('shown', 'secret')"
+        );
+
+        const count = await worker.invoke('fetchTableCount', 'null_scoped_filters', {
+            columns: ['visible'],
+            globalFilterColumns: null,
+            globalFilter: 'secret'
+        });
+
+        assert.deepStrictEqual({ ...count }, { count: 0, isExact: true });
+    });
+
+    it('treats whitespace-only filters as inactive but preserves padded terms', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE whitespace_filters (value TEXT); " +
+            "INSERT INTO whitespace_filters VALUES ('needle'), (' needle '), ('other')"
+        );
+
+        for (const options of [
+            { columns: ['value'], globalFilter: '   ' },
+            { columns: ['value'], filters: [{ column: 'value', value: '   ' }] }
+        ]) {
+            const data = await worker.invoke('fetchTableData', 'whitespace_filters', {
+                ...options,
+                limit: 100,
+                offset: 0
+            });
+            const count = await worker.invoke('fetchTableCount', 'whitespace_filters', options);
+            assert.strictEqual(data.rows.length, 3);
+            assert.deepStrictEqual({ ...count }, { count: 3, isExact: true });
+        }
+
+        const padded = await worker.invoke('fetchTableData', 'whitespace_filters', {
+            columns: ['value'],
+            globalFilter: ' needle ',
+            limit: 100,
+            offset: 0
+        });
+        const paddedCount = await worker.invoke('fetchTableCount', 'whitespace_filters', {
+            columns: ['value'],
+            globalFilter: ' needle '
+        });
+        assert.deepStrictEqual(
+            Array.from(padded.rows, (row: unknown[]) => Array.from(row)),
+            [[' needle ']]
+        );
+        assert.deepStrictEqual({ ...paddedCount }, { count: 1, isExact: true });
+    });
+
+    it('validates the CREATE VIEW construct and leaves the schema unchanged', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW validation_target (a, b) AS SELECT 1, 2');
+        const originalSql = await workerScalar(
+            worker,
+            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'validation_target'"
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'parameter_view',
+                'SELECT ? AS value',
+                'create'
+            ),
+            /parameters are not allowed in views/
+        );
+        await assert.rejects(
+            worker.invoke('validateViewDefinition', 'validation_target', 'SELECT 1'),
+            /expected 2 columns/
+        );
+
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'parameter_view'"
+        ), 0);
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT sql FROM sqlite_schema WHERE type = 'view' AND name = 'validation_target'"
+        ), originalSql);
+    });
+
+    it('enforces create and edit intent against the installed schema', async () => {
+        const worker = await createWorkerHarness();
+
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'missing_intent_target',
+                'SELECT 2 AS value',
+                'edit'
+            ),
+            /view no longer exists/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'missing_intent_target',
+                'SELECT 2 AS value',
+                10,
+                'edit'
+            ),
+            /view no longer exists/i
+        );
+
+        await worker.invoke('createView', 'intent_target', 'SELECT 1 AS value');
+
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'intent_target',
+                'SELECT 2 AS value',
+                'create'
+            ),
+            /view already exists/i
+        );
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'intent_target',
+                'SELECT 2 AS value',
+                10,
+                'create'
+            ),
+            /view already exists/i
+        );
+
+        await worker.invoke(
+            'validateViewDefinition',
+            'intent_target',
+            'SELECT 2 AS value',
+            'edit'
+        );
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'intent_target',
+            'SELECT 2 AS value',
+            10,
+            'edit'
+        );
+        assert.deepStrictEqual(Array.from(preview.headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [[2]]
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT value FROM intent_target'), 1);
+    });
+
+    it('does not run validation DDL in demo read-only mode', async () => {
+        const worker = await createWorkerHarness({ readOnlyMode: true });
+
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'read_only_view',
+                'SELECT 1 AS value',
+                'create'
+            ),
+            /View validation is unavailable because the database is read-only/
+        );
+        const preview = await worker.invoke(
+            'previewViewDefinition',
+            'read_only_view',
+            'SELECT 1 AS value',
+            10,
+            'create'
+        );
+        assert.deepStrictEqual(Array.from(preview.headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(preview.rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.views.some((view: { identifier: string }) => view.identifier === 'read_only_view'),
+            false
+        );
+    });
+
+    it('rejects every demo mutation when initialized read-only', async () => {
+        const writable = await createWorkerHarness();
+        await writable.invoke(
+            'runQuery',
+            "CREATE TABLE read_only_rows (value TEXT, spare TEXT); " +
+            "INSERT INTO read_only_rows VALUES ('original', 'keep')"
+        );
+        await writable.invoke('createView', 'read_only_existing', 'SELECT 1 AS value');
+        const content = await writable.invoke('exportDatabase', 'test.db');
+        const worker = await createWorkerHarness({
+            content: Uint8Array.from(content),
+            readOnlyMode: true
+        });
+
+        const mutations: Array<[string, ...unknown[]]> = [
+            ['runQuery', "UPDATE read_only_rows SET value = 'raw-sql'"],
+            ['setPragma', 'foreign_keys', 1],
+            ['updateCell', 'read_only_rows', 1, 'value', 'changed'],
+            ['insertRow', 'read_only_rows', { value: 'inserted' }],
+            ['deleteRows', 'read_only_rows', [1]],
+            ['deleteColumns', 'read_only_rows', ['spare']],
+            ['createTable', 'read_only_new_table', [{ name: 'id', type: 'INTEGER' }]],
+            ['updateCellBatch', 'read_only_rows', [{ rowId: 1, column: 'value', value: 'batch' }]],
+            ['addColumn', 'read_only_rows', 'added', 'TEXT'],
+            ['createView', 'read_only_new', 'SELECT 2 AS value'],
+            ['editView', 'read_only_existing', 'SELECT 2 AS value'],
+            ['dropView', 'read_only_existing']
+        ];
+        for (const [method, ...args] of mutations) {
+            await assert.rejects(
+                worker.invoke(method, ...args),
+                /unavailable because the database is read-only/i,
+                method
+            );
+        }
+
+        const rows = await worker.invoke('fetchTableData', 'read_only_rows', {
+            columns: ['value', 'spare'],
+            limit: 10,
+            offset: 0
+        });
+        assert.deepStrictEqual(
+            Array.from(rows.rows, (row: unknown[]) => Array.from(row)),
+            [['original', 'keep']]
+        );
+        const tableInfo = await worker.invoke('getTableInfo', 'read_only_rows');
+        assert.deepStrictEqual(
+            Array.from(tableInfo, (column: { identifier: string }) => column.identifier),
+            ['value', 'spare']
+        );
+        const schema = await worker.invoke('fetchSchema');
+        assert.strictEqual(
+            schema.tables.some((table: { identifier: string }) => table.identifier === 'read_only_new_table'),
+            false
+        );
+        assert.strictEqual(
+            schema.views.some((view: { identifier: string }) => view.identifier === 'read_only_new'),
+            false
+        );
+        assert.strictEqual(
+            schema.views.some((view: { identifier: string }) => view.identifier === 'read_only_existing'),
+            true
+        );
+    });
+
+    it('rejects unsafe demo PRAGMA assignments before execution', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE pragma_sentinel (id INTEGER)');
+
+        await worker.invoke('setPragma', 'foreign_keys', true);
+        await worker.invoke('setPragma', 'cache_size', 64);
+        await worker.invoke('setPragma', 'journal_mode', 'memory');
+        await assert.rejects(
+            worker.invoke(
+                'setPragma',
+                'foreign_keys',
+                'OFF; DROP TABLE pragma_sentinel; --'
+            ),
+            /Invalid PRAGMA string value/
+        );
+        await assert.rejects(
+            worker.invoke('setPragma', 'foreign_keys; DROP TABLE pragma_sentinel', 'OFF'),
+            /Invalid or disallowed PRAGMA/
+        );
+        await assert.rejects(
+            worker.invoke('setPragma', 'cache_size', Number.POSITIVE_INFINITY),
+            /Invalid PRAGMA numeric value/
+        );
+
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'pragma_sentinel'"
+            ),
+            1
+        );
+    });
+
+    it('fails the pragma snapshot when a pragma cannot be read, naming it', async () => {
+        let failing = false;
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => {
+                if (failing && kind === 'exec' && sql === 'PRAGMA auto_vacuum') throw new Error('database is locked');
+            }
+        });
+        failing = true;
+        // A snapshot without the key rendered the Configuration modal with
+        // that setting shown as unset, as if the read had succeeded.
+        await assert.rejects(worker.invoke('getPragmas'), /PRAGMA auto_vacuum could not be read: database is locked/);
+        failing = false;
+        const pragmas = await worker.invoke('getPragmas');
+        assert.deepStrictEqual(Object.keys(pragmas), [
+            'foreign_keys', 'journal_mode', 'synchronous', 'cache_size',
+            'locking_mode', 'temp_store', 'encoding', 'auto_vacuum'
+        ]);
+    });
+
+    it('reports locking_mode and temp_store in the demo pragma snapshot', async () => {
+        const worker = await createWorkerHarness();
+
+        const pragmas = await worker.invoke('getPragmas');
+
+        assert.ok(Object.prototype.hasOwnProperty.call(pragmas, 'locking_mode'));
+        assert.ok(Object.prototype.hasOwnProperty.call(pragmas, 'temp_store'));
+        assert.strictEqual(typeof pragmas.locking_mode, 'string');
+        assert.strictEqual(typeof pragmas.temp_store, 'number');
+    });
+
+    it('nests demo batch updates inside an existing savepoint', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nested_batch (value TEXT); " +
+            "INSERT INTO nested_batch VALUES ('before'); " +
+            'SAVEPOINT outer_batch'
+        );
+
+        const outcomes = await worker.invoke('updateCellBatch', 'nested_batch', [
+            { rowId: 1, column: 'value', value: 'after' }
+        ]);
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(outcomes)), [{
+            rowId: 1,
+            columnName: 'value',
+            priorValue: 'before',
+            newValue: 'after',
+            priorState: { storageClass: 'text', value: 'before' },
+            postState: { storageClass: 'text', value: 'after' },
+            operation: 'set'
+        }]);
+        await worker.invoke('runQuery', 'RELEASE outer_batch');
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM nested_batch WHERE rowid = 1'),
+            'after'
+        );
+    });
+
+    it('keeps the outer savepoint in control of a nested demo batch update', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nested_batch_rollback (value TEXT); " +
+            "INSERT INTO nested_batch_rollback VALUES ('before'); " +
+            'SAVEPOINT outer_batch_rollback'
+        );
+
+        await worker.invoke('updateCellBatch', 'nested_batch_rollback', [
+            { rowId: 1, column: 'value', value: 'after' }
+        ]);
+        await worker.invoke(
+            'runQuery',
+            'ROLLBACK TO outer_batch_rollback; RELEASE outer_batch_rollback'
+        );
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM nested_batch_rollback WHERE rowid = 1'),
+            'before'
+        );
+    });
+
+    it('nests demo column deletion and lets the outer savepoint restore the schema', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nested_delete (kept TEXT, removed TEXT); " +
+            "INSERT INTO nested_delete VALUES ('keep', 'restore'); " +
+            'SAVEPOINT outer_delete'
+        );
+
+        await worker.invoke('deleteColumns', 'nested_delete', ['removed']);
+        await worker.invoke('runQuery', 'ROLLBACK TO outer_delete; RELEASE outer_delete');
+
+        const schema = await worker.invoke('getTableInfo', 'nested_delete');
+        assert.deepStrictEqual(
+            Array.from(schema, (column: { identifier: string }) => column.identifier),
+            ['kept', 'removed']
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT removed FROM nested_delete'),
+            'restore'
+        );
+    });
+
+    it('interrupts a long-running preview before its first row is produced', async () => {
+        const worker = await createWorkerHarness({
+            queryTimeout: 20
+        });
+        const startedAt = performance.now();
+
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'slow_preview',
+                'WITH RECURSIVE counter(value) AS (' +
+                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                ') SELECT sum(value) AS value FROM counter',
+                10,
+                'create'
+            ),
+            /Query execution timed out after 20ms/
+        );
+        assert.ok(
+            performance.now() - startedAt < 500,
+            'demo preview completed before timeout rejection instead of being interrupted'
+        );
+    });
+
+    it('interrupts a long-running ad hoc query at the configured deadline', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 20 });
+        const startedAt = performance.now();
+
+        await assert.rejects(
+            worker.invoke(
+                'runQuery',
+                'WITH RECURSIVE counter(value) AS (' +
+                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                ') SELECT sum(value) FROM counter'
+            ),
+            /Query execution timed out after 20ms/
+        );
+        assert.ok(performance.now() - startedAt < 500);
+    });
+
+    it('preempts a running query through a shared cancellation flag', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 200 });
+        const cancellationFlag = new Int32Array(
+            new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
+        );
+        const flagSetter = new NodeWorker(
+            `const { parentPort, workerData } = require('node:worker_threads');
+             setTimeout(() => {
+               Atomics.store(workerData, 0, 1);
+               parentPort.postMessage('cancelled');
+             }, 20);`,
+            { eval: true, workerData: cancellationFlag }
+        );
+        const startedAt = performance.now();
+
+        try {
+            await assert.rejects(
+                worker.invoke(
+                    'runQuery',
+                    'WITH RECURSIVE counter(value) AS (' +
+                    'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                    ') SELECT sum(value) FROM counter',
+                    [],
+                    cancellationFlag
+                ),
+                /Query execution cancelled/
+            );
+            assert.ok(performance.now() - startedAt < 150);
+        } finally {
+            await flagSetter.terminate();
+        }
+    });
+
+    it('drops a view whose stored SQL cannot be extracted for editing', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIEW opaque_view AS SELECT 1 AS value');
+        await worker.invoke('runQuery', 'PRAGMA writable_schema = ON');
+        await worker.invoke(
+            'runQuery',
+            "UPDATE sqlite_schema SET sql = 'opaque stored view text' " +
+            "WHERE type = 'view' AND name = 'opaque_view'"
+        );
+        await worker.invoke('runQuery', 'PRAGMA writable_schema = OFF');
+
+        const dropped = await worker.invoke('dropView', 'opaque_view');
+
+        assert.strictEqual(dropped.sql, 'opaque stored view text');
+        assert.strictEqual(dropped.selectSql, '');
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'view' AND name = 'opaque_view'"
+        ), 0);
+    });
+
+    it('captures the demo drop snapshot inside the drop savepoint', async () => {
+        const order: string[] = [];
+        const worker = await createWorkerHarness({
+            initSqlJs: async config => {
+                const SQL = await initSqlJs(config);
+                const BaseDatabase = SQL.Database;
+                class RecordingDatabase extends BaseDatabase {
+                    exec(sql: string, params?: any) {
+                        if (
+                            sql.startsWith("SELECT sql FROM sqlite_schema WHERE type = 'view'") &&
+                            params?.[0] === 'drop_order_view'
+                        ) {
+                            order.push('snapshot');
+                        }
+                        return super.exec(sql, params);
+                    }
+
+                    prepare(sql: string, params?: any) {
+                        if (!sql.includes('sqlite_explorer_boundary_')) {
+                            if (/^SAVEPOINT "sp_drop_view_/.test(sql)) order.push('savepoint');
+                            if (sql === 'DROP VIEW main."drop_order_view"') order.push('drop');
+                            if (/^RELEASE "sp_drop_view_/.test(sql)) order.push('release');
+                        }
+                        return super.prepare(sql, params);
+                    }
+                }
+                return { ...SQL, Database: RecordingDatabase };
+            }
+        });
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW drop_order_view AS SELECT 1 AS value'
+        );
+        order.length = 0;
+
+        const dropped = await worker.invoke('dropView', 'drop_order_view');
+
+        assert.strictEqual(dropped.selectSql, 'SELECT 1 AS value');
+        assert.deepStrictEqual(order, ['savepoint', 'snapshot', 'drop', 'release']);
+    });
+
+    it('recreates same-event triggers in schema order', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE trigger_log (label TEXT)');
+        await worker.invoke('runQuery', 'CREATE VIEW trigger_order AS SELECT 1 AS value');
+        await worker.invoke(
+            'runQuery',
+            "CREATE TRIGGER z_created_first INSTEAD OF INSERT ON TRIGGER_ORDER BEGIN INSERT INTO trigger_log VALUES ('z'); END"
+        );
+        await worker.invoke(
+            'runQuery',
+            "CREATE TRIGGER a_created_second INSTEAD OF INSERT ON TRIGGER_ORDER BEGIN INSERT INTO trigger_log VALUES ('a'); END"
+        );
+
+        const before = await worker.invoke('getViewDefinition', 'trigger_order');
+        assert.deepStrictEqual(
+            Array.from(before.triggers, (trigger: any) => trigger.identifier),
+            ['z_created_first', 'a_created_second']
+        );
+
+        await worker.invoke('runQuery', 'INSERT INTO trigger_order VALUES (1)');
+        const originalOrder = await worker.invoke('runQuery', 'SELECT label FROM trigger_log ORDER BY rowid');
+        await worker.invoke('runQuery', 'DELETE FROM trigger_log');
+        await worker.invoke('editView', 'trigger_order', 'SELECT 2 AS value', true);
+        await worker.invoke('runQuery', 'INSERT INTO trigger_order VALUES (2)');
+        const recreatedOrder = await worker.invoke('runQuery', 'SELECT label FROM trigger_log ORDER BY rowid');
+
+        assert.deepStrictEqual(
+            Array.from(recreatedOrder[0].rows, (row: unknown[]) => Array.from(row)),
+            Array.from(originalOrder[0].rows, (row: unknown[]) => Array.from(row))
+        );
+    });
+
+    it('rejects a preserved demo trigger that references a removed view column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_trigger_column_source (a TEXT, b TEXT); " +
+            "INSERT INTO demo_trigger_column_source VALUES ('old-a', 'old-b'); " +
+            'CREATE TABLE demo_trigger_column_log (value TEXT); ' +
+            'CREATE VIEW demo_trigger_column_view AS SELECT a FROM demo_trigger_column_source; ' +
+            'CREATE TRIGGER demo_trigger_column_update ' +
+            'INSTEAD OF UPDATE ON demo_trigger_column_view ' +
+            "BEGIN INSERT INTO demo_trigger_column_log VALUES (NEW.\"a\" || ':' || OLD.[a]); END"
+        );
+
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_trigger_column_view',
+                'SELECT b FROM demo_trigger_column_source',
+                true
+            ),
+            /demo_trigger_column_update.*missing view column.*\ba\b/i
+        );
+
+        const definition = await worker.invoke('getViewDefinition', 'demo_trigger_column_view');
+        assert.strictEqual(definition.selectSql, 'SELECT a FROM demo_trigger_column_source');
+        await worker.invoke(
+            'runQuery',
+            "UPDATE demo_trigger_column_view SET a = 'new-a'"
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_trigger_column_log'),
+            'new-a:old-a'
+        );
+    });
+
+    it('preserves a demo trigger whose quoted references match the renamed column', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE demo_matching_trigger_source (a TEXT, b TEXT); " +
+            "INSERT INTO demo_matching_trigger_source VALUES ('old-a', 'old-b'); " +
+            'CREATE TABLE demo_matching_trigger_log (value TEXT); ' +
+            'CREATE VIEW demo_matching_trigger_view AS SELECT a FROM demo_matching_trigger_source; ' +
+            'CREATE TRIGGER demo_matching_trigger_update ' +
+            'INSTEAD OF UPDATE OF b ON demo_matching_trigger_view ' +
+            'BEGIN INSERT INTO demo_matching_trigger_log VALUES (' +
+            "NEW.[b] || ':' || OLD.\"b\" || ':NEW.a' /* OLD.a */); END"
+        );
+
+        await worker.invoke(
+            'editView',
+            'demo_matching_trigger_view',
+            'SELECT b FROM demo_matching_trigger_source',
+            true
+        );
+        await worker.invoke(
+            'runQuery',
+            "UPDATE demo_matching_trigger_view SET b = 'new-b'"
+        );
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_matching_trigger_log'),
+            'new-b:old-b:NEW.a'
+        );
+    });
+
+    it('preserves a TEMP trigger when editing a main-schema view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_temp_trigger_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'CREATE TABLE demo_temp_trigger_log (value INTEGER)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_temp_trigger_view AS SELECT value FROM demo_temp_trigger_rows'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_temp_trigger_insert ' +
+            'INSTEAD OF INSERT ON DEMO_TEMP_TRIGGER_VIEW ' +
+            'BEGIN INSERT INTO demo_temp_trigger_log VALUES (NEW.value); END'
+        );
+
+        const before = await worker.invoke('getViewDefinition', 'demo_temp_trigger_view');
+        assert.strictEqual(before.triggers.length, 1);
+        assert.strictEqual(before.triggers[0].temporary, true);
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_temp_trigger_view',
+            'SELECT value * 2 AS value FROM demo_temp_trigger_rows',
+            true
+        );
+        assert.strictEqual(edit.after.triggers[0].temporary, true);
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_temp_schema " +
+            "WHERE type = 'trigger' AND name = 'demo_temp_trigger_insert'"
+        ), 1);
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_schema " +
+            "WHERE type = 'trigger' AND name = 'demo_temp_trigger_insert'"
+        ), 0);
+
+        await worker.invoke('runQuery', 'INSERT INTO demo_temp_trigger_view VALUES (17)');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_temp_trigger_log'),
+            17
+        );
+    });
+
+    it('rejects a shadowed unqualified demo TEMP trigger before editing the main view', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_shadow_trigger_main_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_shadow_trigger_main_rows VALUES (3)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_shadow_trigger_view AS ' +
+            'SELECT value FROM demo_shadow_trigger_main_rows'
+        );
+        await worker.invoke('runQuery', 'CREATE TEMP TABLE demo_shadow_trigger_temp_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_shadow_trigger_temp_rows VALUES (7)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_shadow_trigger_view AS ' +
+            'SELECT value FROM demo_shadow_trigger_temp_rows'
+        );
+        await worker.invoke('runQuery', 'CREATE TEMP TABLE demo_shadow_trigger_log (value INTEGER)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_shadow_trigger_insert ' +
+            'INSTEAD OF INSERT ON demo_shadow_trigger_view ' +
+            'BEGIN INSERT INTO demo_shadow_trigger_log VALUES (NEW.value); END'
+        );
+
+        const browsed = await worker.invoke('getViewDefinition', 'demo_shadow_trigger_view');
+        assert.deepStrictEqual(Array.from(browsed.triggers), []);
+        assert.deepStrictEqual(
+            Array.from(browsed.ambiguousTemporaryTriggerNames),
+            ['demo_shadow_trigger_insert']
+        );
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_shadow_trigger_view',
+                'SELECT value * 2 AS value FROM demo_shadow_trigger_main_rows',
+                true
+            ),
+            /demo_shadow_trigger_insert.*TEMP trigger.*schema-qualified target/is
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_shadow_trigger_view'),
+            3
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_shadow_trigger_view'),
+            7
+        );
+        await worker.invoke('runQuery', 'INSERT INTO demo_shadow_trigger_view VALUES (11)');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_shadow_trigger_log'),
+            11
+        );
+    });
+
+    it('proves and preserves a demo main-bound unqualified TEMP trigger through a later shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_ambiguous_main_rows (value INTEGER); ' +
+            'INSERT INTO demo_ambiguous_main_rows VALUES (3); ' +
+            'CREATE TABLE demo_ambiguous_main_log (value INTEGER); ' +
+            'CREATE VIEW demo_ambiguous_trigger_view AS ' +
+            'SELECT value FROM demo_ambiguous_main_rows; ' +
+            'CREATE TEMP TRIGGER demo_ambiguous_main_insert ' +
+            'INSTEAD OF INSERT ON demo_ambiguous_trigger_view ' +
+            'BEGIN INSERT INTO demo_ambiguous_main_log VALUES (NEW.value); END; ' +
+            'CREATE TEMP TABLE demo_ambiguous_temp_rows (value INTEGER); ' +
+            'INSERT INTO demo_ambiguous_temp_rows VALUES (7); ' +
+            'CREATE TEMP VIEW demo_ambiguous_trigger_view AS ' +
+            'SELECT value FROM demo_ambiguous_temp_rows'
+        );
+
+        const browsed = await worker.invoke(
+            'getViewDefinition',
+            'demo_ambiguous_trigger_view'
+        );
+        assert.strictEqual(browsed.selectSql, 'SELECT value FROM demo_ambiguous_main_rows');
+        assert.deepStrictEqual(
+            Array.from(browsed.triggers).map((trigger: any) => trigger.identifier),
+            ['demo_ambiguous_main_insert']
+        );
+        assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_ambiguous_trigger_view',
+            'SELECT value * 2 AS value FROM demo_ambiguous_main_rows',
+            true
+        );
+        assert.deepStrictEqual(
+            Array.from(edit.after.triggers).map((trigger: any) => trigger.identifier),
+            ['demo_ambiguous_main_insert']
+        );
+
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM main.demo_ambiguous_trigger_view'),
+            6
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_ambiguous_trigger_view'),
+            7
+        );
+        assert.strictEqual(await workerScalar(
+            worker,
+            "SELECT count(*) FROM sqlite_temp_schema " +
+            "WHERE type = 'trigger' AND name = 'demo_ambiguous_main_insert'"
+        ), 1);
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO main.demo_ambiguous_trigger_view VALUES (19)'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_ambiguous_main_log'),
+            19
+        );
+    });
+
+    it('keeps demo non-ASCII-distinct persistent and TEMP trigger names separate', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_unicode_trigger_rows (value INTEGER); ' +
+            'CREATE TABLE demo_unicode_trigger_log (source TEXT, value INTEGER); ' +
+            'CREATE VIEW demo_unicode_trigger_view AS ' +
+            'SELECT value FROM demo_unicode_trigger_rows; ' +
+            'CREATE TRIGGER "Ä" INSTEAD OF INSERT ON demo_unicode_trigger_view ' +
+            "BEGIN INSERT INTO demo_unicode_trigger_log VALUES ('main', NEW.value); END; " +
+            'CREATE TEMP TRIGGER "ä" INSTEAD OF INSERT ON demo_unicode_trigger_view ' +
+            "BEGIN INSERT INTO demo_unicode_trigger_log VALUES ('temp', NEW.value); END"
+        );
+
+        const browsed = await worker.invoke('getViewDefinition', 'demo_unicode_trigger_view');
+        assert.deepStrictEqual(
+            Array.from(browsed.triggers, (trigger: any) => [
+                trigger.identifier,
+                trigger.temporary === true
+            ]),
+            [['Ä', false], ['ä', true]]
+        );
+        assert.strictEqual(browsed.ambiguousTemporaryTriggerNames, undefined);
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_unicode_trigger_view',
+            'SELECT value * 2 AS value FROM demo_unicode_trigger_rows',
+            true
+        );
+        assert.deepStrictEqual(
+            Array.from(edit.after.triggers, (trigger: any) => [
+                trigger.identifier,
+                trigger.temporary === true
+            ]),
+            [['Ä', false], ['ä', true]]
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO main.demo_unicode_trigger_view VALUES (13)'
+        );
+        const logged = await worker.invoke(
+            'runQuery',
+            'SELECT source, value FROM demo_unicode_trigger_log ORDER BY source'
+        );
+        assert.deepStrictEqual(
+            Array.from(logged[0].rows, (row: unknown[]) => Array.from(row)),
+            [['main', 13], ['temp', 13]]
+        );
+    });
+
+    it('refuses to rebind a demo TEMP trigger historically attached elsewhere', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "ATTACH DATABASE ':memory:' AS demo_aux_history; " +
+            'CREATE TABLE demo_aux_history.demo_historical_rows (value INTEGER); ' +
+            'CREATE VIEW demo_aux_history.demo_historical_view AS ' +
+            'SELECT value FROM demo_historical_rows; ' +
+            'CREATE TEMP TABLE demo_historical_log (value INTEGER); ' +
+            'CREATE TEMP TRIGGER demo_historical_aux_insert ' +
+            'INSTEAD OF INSERT ON demo_historical_view ' +
+            'BEGIN INSERT INTO demo_historical_log VALUES (NEW.value); END; ' +
+            'CREATE TABLE demo_historical_main_rows (value INTEGER); ' +
+            'CREATE VIEW demo_historical_view AS ' +
+            'SELECT value FROM demo_historical_main_rows'
+        );
+
+        const browsed = await worker.invoke('getViewDefinition', 'demo_historical_view');
+        assert.deepStrictEqual(Array.from(browsed.triggers), []);
+        assert.deepStrictEqual(
+            Array.from(browsed.ambiguousTemporaryTriggerNames),
+            ['demo_historical_aux_insert']
+        );
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_historical_view',
+                'SELECT value * 2 AS value FROM demo_historical_main_rows',
+                true
+            ),
+            /demo_historical_aux_insert.*TEMP trigger.*schema-qualified target/is
+        );
+        await assert.rejects(
+            worker.invoke('runQuery', 'INSERT INTO main.demo_historical_view VALUES (23)'),
+            /cannot modify.*view/i
+        );
+        await worker.invoke(
+            'runQuery',
+            'INSERT INTO demo_aux_history.demo_historical_view VALUES (29)'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM demo_historical_log'),
+            29
+        );
+    });
+
+    it('preserves a quoted-main TEMP trigger through a same-named TEMP view shadow', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE demo_qualified_main_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_qualified_main_rows VALUES (3)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_qualified_trigger_view AS SELECT value FROM demo_qualified_main_rows'
+        );
+        await worker.invoke('runQuery', 'CREATE TEMP TABLE demo_qualified_temp_rows (value INTEGER)');
+        await worker.invoke('runQuery', 'INSERT INTO demo_qualified_temp_rows VALUES (7)');
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP VIEW demo_qualified_trigger_view AS ' +
+            'SELECT value FROM demo_qualified_temp_rows'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TABLE demo_qualified_trigger_log (target TEXT, value INTEGER)'
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_qualified_main_insert ' +
+            'INSTEAD OF INSERT ON "main"."demo_qualified_trigger_view" ' +
+            "BEGIN INSERT INTO demo_qualified_trigger_log VALUES ('main', NEW.value); END"
+        );
+        await worker.invoke(
+            'runQuery',
+            'CREATE TEMP TRIGGER demo_qualified_temp_insert ' +
+            'INSTEAD OF INSERT ON temp.demo_qualified_trigger_view ' +
+            "BEGIN INSERT INTO demo_qualified_trigger_log VALUES ('temp', NEW.value); END"
+        );
+
+        const edit = await worker.invoke(
+            'editView',
+            'demo_qualified_trigger_view',
+            'SELECT value * 2 AS value FROM demo_qualified_main_rows',
+            true
+        );
+
+        assert.deepStrictEqual(
+            Array.from(edit.before.triggers, (trigger: any) => trigger.identifier),
+            ['demo_qualified_main_insert']
+        );
+        assert.deepStrictEqual(
+            Array.from(edit.after.triggers, (trigger: any) => trigger.identifier),
+            ['demo_qualified_main_insert']
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT value FROM temp.demo_qualified_trigger_view'),
+            7
+        );
+        await worker.invoke('runQuery', 'INSERT INTO main.demo_qualified_trigger_view VALUES (13)');
+        await worker.invoke('runQuery', 'INSERT INTO temp.demo_qualified_trigger_view VALUES (17)');
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT value FROM demo_qualified_trigger_log WHERE target = 'main'"
+            ),
+            13
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                "SELECT value FROM demo_qualified_trigger_log WHERE target = 'temp'"
+            ),
+            17
+        );
+    });
+
+    it('runs each console statement in order, producing a result set only for SELECT-shaped ones', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS value; CREATE TABLE console_multi (id INTEGER); SELECT 2 AS value;'
+        );
+
+        assert.strictEqual(result.results.length, 2);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+        assert.strictEqual(result.results[0].truncated, false);
+        assert.deepStrictEqual(Array.from(result.results[1].headers), ['value']);
+        assert.deepStrictEqual(
+            Array.from(result.results[1].rows, (row: unknown[]) => Array.from(row)),
+            [[2]]
+        );
+        assert.strictEqual(result.results[1].truncated, false);
+        assert.strictEqual(typeof result.durationMs, 'number');
+        assert.ok(result.durationMs >= 0);
+    });
+
+    it('caps collected console rows without cutting the script short', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_cap (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 10' +
+            ') INSERT INTO console_cap SELECT value FROM ids'
+        );
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT id FROM console_cap ORDER BY id; UPDATE console_cap SET id = id + 1000;',
+            { maxRows: 3 }
+        );
+
+        assert.strictEqual(result.results.length, 1);
+        assert.strictEqual(result.results[0].rows.length, 3);
+        assert.strictEqual(result.results[0].truncated, true);
+        // The UPDATE runs after the capped SELECT and still reports its full
+        // effect: capping collection must not stop the iterator from
+        // reaching, or finishing, later statements.
+        assert.strictEqual(result.changes, 10);
+        const updated = await worker.invoke(
+            'runQuery',
+            'SELECT count(*) FROM console_cap WHERE id >= 1000'
+        );
+        assert.deepStrictEqual(updated[0].rows, [[10]]);
+    });
+
+    it('keeps stepping a capped console statement to completion so every row is still affected', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_cap_returning (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 10' +
+            ') INSERT INTO console_cap_returning SELECT value FROM ids'
+        );
+
+        const result = await worker.invoke(
+            'runConsole',
+            'UPDATE console_cap_returning SET id = id + 100 RETURNING id;',
+            { maxRows: 3 }
+        );
+
+        assert.strictEqual(result.results[0].rows.length, 3);
+        assert.strictEqual(result.results[0].truncated, true);
+        assert.strictEqual(result.changes, 10);
+        const remaining = await worker.invoke(
+            'runQuery',
+            'SELECT count(*) FROM console_cap_returning WHERE id >= 101'
+        );
+        assert.deepStrictEqual(remaining[0].rows, [[10]]);
+    });
+
+    it('detects console mutation from total_changes and schema_version rather than result shape', async () => {
+        const worker = await createWorkerHarness();
+
+        const ddlOnly = await worker.invoke(
+            'runConsole',
+            'CREATE TABLE console_mutation (id INTEGER)'
+        );
+        assert.strictEqual(ddlOnly.mutated, true);
+        assert.strictEqual(ddlOnly.changes, 0);
+
+        const inserted = await worker.invoke('runConsole', 'INSERT INTO console_mutation VALUES (1)');
+        assert.strictEqual(inserted.mutated, true);
+        assert.strictEqual(inserted.changes, 1);
+
+        const selected = await worker.invoke('runConsole', 'SELECT * FROM console_mutation');
+        assert.strictEqual(selected.mutated, false);
+        assert.strictEqual(selected.changes, 0);
+    });
+
+    it('RESOLVES a mid-script console failure with its mutation metadata so half-applied writes stay tracked', async () => {
+        // The whole point: the INSERT really happened. Rejecting would strand
+        // it — the desktop host reads `mutated` off the RESOLVED value to
+        // record an undo barrier, mark the file dirty and honour instantCommit,
+        // and a rejection never reaches that code at all.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runConsole', 'CREATE TABLE console_error (id INTEGER)');
+
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO console_error VALUES (1); SELECT * FROM console_error_missing;'
+        );
+
+        assert.match(result.error, /^statement 2: /);
+        assert.strictEqual(result.multiStatement, true);
+        assert.strictEqual(result.mutated, true);
+        assert.strictEqual(result.changes, 1);
+        assert.deepStrictEqual(Array.from(result.results), []);
+        assert.strictEqual(typeof result.durationMs, 'number');
+
+        const rows = await worker.invoke('runQuery', 'SELECT id FROM console_error');
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+    });
+
+    it('reports a failed read-only script as unmutated so it never dirties the file', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke('runConsole', 'SELECT * FROM console_nothing_here;');
+
+        assert.match(result.error, /^statement 1: /);
+        // Single statement: nothing preceded the failure, so the renderer must
+        // not claim earlier statements were applied.
+        assert.strictEqual(result.multiStatement, false);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
+    });
+
+    it('finalizes a statement that throws mid-step without corrupting later use of the database', async () => {
+        // Unlike "no such table" (a prepare-time failure), a UNIQUE violation is
+        // only detected once sqlite3_step() actually attempts the write. That
+        // makes this the one path where iterateStatements()'s own lazy free
+        // (deferred until the *next* next() call) never fires, since the script
+        // is abandoned on the throw -- so this is what actually exercises the
+        // manual statement.free() in runConsole's finally block.
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_step_throw (id INTEGER UNIQUE); ' +
+            'INSERT INTO console_step_throw VALUES (1)'
+        );
+
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO console_step_throw VALUES (2); ' +
+            'INSERT INTO console_step_throw VALUES (1); ' +
+            'INSERT INTO console_step_throw VALUES (3);'
+        );
+        assert.match(result.error, /^statement 2: /);
+        assert.match(result.error, /UNIQUE constraint failed/);
+        assert.strictEqual(result.mutated, true);
+        assert.strictEqual(result.changes, 1);
+
+        // Statement 1 committed; statement 3 never ran. The real point of this
+        // assertion is that the connection is still fully usable afterwards --
+        // proof the throwing statement was finalized cleanly rather than
+        // leaked or left in a state that wedges the shared db handle.
+        const rows = await worker.invoke('runQuery', 'SELECT id FROM console_step_throw ORDER BY id');
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1], [2]]
+        );
+        const after = await worker.invoke('runConsole', 'SELECT count(*) AS n FROM console_step_throw');
+        assert.deepStrictEqual(Array.from(after.results[0].rows[0]), [2]);
+    });
+
+    it('treats empty console statements and trailing comments as producing no extra result sets', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke('runConsole', 'SELECT 1; ; -- x');
+
+        assert.strictEqual(result.results.length, 1);
+        assert.deepStrictEqual(
+            Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1]]
+        );
+    });
+
+    it('never drops the tail statement across mid-script empty-statement and comment variants', async () => {
+        // Regression coverage for the fail-loud drift guard added after runConsole:
+        // sqlite3_prepare_v2 (via iterateStatements) consumes leading empty
+        // statements/whitespace/comments on its own, so none of these should ever
+        // throw the "unexecuted SQL remained" insurance error -- both statements
+        // must always come through.
+        const worker = await createWorkerHarness();
+        const scripts = [
+            // The four binding probe scripts, verbatim.
+            'SELECT 1;; SELECT 2;',
+            'SELECT 1; ; SELECT 2;',
+            'SELECT 1; -- c\nSELECT 2;',
+            'SELECT 1;\n;\n-- x\nSELECT 2;',
+            // Supplementary variants beyond the binding list.
+            'SELECT 1; -- comment\nSELECT 2;',
+            'SELECT 1;; ; -- comment\n; SELECT 2;'
+        ];
+
+        for (const sql of scripts) {
+            const result = await worker.invoke('runConsole', sql);
+            assert.strictEqual(result.results.length, 2, `expected 2 result sets for: ${sql}`);
+            assert.deepStrictEqual(
+                Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+                [[1]],
+                `first result set for: ${sql}`
+            );
+            assert.deepStrictEqual(
+                Array.from(result.results[1].rows, (row: unknown[]) => Array.from(row)),
+                [[2]],
+                `second result set for: ${sql}`
+            );
+        }
+    });
+
+    it('clamps console maxRows into [1, 50000]', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_clamp_low (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 3' +
+            ') INSERT INTO console_clamp_low SELECT value FROM ids'
+        );
+        const low = await worker.invoke(
+            'runConsole',
+            'SELECT id FROM console_clamp_low ORDER BY id',
+            { maxRows: 0 }
+        );
+        assert.strictEqual(low.results[0].rows.length, 1);
+        assert.strictEqual(low.results[0].truncated, true);
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE console_clamp_high (id INTEGER); ' +
+            'WITH RECURSIVE ids(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM ids WHERE value < 50010' +
+            ') INSERT INTO console_clamp_high SELECT value FROM ids'
+        );
+        const high = await worker.invoke(
+            'runConsole',
+            'SELECT id FROM console_clamp_high ORDER BY id',
+            { maxRows: 999999 }
+        );
+        assert.strictEqual(high.results[0].rows.length, 50000);
+        assert.strictEqual(high.results[0].truncated, true);
+    });
+
+    it('keeps runQuery refusing every statement on a read-only database, reads included', async () => {
+        // runQuery hands its whole text to db.exec, which compiles every
+        // statement in it, so no text-level read check can admit it there; the
+        // console's reads on such a database are covered below.
+        const worker = await createWorkerHarness({ readOnlyMode: true });
+        await assert.rejects(
+            worker.invoke('runQuery', 'SELECT 1'),
+            /Ad hoc SQL execution is unavailable because the database is read-only/
+        );
+        // The schema probe of the desktop host's FTS3/FTS4 engine switch goes
+        // through the read workspace instead (desktop-host.js SCHEMA_PROBE_SQL).
+        assert.strictEqual(
+            (await worker.invoke('executeReadQuery', 'SELECT count(*) FROM main.sqlite_schema', '[]')).rows[0][0], 0
+        );
+    });
+
+    it('interrupts a long-running console script at the configured deadline', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 20 });
+
+        // Timeout is an error raised after execution began, so it takes the
+        // same resolve-with-metadata path as a statement error.
+        const result = await worker.invoke(
+            'runConsole',
+            'WITH RECURSIVE counter(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+            ') SELECT sum(value) FROM counter'
+        );
+        assert.match(result.error, /^statement 1: Query execution timed out after 20ms/);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
+    });
+
+    it('reports mutations made before a timeout cut the script short', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 60 });
+        await worker.invoke('runConsole', 'CREATE TABLE console_timeout_writes (id INTEGER)');
+
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO console_timeout_writes VALUES (1); ' +
+            'WITH RECURSIVE counter(value) AS (' +
+            'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+            ') SELECT sum(value) FROM counter'
+        );
+
+        assert.match(result.error, /^statement 2: Query execution timed out/);
+        // The interrupted script still wrote a row; losing that would leave an
+        // untracked mutation on disk.
+        assert.strictEqual(result.mutated, true);
+        assert.strictEqual(result.changes, 1);
+        const rows = await worker.invoke('runQuery', 'SELECT count(*) FROM console_timeout_writes');
+        assert.deepStrictEqual(rows[0].rows, [[1]]);
+    });
+
+    it('preempts a running console script through a shared cancellation flag', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 200 });
+        const cancellationFlag = new Int32Array(
+            new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)
+        );
+        const flagSetter = new NodeWorker(
+            `const { parentPort, workerData } = require('node:worker_threads');
+             setTimeout(() => {
+               Atomics.store(workerData, 0, 1);
+               parentPort.postMessage('cancelled');
+             }, 20);`,
+            { eval: true, workerData: cancellationFlag }
+        );
+
+        try {
+            const result = await worker.invoke(
+                'runConsole',
+                'WITH RECURSIVE counter(value) AS (' +
+                'VALUES(1) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000' +
+                ') SELECT sum(value) FROM counter',
+                {},
+                cancellationFlag
+            );
+            assert.match(result.error, /^statement 1: Query execution cancelled/);
+            assert.strictEqual(result.mutated, false);
+        } finally {
+            await flagSetter.terminate();
+        }
+    });
+
+    it('runs only the first statement under maxStatements and reports the rest as skipped', async () => {
+        // The cap the console's EXPLAIN button used to ride (a prefixed
+        // `EXPLAIN QUERY PLAN` only ever covers statement 1, so without a cap
+        // the tail would execute for real). EXPLAIN now has its own
+        // single-statement path; the cap remains a supported option.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runConsole', 'CREATE TABLE console_cap_stmt (id INTEGER)');
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS plan; INSERT INTO console_cap_stmt VALUES (99);',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.results.length, 1);
+        assert.deepStrictEqual(Array.from(result.results[0].rows[0]), [1]);
+        assert.strictEqual(result.statementsSkipped, true);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
+        assert.strictEqual(result.error, undefined);
+
+        // The INSERT must not have run.
+        const rows = await worker.invoke('runQuery', 'SELECT count(*) FROM console_cap_stmt');
+        assert.deepStrictEqual(rows[0].rows, [[0]]);
+
+        // Still usable afterwards: the abandoned tail is drained, not leaked.
+        const after = await worker.invoke('runConsole', 'SELECT 2 AS ok');
+        assert.deepStrictEqual(Array.from(after.results[0].rows[0]), [2]);
+        assert.strictEqual(after.statementsSkipped, false);
+    });
+
+    it('never lets a capped tail PRAGMA take effect, since pragmas apply at prepare time', async () => {
+        // Draining the tail compiles it, and SOME pragmas act during
+        // compilation -- so a plain drain would run `PRAGMA query_only=ON`
+        // behind an EXPLAIN and silently write-lock the connection while the
+        // status line honestly reported the tail as not executed. The tail is
+        // left undrained (one leaked buffer) whenever it mentions a pragma.
+        const worker = await createWorkerHarness();
+        const before = await worker.invoke('runConsole', 'PRAGMA foreign_keys');
+        const beforeValue = before.results[0].rows[0][0];
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS plan; PRAGMA foreign_keys=ON;',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.results.length, 1);
+        // Conservative rather than counted: the tail was never walked, but it
+        // did hold a statement that was skipped.
+        assert.strictEqual(result.statementsSkipped, true);
+
+        const after = await worker.invoke('runConsole', 'PRAGMA foreign_keys');
+        assert.strictEqual(
+            after.results[0].rows[0][0],
+            beforeValue,
+            'a capped tail pragma changed the connection state'
+        );
+
+        // The connection is still fully usable after the undrained tail.
+        const usable = await worker.invoke('runConsole', 'SELECT 7 AS ok');
+        assert.deepStrictEqual(Array.from(usable.results[0].rows[0]), [7]);
+    });
+
+    it('does not report skipped statements when the capped tail is only comments or whitespace', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT 1 AS plan; -- nothing executable here\n  ',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.results.length, 1);
+        assert.strictEqual(result.statementsSkipped, false);
+    });
+
+    it('shows a capped run its first result even when a later statement would fail to compile', async () => {
+        // The drain that frees the iterator must swallow prepare errors from
+        // statements it deliberately did not run, or a capped run would report
+        // a failure instead of the result the user asked for.
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke(
+            'runConsole',
+            'EXPLAIN QUERY PLAN SELECT 1; SELECT * FROM console_no_such_table_at_all;',
+            { maxStatements: 1 }
+        );
+
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.results.length, 1);
+        assert.strictEqual(result.statementsSkipped, true);
+    });
+
+    it('runs the whole script when maxStatements is absent or non-numeric', async () => {
+        const worker = await createWorkerHarness();
+
+        for (const options of [{}, { maxStatements: undefined }, { maxStatements: 'lots' }]) {
+            const result = await worker.invoke(
+                'runConsole',
+                'SELECT 1 AS a; SELECT 2 AS b; SELECT 3 AS c;',
+                options
+            );
+            assert.strictEqual(result.results.length, 3, `all sets for ${JSON.stringify(options)}`);
+            assert.strictEqual(result.statementsSkipped, false);
+        }
+    });
+});
+
+/**
+ * Regressions for engine findings from a review. Every one of them was a SILENTLY WRONG answer -- a result set that
+ * vanished, an edit that reported success without changing a row, text that
+ * lost everything past a NUL -- so each test asserts the observable database
+ * state, not just the returned message.
+ */
+describe('web demo worker engine defects', () => {
+    it('returns the rows of a statement with no trailing semicolon (E-1)', async () => {
+        // sql.js frees the iterator's heap copy of the script inside the next()
+        // that reports `done`; the old leftover-SQL guard then read that freed
+        // pointer and threw away an already-collected result set. Which garbage
+        // byte lands there is heap-layout dependent, so each statement runs on a
+        // FRESH worker -- the shape found to fail deterministically.
+        const statements: [string, unknown[][]][] = [
+            ['SELECT 1', [[1]]],
+            ['SELECT 2 AS two', [[2]]],
+            ["SELECT 'x' AS s", [['x']]],
+            ['SELECT 1 -- trailing comment', [[1]]],
+            ['SELECT 1 /* trailing block */', [[1]]]
+        ];
+        for (const [sql, expected] of statements) {
+            const worker = await createWorkerHarness();
+            const result = await worker.invoke('runConsole', sql);
+            assert.strictEqual(result.error, undefined, `unexpected error for: ${sql}`);
+            assert.strictEqual(result.results.length, 1, `one result set for: ${sql}`);
+            assert.deepStrictEqual(
+                Array.from(result.results[0].rows, (row: unknown[]) => Array.from(row)),
+                expected,
+                `rows for: ${sql}`
+            );
+        }
+    });
+
+    it('keeps a trailing comment from tripping the leftover-SQL guard (E-1)', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('runConsole', 'SELECT 1 AS a; -- note');
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.results.length, 1);
+    });
+
+    it('refuses console SQL containing a NUL instead of running the prefix (E-23)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runConsole', 'CREATE TABLE console_nul_guard (id INTEGER)');
+        await assert.rejects(
+            worker.invoke(
+                'runConsole',
+                'INSERT INTO console_nul_guard VALUES (1)\0; SELECT 1'
+            ),
+            (error: Error) => {
+                assert.match(error.message, /NUL/);
+                return true;
+            }
+        );
+        // Pre-execution guard: nothing ran, so nothing was applied.
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM console_nul_guard'),
+            0
+        );
+    });
+
+    it('returns the rows of a value-returning PRAGMA through the console (E-2)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE console_pragma (id INTEGER, note TEXT)');
+
+        const info = await worker.invoke('runConsole', 'PRAGMA table_info(console_pragma)');
+        assert.strictEqual(info.error, undefined);
+        assert.strictEqual(info.results.length, 1);
+        assert.deepStrictEqual(
+            Array.from(info.results[0].rows, (row: unknown[]) => row[1]),
+            ['id', 'note']
+        );
+
+        const journal = await worker.invoke('runConsole', 'PRAGMA journal_mode');
+        assert.strictEqual(journal.results.length, 1);
+        assert.strictEqual(journal.results[0].rows.length, 1);
+    });
+
+    it('refuses a single-cell update whose row no longer exists (E-3)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE ghost_edit (id INTEGER PRIMARY KEY, msg TEXT); " +
+            "INSERT INTO ghost_edit VALUES (1, 'here')"
+        );
+
+        // updateCellBatch has always refused this; updateCell reported success
+        // and changed nothing, and the grid's single-cell edit path is the one
+        // that calls updateCell.
+        await assert.rejects(
+            worker.invoke('updateCell', 'ghost_edit', 999999, 'msg', 'ghost'),
+            (error: Error) => {
+                assert.match(error.message, /row 999999 no longer exists/);
+                return true;
+            }
+        );
+        await assert.rejects(
+            worker.invoke(
+                'updateCellBatch',
+                'ghost_edit',
+                [{ rowId: 999999, column: 'msg', value: 'ghost' }]
+            ),
+            (error: Error) => {
+                assert.match(error.message, /row 999999 no longer exists/);
+                return true;
+            }
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM ghost_edit'), 1);
+
+        // ... and the row that DOES exist still updates, with and without the
+        // oversized-cell policy argument.
+        assert.strictEqual(
+            await worker.invoke('updateCell', 'ghost_edit', 1, 'msg', 'plain'),
+            1
+        );
+        assert.strictEqual(
+            await worker.invoke(
+                'updateCell', 'ghost_edit', 1, 'msg', 'policed', undefined, 4096
+            ),
+            1
+        );
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT msg FROM ghost_edit WHERE id = 1'),
+            'policed'
+        );
+    });
+
+    it('stores TEXT containing a NUL byte without truncating it (E-5)', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE nul_text (id INTEGER PRIMARY KEY, name TEXT); " +
+            "INSERT INTO nul_text VALUES (1, 'seed')"
+        );
+
+        await worker.invoke('updateCell', 'nul_text', 1, 'name', 'a\0b');
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT hex(CAST(name AS BLOB)) FROM nul_text WHERE id = 1'
+            ),
+            '610062'
+        );
+        assert.strictEqual(
+            await workerScalar(worker, "SELECT typeof(name) FROM nul_text WHERE id = 1"),
+            'text'
+        );
+
+        const insertedId = await worker.invoke('insertRow', 'nul_text', { name: 'x\0y' });
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                `SELECT hex(CAST(name AS BLOB)) FROM nul_text WHERE rowid = ${Number(insertedId)}`
+            ),
+            '780079'
+        );
+
+        await worker.invoke(
+            'updateCellBatch',
+            'nul_text',
+            [{ rowId: 1, column: 'name', value: 'p\0q\0r' }]
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT hex(CAST(name AS BLOB)) FROM nul_text WHERE id = 1'
+            ),
+            '7000710072'
+        );
+    });
+
+    it('enforces foreign keys on both engines instead of orphaning children (E-15)', async () => {
+        const worker = await createWorkerHarness();
+        assert.strictEqual((await worker.invoke('getPragmas')).foreign_keys, 1);
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE fk_parent (id INTEGER PRIMARY KEY); ' +
+            'CREATE TABLE fk_child (id INTEGER PRIMARY KEY, ' +
+            'parent_id INTEGER REFERENCES fk_parent(id)); ' +
+            'INSERT INTO fk_parent VALUES (1); INSERT INTO fk_child VALUES (1, 1)'
+        );
+
+        await assert.rejects(
+            worker.invoke('deleteRows', 'fk_parent', [1]),
+            (error: Error) => {
+                assert.match(error.message, /FOREIGN KEY constraint failed/i);
+                return true;
+            }
+        );
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM fk_parent'), 1);
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT count(*) FROM fk_child WHERE parent_id = 1'),
+            1
+        );
+
+        // Still user-controllable: the permissive behaviour is one pragma away.
+        await worker.invoke('setPragma', 'foreign_keys', false);
+        assert.strictEqual((await worker.invoke('getPragmas')).foreign_keys, 0);
+    });
+
+    it('reports a database it cannot write as read-only at open (E-11)', async () => {
+        const withProbeFailure = (failure: Error) => async (config: any) => {
+            const sqlJs = await initSqlJs(config);
+            const ProbedDatabase = new Proxy(sqlJs.Database, {
+                construct(Target: any, args: any[]): object {
+                    const database = Reflect.construct(Target, args) as Record<string, any>;
+                    const originalRun = database.run.bind(database);
+                    database.run = (sql: string, ...rest: unknown[]) => {
+                        // The open-time write probe's one real write.
+                        if (typeof sql === 'string' && sql.startsWith('PRAGMA user_version =')) {
+                            throw failure;
+                        }
+                        return originalRun(sql, ...rest);
+                    };
+                    return database;
+                }
+            });
+            return { ...sqlJs, Database: ProbedDatabase };
+        };
+
+        const readOnly = await createWorkerHarness({
+            initSqlJs: withProbeFailure(Object.assign(
+                new Error('attempt to write a readonly database'),
+                { errno: 8 }
+            ))
+        });
+        const readOnlyOpen = await readOnly.invoke('initializeDatabase', 'ro.db', {});
+        assert.strictEqual(readOnlyOpen.isReadOnly, true);
+        assert.match(String(readOnlyOpen.readOnlyReason), /read-only/);
+        await assert.rejects(
+            readOnly.invoke('runQuery', 'CREATE TABLE nope (id INTEGER)'),
+            /read-only/
+        );
+
+        // A BUSY database is INCONCLUSIVE, not read-only: reporting it as
+        // read-only would strand an editable file for the whole session.
+        const busy = await createWorkerHarness({
+            initSqlJs: withProbeFailure(Object.assign(
+                new Error('database is locked'),
+                { errno: 5 }
+            ))
+        });
+        const busyOpen = await busy.invoke('initializeDatabase', 'busy.db', {});
+        assert.strictEqual(busyOpen.isReadOnly, false);
+        assert.strictEqual(busyOpen.readOnlyReason, undefined);
+
+        // And an ordinary open is unaffected.
+        const writable = await createWorkerHarness();
+        const writableOpen = await writable.invoke('initializeDatabase', 'rw.db', {});
+        assert.strictEqual(writableOpen.isReadOnly, false);
+    });
+    // -----------------------------------------------------------------------
+    // Undo of an FTS5 delete, and the column-drop dependency surface.
+    // -----------------------------------------------------------------------
+
+    it('restores a deleted FTS5 row, full-text index included', async () => {
+        // The delete snapshot took every column pragma_table_xinfo reported
+        // except generated ones, which for an FTS5 table includes its two
+        // HIDDEN columns — `<table>` (a command channel: writing to it means
+        // "rebuild"/"optimize", not a value) and `rank`. The replay insert
+        // therefore built `INSERT INTO docs (title, body, docs, rank)`, which
+        // SQLite refuses with "SQL logic error", and the row stayed deleted with
+        // no way back.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE VIRTUAL TABLE docs USING fts5(title, body)');
+        await worker.invoke(
+            'runQuery',
+            "INSERT INTO docs VALUES ('a','alpha'),('b','beta'),('c','gamma')"
+        );
+
+        const deleted = await worker.invoke('deleteRows', 'docs', [2]);
+        assert.deepStrictEqual(
+            Object.keys(deleted[0].row).sort(),
+            ['body', 'title'],
+            'the snapshot must not carry the virtual table’s hidden columns'
+        );
+
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete',
+            targetTable: 'docs',
+            deletedRows: deleted
+        });
+
+        const rows = await worker.invoke('runQuery', 'SELECT rowid, title, body FROM docs ORDER BY rowid');
+        assert.deepStrictEqual(
+            Array.from(rows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'a', 'alpha'], [2, 'b', 'beta'], [3, 'c', 'gamma']]
+        );
+        // Re-inserted at its original rowid AND re-indexed: a restore that the
+        // full-text index could not find would be a silent half-undo.
+        const matched = await worker.invoke('runQuery', "SELECT rowid FROM docs WHERE docs MATCH 'beta'");
+        assert.deepStrictEqual(
+            Array.from(matched[0].rows, (row: unknown[]) => Array.from(row)),
+            [[2]]
+        );
+    });
+
+    it('keeps generated and fts4 columns behaving as before', async () => {
+        const worker = await createWorkerHarness();
+        // Generated columns (hidden 2/3) were already excluded and must stay so:
+        // SQLite refuses an INSERT that names one.
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE gen (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED, '
+            + 'c INTEGER GENERATED ALWAYS AS (a + 1) VIRTUAL)'
+        );
+        await worker.invoke('runQuery', 'INSERT INTO gen (a) VALUES (5), (6)');
+        const generated = await worker.invoke('deleteRows', 'gen', [2]);
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete', targetTable: 'gen', deletedRows: generated
+        });
+        const genRows = await worker.invoke('runQuery', 'SELECT a, b, c FROM gen ORDER BY rowid');
+        assert.deepStrictEqual(
+            Array.from(genRows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[5, 10, 6], [6, 12, 7]]
+        );
+
+        // fts4 carries three hidden columns (`<table>`, `docid`, `__langid`).
+        await worker.invoke('runQuery', 'CREATE VIRTUAL TABLE notes USING fts4(a, b)');
+        await worker.invoke('runQuery', "INSERT INTO notes VALUES ('p','q'), ('r','s')");
+        const notes = await worker.invoke('deleteRows', 'notes', [2]);
+        await worker.invoke('undoModification', {
+            modificationType: 'row_delete', targetTable: 'notes', deletedRows: notes
+        });
+        const noteRows = await worker.invoke('runQuery', 'SELECT rowid, a, b FROM notes ORDER BY rowid');
+        assert.deepStrictEqual(
+            Array.from(noteRows[0].rows, (row: unknown[]) => Array.from(row)),
+            [[1, 'p', 'q'], [2, 'r', 's']]
+        );
+    });
+
+    it('names the views and triggers that block a column drop, on top of the dependent-index contract', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+        await worker.invoke('runQuery', "INSERT INTO users VALUES (1, 'n', 'e')");
+        await worker.invoke('runQuery', 'CREATE INDEX idx_users_email ON users(email)');
+        await worker.invoke('runQuery', 'CREATE VIEW active_users AS SELECT email FROM users');
+
+        // The desktop's confirmation prompt is built from findDependentIndexes,
+        // and the exact definitions go back with the drop. Structural compare:
+        // the worker runs in its own vm realm.
+        const dependencies = await worker.invoke('findDependentIndexes', 'users', ['email']);
+        assert.deepStrictEqual(
+            JSON.parse(JSON.stringify(dependencies)).map((index: { identifier: string }) => index.identifier),
+            ['idx_users_email']
+        );
+        // An index on ANOTHER column is not swept up.
+        assert.deepStrictEqual(
+            Array.from(await worker.invoke('findDependentIndexes', 'users', ['name'])),
+            []
+        );
+
+        // The confirmation argument comes from the webview, so it is validated
+        // rather than trusted: a boolean and a list of bare names are refused.
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'users', ['email'], true),
+            /Dependent-index confirmation must be an array/
+        );
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'users', ['email'], ['idx_users_email']),
+            /Dependent-index confirmation contains an invalid definition/
+        );
+
+        // Blocked by the view: SQLite decides, and the diagnostic NAMES the
+        // object so the failure is actionable on the NATIVE engine too, where
+        // the engine's own message is only "SQL logic error". sql.js happens to
+        // name the view itself, so the assertion is on the appended clause —
+        // otherwise this passes with the diagnostic removed.
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'users', ['email'], dependencies),
+            (error: Error) => {
+                assert.match(error.message, /may be blocking the drop: view active_users/);
+                assert.match(error.message, /Drop or edit them first/);
+                return true;
+            }
+        );
+        // The refusal rolled everything back — the index is still there.
+        const indexes = await worker.invoke(
+            'runQuery',
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'users'"
+        );
+        assert.deepStrictEqual(
+            Array.from(indexes[0].rows, (row: unknown[]) => row[0]),
+            ['idx_users_email']
+        );
+
+        // With the view gone, the confirmed definitions are what make the drop work.
+        await worker.invoke('runQuery', 'DROP VIEW active_users');
+        await worker.invoke('deleteColumns', 'users', ['email'], dependencies);
+        const columns = await worker.invoke('runQuery', "SELECT name FROM pragma_table_info('users')");
+        assert.deepStrictEqual(
+            Array.from(columns[0].rows, (row: unknown[]) => row[0]),
+            ['id', 'name']
+        );
+    });
+
+    it('distinguishes an ABSENT dropDependentIndexes from an explicit null', async () => {
+        // The desktop half of this is in desktop_api.test.ts. The two halves
+        // meet on the wire: the native engine carries the argument list as
+        // JSON, `JSON.stringify` turns a trailing `undefined` into `null`, and
+        // the guard below is keyed on `undefined`. That mismatch broke column
+        // drops for the COMMON case — a column no index depends on — because
+        // the caller sent `[table, columns, undefined]` meaning "absent".
+        // Neither side is wrong on its own, which is why this needs pinning on
+        // both: the guard must keep rejecting `null` (it is not a list), and
+        // omitting the argument must keep working.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, note TEXT)');
+        await worker.invoke('runQuery', "INSERT INTO people VALUES (1, 'n', 'keep me')");
+
+        await assert.rejects(
+            worker.invoke('deleteColumns', 'people', ['note'], null),
+            /Dependent-index confirmation must be an array/,
+            'null is not a list of index definitions and must stay refused'
+        );
+        // Refused, not half-applied.
+        assert.deepStrictEqual(
+            Array.from(
+                (await worker.invoke('runQuery', "SELECT name FROM pragma_table_info('people')"))[0].rows,
+                (row: unknown[]) => row[0]
+            ),
+            ['id', 'name', 'note']
+        );
+
+        // Absent: the early-out fires and the drop goes through.
+        await worker.invoke('deleteColumns', 'people', ['note']);
+        assert.deepStrictEqual(
+            Array.from(
+                (await worker.invoke('runQuery', "SELECT name FROM pragma_table_info('people')"))[0].rows,
+                (row: unknown[]) => row[0]
+            ),
+            ['id', 'name']
+        );
+    });
+
+    it('says a column drop cannot be replayed, without calling itself a demo', async () => {
+        // The desktop records DDL as a history BARRIER and never asks the worker
+        // to replay it, so reaching this is a contract breach — but the message
+        // said "Demo history replay does not support undoing column_drop" and
+        // the desktop ships this same worker.
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (a, b)');
+        for (const [method, verb] of [['undoModification', 'undone'], ['redoModification', 'redone']]) {
+            await assert.rejects(
+                worker.invoke(method, { modificationType: 'column_drop', targetTable: 't' }),
+                (error: Error) => {
+                    assert.match(error.message, new RegExp(`column_drop cannot be ${verb}`));
+                    assert.match(error.message, /history barrier/);
+                    assert.doesNotMatch(error.message, /Demo/);
+                    return true;
+                }
+            );
+        }
+    });
+
+    it('rejects demo view changes that break reverse view and trigger dependencies', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_dependency_rows (id INTEGER, label TEXT); ' +
+            "INSERT INTO demo_dependency_rows VALUES (29, 'kept'); " +
+            'CREATE VIEW demo_dependency_source AS ' +
+            'SELECT id, label FROM demo_dependency_rows; ' +
+            'CREATE VIEW demo_dependency_consumer AS ' +
+            'SELECT id FROM demo_dependency_source'
+        );
+
+        for (const operation of [
+            () => worker.invoke(
+                'validateViewDefinition',
+                'demo_dependency_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            () => worker.invoke(
+                'previewViewDefinition',
+                'demo_dependency_source',
+                'SELECT label FROM demo_dependency_rows',
+                10
+            ),
+            () => worker.invoke(
+                'editView',
+                'demo_dependency_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            () => worker.invoke('dropView', 'demo_dependency_source')
+        ]) {
+            await assert.rejects(
+                operation(),
+                /would break existing view.*demo_dependency_consumer/is
+            );
+        }
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT id FROM demo_dependency_consumer'),
+            29
+        );
+
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_reverse_trigger_source AS ' +
+            'SELECT id, label FROM demo_dependency_rows; ' +
+            'CREATE TABLE demo_reverse_trigger_events (event_id INTEGER); ' +
+            'CREATE TABLE demo_reverse_trigger_log (seen_id INTEGER); ' +
+            'CREATE TRIGGER demo_reverse_trigger_probe ' +
+            'AFTER INSERT ON demo_reverse_trigger_events BEGIN ' +
+            'INSERT INTO demo_reverse_trigger_log ' +
+            'SELECT id FROM demo_reverse_trigger_source; END'
+        );
+        await assert.rejects(
+            worker.invoke(
+                'editView',
+                'demo_reverse_trigger_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await assert.rejects(
+            worker.invoke(
+                'validateViewDefinition',
+                'demo_reverse_trigger_source',
+                'SELECT label FROM demo_dependency_rows'
+            ),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await assert.rejects(
+            worker.invoke(
+                'previewViewDefinition',
+                'demo_reverse_trigger_source',
+                'SELECT label FROM demo_dependency_rows',
+                10
+            ),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await assert.rejects(
+            worker.invoke('dropView', 'demo_reverse_trigger_source'),
+            /would break existing trigger.*demo_reverse_trigger_probe/is
+        );
+        await worker.invoke('runQuery', 'INSERT INTO demo_reverse_trigger_events VALUES (1)');
+        assert.strictEqual(
+            await workerScalar(worker, 'SELECT seen_id FROM demo_reverse_trigger_log'),
+            29
+        );
+    });
+
+    it('rejects demo column additions that activate broken UPDATE OF triggers', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_dormant_rows (id INTEGER, label TEXT); ' +
+            'CREATE VIEW demo_dormant_source AS ' +
+            'SELECT id, label FROM demo_dormant_rows; ' +
+            'CREATE TABLE demo_dormant_events (event_id INTEGER); ' +
+            'CREATE TABLE demo_dormant_log (value TEXT); ' +
+            'CREATE TRIGGER demo_dormant_update AFTER UPDATE OF activated ' +
+            'ON demo_dormant_events BEGIN ' +
+            'INSERT INTO demo_dormant_log SELECT label FROM demo_dormant_source; END'
+        );
+
+        await worker.invoke(
+            'editView',
+            'demo_dormant_source',
+            'SELECT id FROM demo_dormant_rows'
+        );
+        await assert.rejects(
+            worker.invoke('addColumn', 'demo_dormant_events', 'activated', 'INTEGER'),
+            /would break existing trigger.*demo_dormant_update/is
+        );
+        assert.deepStrictEqual(
+            Array.from(
+                await worker.invoke('getTableInfo', 'demo_dormant_events'),
+                (column: any) => column.identifier
+            ),
+            ['event_id']
+        );
+    });
+
+    it('rejects demo undo and redo that break newer dependent views', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE demo_history_dependency_rows (id INTEGER, label TEXT); ' +
+            "INSERT INTO demo_history_dependency_rows VALUES (1, 'kept')"
+        );
+
+        const undoBefore = await worker.invoke(
+            'createView',
+            'demo_history_dependency_undo',
+            'SELECT id FROM demo_history_dependency_rows'
+        );
+        const undoEdit = await worker.invoke(
+            'editView',
+            'demo_history_dependency_undo',
+            'SELECT id, label FROM demo_history_dependency_rows'
+        );
+        const undoModification = {
+            description: 'Edit demo_history_dependency_undo',
+            modificationType: 'view_edit',
+            targetTable: 'demo_history_dependency_undo',
+            viewDefBefore: undoBefore,
+            viewDefAfter: undoEdit.after
+        };
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_history_dependency_undo_consumer AS ' +
+            'SELECT label FROM demo_history_dependency_undo'
+        );
+        await assert.rejects(
+            worker.invoke('undoModification', undoModification),
+            /would break existing view.*demo_history_dependency_undo_consumer/is
+        );
+
+        const redoBefore = await worker.invoke(
+            'createView',
+            'demo_history_dependency_redo',
+            'SELECT id, label FROM demo_history_dependency_rows'
+        );
+        const redoEdit = await worker.invoke(
+            'editView',
+            'demo_history_dependency_redo',
+            'SELECT id FROM demo_history_dependency_rows'
+        );
+        const redoModification = {
+            description: 'Edit demo_history_dependency_redo',
+            modificationType: 'view_edit',
+            targetTable: 'demo_history_dependency_redo',
+            viewDefBefore: redoBefore,
+            viewDefAfter: redoEdit.after
+        };
+        await worker.invoke('undoModification', redoModification);
+        await worker.invoke(
+            'runQuery',
+            'CREATE VIEW demo_history_dependency_redo_consumer AS ' +
+            'SELECT label FROM demo_history_dependency_redo'
+        );
+        await assert.rejects(
+            worker.invoke('redoModification', redoModification),
+            /would break existing view.*demo_history_dependency_redo_consumer/is
+        );
+        assert.strictEqual(
+            await workerScalar(
+                worker,
+                'SELECT label FROM demo_history_dependency_redo_consumer'
+            ),
+            'kept'
+        );
+    });
+});
+
+/**
+ * The SQL console's query plans and positional parameters, driven through the
+ * REAL worker bundle against the REAL vendored sql.js. Two engine mechanisms
+ * answer EXPLAIN on the desktop -- the bounded reader compiled into sql.js
+ * (armed here at init) and SQLite's own `EXPLAIN QUERY PLAN` statement (the
+ * native sidecar's only route, and WASM's route for anything the reader will
+ * not admit) -- so both are exercised, and both are held to the same limits.
+ */
+describe('web demo worker SQL console query plans and parameters', () => {
+    const PLAN_HEADERS = ['id', 'parent', 'notused', 'detail'];
+
+    /** A table with an index the planner can be seen choosing. */
+    async function withIndexedTable(worker: WorkerHarness) {
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE plan_target (a INTEGER PRIMARY KEY, b TEXT); ' +
+            'CREATE INDEX plan_target_b ON plan_target(b); ' +
+            "INSERT INTO plan_target VALUES (1, 'x'), (2, 'y')"
+        );
+    }
+
+    /** The connection's mutation counters, read directly rather than through runConsole's own report. */
+    async function counters(worker: WorkerHarness) {
+        return [
+            await workerScalar(worker, 'SELECT total_changes()'),
+            await workerScalar(worker, 'PRAGMA schema_version')
+        ];
+    }
+
+    it('arms the bounded query-plan reader on the sql.js module at init', async () => {
+        const worker = await createWorkerHarness();
+
+        // The SQL function only exists on a connection opened after the
+        // auto-extension was registered, so its presence IS the proof that
+        // initializeDatabase registered it before opening.
+        const result = await worker.invoke(
+            'runQuery',
+            "SELECT sqlite_explorer_query_plan('SELECT 1') AS plan"
+        );
+        const plan = JSON.parse(result[0].rows[0][0]);
+        assert.strictEqual(Array.isArray(plan), true);
+        assert.strictEqual(plan.length, 1);
+        assert.strictEqual(plan[0].length, 4);
+        assert.match(plan[0][3], /SCAN CONSTANT ROW/);
+    });
+
+    it('refuses to open when a build that ships the reader fails to register it', async () => {
+        // Mirrors the extension host (src/core/sqlite-db.ts): a build that HAS
+        // the export and cannot arm it is broken, not old.
+        await assert.rejects(
+            createWorkerHarness({
+                initSqlJs: async (config: any) => ({
+                    ...(await initSqlJs(config)),
+                    _sqlite_explorer_register_query_plan: () => 1
+                })
+            }),
+            /Unable to initialize the bounded query-plan reader/
+        );
+    });
+
+    it('explains a read query through the reader, with its parameters bound', async () => {
+        const prepared: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => { if (kind === 'prepare') prepared.push(sql); }
+        });
+        await withIndexedTable(worker);
+        const before = await counters(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT a FROM plan_target WHERE b = ?',
+            { explain: true, params: ['x'] }
+        );
+
+        // The reader route: the user's SQL crossed as a bound value of the
+        // reader function, and no EXPLAIN statement was ever prepared.
+        assert.ok(prepared.includes('SELECT sqlite_explorer_query_plan(?, ?) AS plan'), prepared.join('\n'));
+        assert.strictEqual(prepared.some(sql => /^EXPLAIN QUERY PLAN/.test(sql)), false);
+        assert.strictEqual(prepared.some(sql => sql.includes('SELECT a FROM plan_target WHERE b = ?')), false,
+            'the user query must first compile inside the bounded C reader');
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.explain, true);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(result.changes, 0);
+        assert.strictEqual(result.statementsSkipped, false);
+        assert.strictEqual(result.results.length, 1);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), PLAN_HEADERS);
+        assert.strictEqual(result.results[0].truncated, false);
+        const details = result.results[0].rows.map((row: unknown[]) => row[3]);
+        assert.ok(details.length >= 1);
+        // The planner chose the index -- a plan, not a placeholder.
+        assert.match(details.join('\n'), /SEARCH plan_target USING (COVERING )?INDEX plan_target_b/);
+        for (const row of result.results[0].rows) {
+            assert.strictEqual(row.length, 4);
+            assert.strictEqual(typeof row[3], 'string');
+        }
+        assert.deepStrictEqual(await counters(worker), before);
+    });
+
+    it('the reader answers exactly what SQLite\'s own EXPLAIN QUERY PLAN says for the same text', async () => {
+        const worker = await createWorkerHarness();
+        await withIndexedTable(worker);
+        const sql = 'SELECT a FROM plan_target WHERE b = ? ORDER BY a';
+
+        const viaReader = await worker.invoke('runConsole', sql, { explain: true, params: ['x'] });
+        const viaSqlite = await worker.invoke('runConsole', `EXPLAIN QUERY PLAN ${sql}`);
+
+        assert.deepStrictEqual(
+            Array.from(viaReader.results[0].rows, (row: unknown[]) => Array.from(row)),
+            Array.from(viaSqlite.results[0].rows, (row: unknown[]) => Array.from(row))
+        );
+    });
+
+    it('routes CTE reads through the bounded reader and retains CTE DML plans', async () => {
+        const prepared: string[] = [];
+        const worker = await createWorkerHarness({
+            onSql: (kind, sql) => { if (kind === 'prepare') prepared.push(sql); }
+        });
+        await withIndexedTable(worker);
+        for (const sql of [
+            'WITH c(value) AS (SELECT a FROM plan_target) SELECT * FROM c',
+            'WITH "AS" AS NOT MATERIALIZED (SELECT a FROM plan_target), d AS (SELECT * FROM "AS") SELECT * FROM d'
+        ]) {
+            prepared.length = 0;
+            const result = await worker.invoke('runConsole', sql, { explain: true });
+            assert.strictEqual(result.error, undefined);
+            assert.ok(prepared.includes('SELECT sqlite_explorer_query_plan(?) AS plan'));
+            assert.strictEqual(prepared.some(text => text.includes(sql)), false);
+        }
+        const dml = await worker.invoke('runConsole',
+            "WITH c(value) AS (SELECT 'changed') UPDATE plan_target SET b = (SELECT value FROM c) WHERE a = 1",
+            { explain: true });
+        assert.strictEqual(dml.error, undefined);
+        assert.strictEqual(dml.mutated, false);
+        assert.strictEqual(await workerScalar(worker, 'SELECT b FROM plan_target WHERE a = 1'), 'x');
+    });
+
+    it('accepts one trailing semicolon, as a console user types it', async () => {
+        const worker = await createWorkerHarness();
+
+        const result = await worker.invoke('runConsole', 'SELECT 1;', { explain: true });
+
+        assert.strictEqual(result.error, undefined);
+        assert.match(result.results[0].rows[0][3], /SCAN CONSTANT ROW/);
+    });
+
+    it('refuses a second statement and runs nothing from it', async () => {
+        const worker = await createWorkerHarness();
+        await withIndexedTable(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            "SELECT 1; INSERT INTO plan_target VALUES (3, 'z')",
+            { explain: true }
+        );
+
+        assert.match(result.error, /Exactly one SQL statement is required/);
+        // Not "statements before the error were applied": nothing runs on this path.
+        assert.strictEqual(result.multiStatement, false);
+        assert.strictEqual(result.explain, true);
+        assert.strictEqual(result.mutated, false);
+        assert.deepStrictEqual(Array.from(result.results), []);
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM plan_target'), 2);
+    });
+
+    it('explains a DML statement through SQLite\'s own EXPLAIN without executing it', async () => {
+        // The reader admits read queries only; a DML plan is still worth
+        // reading (does my UPDATE hit the index?), and it is what the native
+        // engine answers for everything.
+        const worker = await createWorkerHarness();
+        await withIndexedTable(worker);
+        const before = await counters(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            "UPDATE plan_target SET b = 'changed' WHERE a = ?",
+            { explain: true, params: [1] }
+        );
+
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.explain, true);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), PLAN_HEADERS);
+        assert.match(
+            result.results[0].rows.map((row: unknown[]) => row[3]).join('\n'),
+            /SEARCH plan_target USING INTEGER PRIMARY KEY/
+        );
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(await workerScalar(worker, 'SELECT b FROM plan_target WHERE a = 1'), 'x');
+        assert.deepStrictEqual(await counters(worker), before);
+    });
+
+    it('refuses to explain a PRAGMA before compiling it, so a flag pragma cannot take effect', async () => {
+        // Flag pragmas apply at sqlite3_prepare time; `EXPLAIN QUERY PLAN
+        // PRAGMA query_only = ON` would arm the pragma and display nothing.
+        const worker = await createWorkerHarness();
+
+        for (const sql of ['PRAGMA query_only = ON', '  -- note\n  pragma query_only = ON;']) {
+            const result = await worker.invoke('runConsole', sql, { explain: true });
+            assert.match(result.error, /PRAGMA statements have no query plan/, sql);
+            assert.strictEqual(result.mutated, false);
+        }
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        // Still writable: the connection was not silently write-locked.
+        const write = await worker.invoke('runConsole', 'CREATE TABLE pragma_probe (id INTEGER)');
+        assert.strictEqual(write.error, undefined);
+        assert.strictEqual(write.mutated, true);
+    });
+
+    it('reports a parameter-count mismatch from the reader in its own words', async () => {
+        const worker = await createWorkerHarness();
+
+        const none = await worker.invoke('runConsole', 'SELECT ? AS v', { explain: true });
+        assert.match(none.error, /Query plan positional parameter count does not match/);
+
+        const extra = await worker.invoke('runConsole', 'SELECT ? AS v', { explain: true, params: [1, 2] });
+        assert.match(extra.error, /Query plan positional parameter count does not match/);
+
+        const exact = await worker.invoke('runConsole', 'SELECT ? AS v', { explain: true, params: [1] });
+        assert.strictEqual(exact.error, undefined);
+        assert.strictEqual(exact.results[0].rows.length, 1);
+    });
+
+    it('caps a plan at 1000 displayed entries with one lookahead marking truncation, on both mechanisms', async () => {
+        const worker = await createWorkerHarness();
+        // 1100 scalar subqueries: SQLite lists two plan entries per subquery,
+        // so both routes must stop reading well before the end.
+        const subqueries = Array.from({ length: 1100 }, () => '(SELECT 1)').join(', ');
+
+        // Reader route: a read query.
+        const read = await worker.invoke('runConsole', `SELECT ${subqueries}`, { explain: true });
+        assert.strictEqual(read.error, undefined);
+        assert.strictEqual(read.results[0].rows.length, 1000);
+        assert.strictEqual(read.results[0].truncated, true);
+        // The reader restores the connection limits it clamped.
+        assert.strictEqual(await workerScalar(worker, 'SELECT length(zeroblob(2097152))'), 2097152);
+
+        // Built-in route: the same SELECT feeding an INSERT (DML is not a read query).
+        const columns = Array.from({ length: 1100 }, (_, i) => `c${i}`).join(', ');
+        await worker.invoke('runQuery', `CREATE TABLE wide_plan (${columns})`);
+        const dml = await worker.invoke(
+            'runConsole',
+            `INSERT INTO wide_plan SELECT ${subqueries}`,
+            { explain: true }
+        );
+        assert.strictEqual(dml.error, undefined);
+        assert.strictEqual(dml.results[0].rows.length, 1000);
+        assert.strictEqual(dml.results[0].truncated, true);
+        assert.strictEqual(dml.mutated, false);
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM wide_plan'), 0);
+    });
+
+    it('refuses SQL text over the reader\'s 262,144-byte limit on either route', async () => {
+        const worker = await createWorkerHarness();
+        const huge = `SELECT '${'x'.repeat(262_144)}'`;
+
+        const result = await worker.invoke('runConsole', huge, { explain: true });
+
+        assert.match(result.error, /Query plan SQL exceeds 262,144 UTF-8 bytes/);
+    });
+
+    it('falls back to SQLite\'s own EXPLAIN when the sql.js build has no reader', async () => {
+        // An older vendored build: `_sqlite_explorer_register_query_plan`
+        // absent. The console must still answer plans -- this is also the
+        // shape the native sidecar's engine presents. (The sql.js glue caches
+        // ONE module per import, so an earlier harness's auto-extension is
+        // still registered on this connection; the route is therefore proven
+        // by the SQL the worker prepares, not by the function's absence.)
+        const prepared: string[] = [];
+        const worker = await createWorkerHarness({
+            initSqlJs: async (config: any) => ({
+                ...(await initSqlJs(config)),
+                _sqlite_explorer_register_query_plan: undefined
+            }),
+            onSql: (kind, sql) => { if (kind === 'prepare') prepared.push(sql); }
+        });
+        await withIndexedTable(worker);
+
+        const result = await worker.invoke(
+            'runConsole',
+            'SELECT a FROM plan_target WHERE b = ?',
+            { explain: true, params: ['x'] }
+        );
+        assert.strictEqual(prepared.some(sql => sql.includes('sqlite_explorer_query_plan')), false, prepared.join('\n'));
+        assert.ok(prepared.some(sql => /^EXPLAIN QUERY PLAN SELECT a FROM plan_target WHERE b = \?\n\/\*sqlite_explorer_boundary_/.test(sql)), prepared.join('\n'));
+        assert.strictEqual(result.error, undefined);
+        assert.deepStrictEqual(Array.from(result.results[0].headers), PLAN_HEADERS);
+        assert.match(
+            result.results[0].rows.map((row: unknown[]) => row[3]).join('\n'),
+            /SEARCH plan_target USING (COVERING )?INDEX plan_target_b/
+        );
+        // The reader's structural guarantees are re-established in JavaScript.
+        const two = await worker.invoke('runConsole', 'SELECT 1; SELECT 2', { explain: true });
+        assert.match(two.error, /Exactly one SQL statement is required/);
+        const pragma = await worker.invoke('runConsole', 'PRAGMA foreign_keys = OFF', { explain: true });
+        assert.match(pragma.error, /PRAGMA statements have no query plan/);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA foreign_keys'), 1);
+    });
+
+    it('binds positional parameters to a run, to every statement of it', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE param_rows (id INTEGER, label TEXT)');
+
+        const inserted = await worker.invoke(
+            'runConsole',
+            'INSERT INTO param_rows VALUES (?, ?)',
+            { params: [7, 'seven'] }
+        );
+        assert.strictEqual(inserted.error, undefined);
+        assert.strictEqual(inserted.mutated, true);
+        assert.strictEqual(inserted.changes, 1);
+
+        const selected = await worker.invoke(
+            'runConsole',
+            'SELECT label FROM param_rows WHERE id = ?; SELECT ? * 2 AS twice',
+            { params: [7] }
+        );
+        assert.strictEqual(selected.error, undefined);
+        assert.deepStrictEqual(Array.from(selected.results[0].rows[0]), ['seven']);
+        assert.deepStrictEqual(Array.from(selected.results[1].rows[0]), [14]);
+
+        // NULL, text and floating point cross as themselves.
+        const typed = await worker.invoke(
+            'runConsole',
+            'SELECT ? IS NULL AS n, typeof(?) AS t, ? + 0.5 AS f',
+            { params: [null, 'text', 1] }
+        );
+        assert.deepStrictEqual(Array.from(typed.results[0].rows[0]), [1, 'text', 1.5]);
+    });
+
+    it('reports a value with no placeholder against the statement it hit, naming the count', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE param_over (id INTEGER)');
+
+        const result = await worker.invoke(
+            'runConsole',
+            'INSERT INTO param_over VALUES (?); SELECT 1;',
+            { params: [1, 2] }
+        );
+
+        // Statement 1 has one placeholder for two values: refused BEFORE it
+        // runs, so the table stays empty and the failure is statement 1's.
+        assert.match(result.error, /^statement 1: cannot bind 2 positional parameters: /);
+        assert.strictEqual(result.mutated, false);
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM param_over'), 0);
+    });
+
+    it('rejects a malformed parameter list before anything runs', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE param_guard (id INTEGER)');
+        const attempts: Array<[unknown, RegExp]> = [
+            ['[1]', /must be a JSON array/],
+            [{ length: 1, 0: 1 }, /must be a JSON array/],
+            [[true], /null, string, finite number or 64-bit integer/],
+            [[Number.NaN], /null, string, finite number or 64-bit integer/],
+            [[{ toString: () => '1' }], /null, string, finite number or 64-bit integer/],
+            [[2n ** 63n], /null, string, finite number or 64-bit integer/],
+            [['a\0b'], /NUL/],
+            [Array.from({ length: 101 }, () => 1), /at most 100/],
+            // A hole is a value class of its own (undefined), and must not be skipped.
+            // eslint-disable-next-line no-sparse-arrays
+            [[1, , 3], /null, string, finite number or 64-bit integer/]
+        ];
+        for (const [params, expected] of attempts) {
+            await assert.rejects(
+                worker.invoke('runConsole', 'INSERT INTO param_guard VALUES (1)', { params }),
+                expected,
+                JSON.stringify(params, (_key, value) => typeof value === 'bigint' ? `${value}n` : value)
+            );
+        }
+        // Pre-execution: none of them ran.
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM param_guard'), 0);
+        // Absent and null both mean "no parameters".
+        for (const params of [undefined, null]) {
+            const result = await worker.invoke('runConsole', 'SELECT 1 AS ok', { params });
+            assert.strictEqual(result.error, undefined);
+        }
+    });
+});
+
+describe('web demo worker importRows', () => {
+    const rowCount = async (worker: WorkerHarness, table: string) =>
+        Number(await workerScalar(worker, `SELECT count(*) FROM ${table}`));
+    /** The history entry the desktop host records for an import. */
+    const importEntry = (table: string, result: any) => ({
+        modificationType: 'row_insert',
+        targetTable: table,
+        description: `Import ${result.rowCount} rows into ${table}`,
+        importedRows: result.snapshots
+    });
+
+    it('imports every row in one savepoint and answers compact post-images that undo and redo as one edit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT DEFAULT 'default', note TEXT, " +
+            'doubled INTEGER GENERATED ALWAYS AS (id * 2) STORED)'
+        );
+        // Ragged rows on purpose: an empty object is `DEFAULT VALUES` (rowid 1
+        // on the empty table), a missing key takes the column DEFAULT, and an
+        // exact int64 crosses as text.
+        const rows = [
+            {},
+            { id: 2, value: 'second', note: null },
+            { id: 3 },
+            { id: '9007199254740993', value: 'first' }
+        ];
+        const result = await worker.invoke('importRows', 'items', rows, { maxUndoSnapshotBytes: 1024 * 1024 });
+        assert.equal(result.rowCount, 4);
+        // Generated columns are not insertable and so not part of the post-image.
+        assert.deepEqual(result.snapshots.columns, ['id', 'value', 'note']);
+        assert.equal(result.snapshots.rows.length, 4);
+        // Insertion order, exact identities (the unsafe integer stays a decimal string).
+        assert.deepEqual(result.snapshots.rows.map((row: any) => String(row.rowId)), ['1', '2', '3', '9007199254740993']);
+        // Every row stored [integer, text, null] → ONE storage-class pattern for the batch.
+        assert.deepEqual(result.snapshots.storageClassPatterns, [['integer', 'text', 'null']]);
+        assert.ok(result.snapshots.rows.every((row: any) => row.pattern === 0 && row.values.length === 3));
+
+        // sql.js answers an empty SELECT with no result set at all.
+        const values = async () => (await worker.invoke(
+            'runQuery', 'SELECT CAST(id AS TEXT), value, note, CAST(doubled AS TEXT) FROM items ORDER BY id'
+        ))[0]?.rows ?? [];
+        const imported = [
+            ['1', 'default', null, '2'], ['2', 'second', null, '4'], ['3', 'default', null, '6'],
+            ['9007199254740993', 'first', null, '18014398509481986']
+        ];
+        assert.deepEqual(await values(), imported);
+
+        const entry = importEntry('items', result);
+        await worker.invoke('undoModification', entry);
+        assert.deepEqual(await values(), []);
+        await worker.invoke('redoModification', entry);
+        assert.deepEqual(await values(), imported);
+
+        // The exact-state guard: an external change to one imported row refuses
+        // the undo and must not partly remove the import.
+        await worker.invoke('runQuery', "UPDATE items SET value = 'external change' WHERE id = 2");
+        await assert.rejects(worker.invoke('undoModification', entry));
+        assert.equal(await rowCount(worker, 'items'), 4);
+    });
+
+    it('rolls the whole batch back on any refusal, before any row is released', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT UNIQUE)');
+        const untouched = async () => assert.equal(await rowCount(worker, 'items'), 0);
+
+        // A constraint on the SECOND row takes the first row back with it.
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'a' }, { id: 2, value: 'a' }]),
+            /UNIQUE|constraint/i
+        );
+        await untouched();
+        // Per-value edit cap, checked before the first statement.
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'x'.repeat(100) }], { maxEditValueBytes: 16 }),
+            (error: unknown) => error instanceof CellEditPolicyError
+        );
+        await untouched();
+        // Undo memory budget and transport budget, both measured on the answer
+        // while the savepoint is still open.
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'x'.repeat(4096) }], { maxUndoSnapshotBytes: 64 }),
+            /undo memory budget/
+        );
+        await untouched();
+        await assert.rejects(
+            worker.invoke('importRows', 'items', [{ id: 1, value: 'x'.repeat(4096) }], { maxSnapshotTransportBytes: 64 }),
+            /can return in one edit/
+        );
+        await untouched();
+        // Shape refusals, in the worker's own words.
+        await assert.rejects(worker.invoke('importRows', 'items', { id: 1 }), /Import rows must be an array/);
+        await assert.rejects(worker.invoke('importRows', 'items', []), /at least one row/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ id: 1 }, 'nope']), /row 2 must be an object/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ id: 1 }], { maxUndoSnapshotBytes: -1 }), /non-negative safe integer/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ id: 1 }], 'options'), /options must be an object/);
+        await assert.rejects(worker.invoke('importRows', 'items', [{ '': 1 }]), /Column name/);
+        await assert.rejects(worker.invoke('importRows', 'absent', [{ id: 1 }]), /Table not found/);
+        await assert.rejects(
+            worker.invoke('importRows', 'items', Array.from({ length: 100_001 }, (_, id) => ({ id }))),
+            /100,000 rows/
+        );
+        await untouched();
+
+        const readOnly = await createWorkerHarness({ readOnlyMode: true });
+        await assert.rejects(readOnly.invoke('importRows', 'items', [{ id: 1 }]), /read-only/);
+    });
+
+    it('imports into WITHOUT ROWID composite keys and unwinds self-referencing foreign keys in reverse', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke(
+            'runQuery',
+            'CREATE TABLE "odd table" ("group" TEXT, "key" INTEGER, value TEXT NOT NULL DEFAULT \'ok\', ' +
+            'PRIMARY KEY ("group", "key")) WITHOUT ROWID'
+        );
+        const odd = await worker.invoke('importRows', 'odd table', [
+            { group: 'a"b', key: '9223372036854775807' }, { group: 'a"b', key: 2 }
+        ]);
+        assert.equal(odd.rowCount, 2);
+        assert.ok(odd.snapshots.rows.every((row: any) => typeof row.rowId === 'string'), 'primary-key identities are encoded strings');
+        const oddRows = async () => (await worker.invoke(
+            'runQuery', 'SELECT "group", CAST("key" AS TEXT), value FROM "odd table" ORDER BY "key"'
+        ))[0]?.rows ?? [];
+        assert.deepEqual(await oddRows(), [['a"b', '2', 'ok'], ['a"b', '9223372036854775807', 'ok']]);
+        const oddEntry = importEntry('odd table', odd);
+        await worker.invoke('undoModification', oddEntry);
+        assert.deepEqual(await oddRows(), []);
+        await worker.invoke('redoModification', oddEntry);
+        assert.deepEqual(await oddRows(), [['a"b', '2', 'ok'], ['a"b', '9223372036854775807', 'ok']]);
+        // NOT NULL on the second row rolls back the first.
+        await assert.rejects(
+            worker.invoke('importRows', 'odd table', [{ group: 'c', key: 1 }, { group: 'c', key: 2, value: null }]),
+            /NOT NULL|constraint/i
+        );
+        assert.equal(await rowCount(worker, '"odd table"'), 2);
+
+        // foreign_keys is ON by default in this worker: undo must delete the
+        // child (row 2) before its parent (row 1), i.e. in reverse insertion order.
+        await worker.invoke('runQuery', 'CREATE TABLE nodes (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES nodes(id))');
+        const nodes = await worker.invoke('importRows', 'nodes', [{ id: 1, parent_id: null }, { id: 2, parent_id: 1 }]);
+        const nodesEntry = importEntry('nodes', nodes);
+        await worker.invoke('undoModification', nodesEntry);
+        assert.equal(await rowCount(worker, 'nodes'), 0);
+        await worker.invoke('redoModification', nodesEntry);
+        assert.deepEqual(
+            (await worker.invoke('runQuery', 'SELECT id, parent_id FROM nodes ORDER BY id'))[0].rows,
+            [[1, null], [2, 1]]
+        );
+    });
+
+    it('refuses a malformed importedRows history entry instead of guessing at a predicate', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT)');
+        const result = await worker.invoke('importRows', 'items', [{ id: 1, value: 'a' }]);
+        for (const importedRows of [
+            null,
+            { columns: ['id'], storageClassPatterns: [], rows: [] },
+            { ...result.snapshots, rows: [{ rowId: 1, values: [1], pattern: 0 }] },      // width mismatch
+            { ...result.snapshots, rows: [{ rowId: 1, values: [1, 'a'], pattern: 7 }] }  // pattern out of range
+        ]) {
+            await assert.rejects(worker.invoke('undoModification', {
+                modificationType: 'row_insert', targetTable: 'items', description: 'x', importedRows
+            }));
+        }
+        assert.equal(await rowCount(worker, 'items'), 1);
+    });
+});
+
+describe('desktop import preview schema snapshot', () => {
+    it('keeps preview defaults and permits ordinary reads before import', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', "CREATE TABLE import_target(id INTEGER PRIMARY KEY, value TEXT DEFAULT 'original')");
+        const target = await worker.invoke('getImportTarget', 'import_target');
+        assert.equal(typeof target.schemaVersion, 'string');
+        assert.equal(target.columns.find((column: any) => column.identifier === 'value').defaultExpression, "'original'");
+        await worker.invoke('runQuery', 'SELECT * FROM import_target');
+        const result = await worker.invoke('importRows', 'import_target', [{ id: 1 }], { expectedSchemaVersion: target.schemaVersion });
+        assert.equal(result.rowCount, 1);
+        assert.deepEqual((await worker.invoke('runQuery', 'SELECT value FROM import_target'))[0].rows, [['original']]);
+        await assert.rejects(worker.invoke('getImportTarget', 'missing'), /Table not found/);
+    });
+
+    for (const ddl of [
+        "DROP TABLE import_target; CREATE TABLE import_target(id INTEGER PRIMARY KEY, value TEXT DEFAULT 'original')",
+        'CREATE TEMP TABLE temporary_change (id INTEGER)'
+    ]) it(`refuses stale preview after ${ddl.split(' ')[0]} without importing any rows`, async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', "CREATE TABLE import_target(id INTEGER PRIMARY KEY, value TEXT DEFAULT 'original')");
+        const target = await worker.invoke('getImportTarget', 'import_target');
+        await worker.invoke('runConsole', ddl);
+        await assert.rejects(worker.invoke('importRows', 'import_target', [{ id: 1 }], { expectedSchemaVersion: target.schemaVersion }), /schema changed after the preview/);
+        assert.equal((await worker.invoke('runQuery', 'SELECT COUNT(*) FROM import_target'))[0].rows[0][0], 0);
+    });
+});
+
+describe('web demo filters and sorts through the runtime and the rowid lookup', () => {
+    const plainOrder = (column: string, dir: string) => `"${column}" ${dir}, rowid ${dir}`;
+    async function expectedIds(worker: WorkerHarness, sql: string, params: unknown[] = []) {
+        const result = await worker.invoke('executeReadQuery', sql, JSON.stringify(params));
+        return Array.from(result.rows, (row: unknown[]) => row[0]);
+    }
+
+    it('matches the LIKE chain for global filters, through sqlite_explorer_like_any', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({ onSql: (kind, sql) => { if (kind === 'prepare') observed.push(sql); } });
+        await worker.invoke('runQuery',
+            'CREATE TABLE demo_filter (a, b, c); INSERT INTO demo_filter VALUES ' +
+            "('John Smith', 1.5, 9999), ('é', 'É', NULL), (CAST(x'c3a9a9' AS TEXT), 19999, -1.0e+20), " +
+            "(x'616263', 'abc', 0), (CAST(x'ffc3a9' AS TEXT), 'x', 1e999), ('nothing', 'here', 7)");
+        const columns = ['rowid', 'a', 'b', 'c'];
+        for (const needle of ['john', 'JOHN', 'é', 'É', '99', '1.5', 'e+', 'inf', 'abc', '%', 'zzz']) {
+            observed.length = 0;
+            const page = await worker.invoke('fetchTableData', 'demo_filter', {
+                columns, globalFilterColumns: ['a', 'b', 'c'], globalFilter: needle, limit: 100, offset: 0
+            });
+            assert.ok(observed.some(sql => sql.includes('sqlite_explorer_like_any(')), needle);
+            const pattern = `%${needle.replace(/[\\%_]/g, character => `\\${character}`)}%`;
+            const expected = await expectedIds(worker,
+                "SELECT rowid FROM demo_filter WHERE a LIKE ? ESCAPE '\\' OR b LIKE ? ESCAPE '\\' OR c LIKE ? ESCAPE '\\' ORDER BY rowid",
+                [pattern, pattern, pattern]);
+            assert.deepStrictEqual(Array.from(page.rows, (row: unknown[]) => row[0]), expected, needle);
+            const count = await worker.invoke('fetchTableCount', 'demo_filter', {
+                columns, globalFilterColumns: ['a', 'b', 'c'], globalFilter: needle
+            });
+            assert.strictEqual(count.count, expected.length, needle);
+        }
+    });
+
+    it('pages sorted tables in the plain order, through the rowid lookup', async () => {
+        const observed: string[] = [];
+        const worker = await createWorkerHarness({ onSql: (kind, sql) => { if (kind === 'prepare') observed.push(sql); } });
+        await worker.invoke('runQuery',
+            'CREATE TABLE demo_sort (k1, s TEXT COLLATE NOCASE); ' +
+            'WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 53) ' +
+            "INSERT INTO demo_sort SELECT (x * 37) % 11, CASE x % 3 WHEN 0 THEN 'b' WHEN 1 THEN 'B' ELSE 'a' END || (x % 5) FROM n; " +
+            'CREATE VIRTUAL TABLE demo_sort_fts USING fts5(s); INSERT INTO demo_sort_fts (rowid, s) SELECT rowid, s FROM demo_sort');
+        for (const [table, column] of [['demo_sort', 'k1'], ['demo_sort', 's'], ['demo_sort_fts', 's']] as const) {
+            for (const dir of ['ASC', 'DESC']) {
+                const expected = await expectedIds(worker, `SELECT rowid FROM ${table} ORDER BY ${plainOrder(column, dir)}`);
+                const options = (page: number, keyset?: object) => ({
+                    columns: ['rowid', column], orderBy: column, orderDir: dir, limit: 10, offset: page * 10,
+                    ...(keyset ? { keyset } : {})
+                });
+                observed.length = 0;
+                const pages: unknown[][] = [];
+                let page = await worker.invoke('fetchTableData', table, options(0, { mode: 'first' }));
+                pages.push(Array.from(page.rows, (row: unknown[]) => row[0]));
+                for (let index = 1; index * 10 < expected.length; index++) {
+                    page = await worker.invoke('fetchTableData', table, options(index, { mode: 'after', anchor: page.keysetAnchors.last }));
+                    pages.push(Array.from(page.rows, (row: unknown[]) => row[0]));
+                }
+                assert.deepStrictEqual(pages.flat(), expected, `${table}.${column} ${dir} keyset`);
+                const offsetPage = await worker.invoke('fetchTableData', table, options(2));
+                assert.deepStrictEqual(Array.from(offsetPage.rows, (row: unknown[]) => row[0]), expected.slice(20, 30), `${table}.${column} ${dir} OFFSET`);
+                const lookup = observed.some(sql => sql.includes('AS "page_keys" CROSS JOIN'));
+                assert.strictEqual(lookup, table === 'demo_sort', `${table} lookup`);
+            }
+        }
+    });
+});
+
+describe('web demo edits of whole numbers past int32', () => {
+    it('store INTEGER in untyped and BLOB columns, as the extension does', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', "CREATE TABLE demo_int (id INTEGER PRIMARY KEY, a, b BLOB); INSERT INTO demo_int VALUES (1, 'x', 'x'), (2, 'x', 'x')");
+        await worker.invoke('updateCell', 'demo_int', 1, 'a', 1730000000000);
+        await worker.invoke('updateCellBatch', 'demo_int', [
+            { rowId: 2, column: 'a', value: 1730000000000 },
+            { rowId: 2, column: 'b', value: -2147483649 }
+        ]);
+        await worker.invoke('insertRow', 'demo_int', { id: 3, a: 3000000000, b: 3000000000 });
+        assert.strictEqual(
+            await workerScalar(worker, "SELECT group_concat(kind, ',') FROM (SELECT typeof(a) || '/' || typeof(b) AS kind FROM demo_int ORDER BY id)"),
+            'integer/text,integer/integer,integer/integer'
+        );
+    });
+});
+
+// sql.js exports through the backup API and marks its copy as a rollback-journal
+// file; the download keeps a WAL database in WAL mode, as the extension's save does.
+describe('web demo download journal mode', () => {
+    it('keeps a WAL database in WAL mode and a rollback-journal one in rollback mode', async () => {
+        const seed = await createWorkerHarness();
+        await seed.invoke('runQuery', "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t VALUES (1, 'a')");
+        const rollback = Uint8Array.from(await seed.invoke('exportDatabase', 'test.db'));
+        const wal = Uint8Array.from(rollback);
+        wal[18] = 2; wal[19] = 2;
+        for (const [content, journalMode, header] of [[wal, 'wal', [2, 2]], [rollback, 'delete', [1, 1]]] as const) {
+            const worker = await createWorkerHarness({ content: Uint8Array.from(content) });
+            await worker.invoke('runQuery', "INSERT INTO t VALUES (2, 'b')");
+            assert.strictEqual(await workerScalar(worker, 'PRAGMA journal_mode'), journalMode);
+            const saved = Uint8Array.from(await worker.invoke('exportDatabase', 'test.db'));
+            assert.deepStrictEqual([saved[18], saved[19]], header);
+            const reopened = await createWorkerHarness({ content: saved });
+            assert.strictEqual(await workerScalar(reopened, "SELECT group_concat(v, ',') FROM t"), 'a,b');
+        }
+    });
+});
+
+// A schema ON CONFLICT clause applies to every INSERT and UPDATE that does not
+// name its own. The demo's edit writes say OR ABORT, as the extension engines'
+// do (conflict_clause_history.test.ts), so a conflicting edit fails instead of
+// deleting a row (REPLACE) or skipping the write (IGNORE).
+describe('web demo edits under schema ON CONFLICT clauses', () => {
+    const uniqueTable = (clause: string) =>
+        `CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT ${clause}, v TEXT); ` +
+        "INSERT INTO t VALUES (1, 'x', 'keep'), (2, 'y', 'other');";
+    const UNIQUE_REPLACE = uniqueTable('REPLACE');
+    const CONFLICT = /UNIQUE constraint failed/;
+    const seeded = async (setup: string) => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', setup);
+        return worker;
+    };
+    const rows = async (worker: WorkerHarness) => Array.from(
+        (await worker.invoke('runQuery', 'SELECT * FROM t ORDER BY 1'))[0]?.rows ?? [],
+        (row: unknown[]) => Array.from(row)
+    );
+
+    it('refuses a cell edit that collides with a UNIQUE ON CONFLICT REPLACE row', async () => {
+        const worker = await seeded(UNIQUE_REPLACE);
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('updateCell', 't', 2, 'k', 'x'), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses rowid batch edits that collide under ON CONFLICT REPLACE or IGNORE', async () => {
+        for (const clause of ['REPLACE', 'IGNORE']) {
+            const worker = await seeded(uniqueTable(clause));
+            const before = await rows(worker);
+            await assert.rejects(
+                worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'x' }]),
+                CONFLICT,
+                clause
+            );
+            assert.deepStrictEqual(await rows(worker), before, clause);
+            await assert.rejects(worker.invoke('updateCellBatch', 't', [
+                { rowId: 2, column: 'v', value: 'changed' },
+                { rowId: 2, column: 'k', value: 'x' }
+            ]), CONFLICT, clause);
+            assert.deepStrictEqual(await rows(worker), before, clause);
+        }
+    });
+
+    it('refuses a rowid batch JSON patch whose result collides with a UNIQUE ON CONFLICT REPLACE row', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT REPLACE, v TEXT); ' +
+            `INSERT INTO t VALUES (1, '{"a":1}', 'keep'), (2, '{}', 'other');`
+        );
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('updateCellBatch', 't', [
+            { rowId: 2, column: 'k', value: '{"a":1}', operation: 'json_patch' }
+        ]), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses a rowid-alias batch edit onto an INTEGER PRIMARY KEY ON CONFLICT REPLACE key', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY ON CONFLICT REPLACE, v TEXT); ' +
+            "INSERT INTO t VALUES (1, 'keep'), (2, 'other');"
+        );
+        const before = await rows(worker);
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'id', value: 1 }]),
+            CONFLICT
+        );
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses a WITHOUT ROWID key edit onto a PRIMARY KEY ON CONFLICT REPLACE key', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (k TEXT PRIMARY KEY ON CONFLICT REPLACE, v TEXT) WITHOUT ROWID; ' +
+            "INSERT INTO t VALUES ('a', 'keep'), ('b', 'other');"
+        );
+        const page = await worker.invoke('fetchTableData', 't', {
+            columns: ['rowid', 'k', 'v'],
+            limit: 10,
+            offset: 0
+        });
+        const identity = page.rows.find((row: unknown[]) => row[1] === 'b')[0];
+        assert.match(identity, /^pk:/);
+        const before = await rows(worker);
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: identity, column: 'k', value: 'a' }]),
+            CONFLICT
+        );
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses inserts onto an existing ON CONFLICT REPLACE key', async () => {
+        for (const withoutRowId of [false, true]) {
+            const worker = await seeded(
+                'CREATE TABLE t (id INTEGER PRIMARY KEY ON CONFLICT REPLACE, v TEXT)' +
+                `${withoutRowId ? ' WITHOUT ROWID' : ''}; INSERT INTO t VALUES (1, 'keep');`
+            );
+            for (const method of ['insertRow', 'insertRowWithHistory']) {
+                await assert.rejects(
+                    worker.invoke(method, 't', { id: 1, v: 'new' }),
+                    CONFLICT,
+                    `${method} withoutRowId=${withoutRowId}`
+                );
+                assert.deepStrictEqual(await rows(worker), [[1, 'keep']]);
+            }
+        }
+        // DEFAULT VALUES: the column default collides with an existing row.
+        const worker = await seeded(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT REPLACE DEFAULT 'x', v TEXT); " +
+            "INSERT INTO t VALUES (1, 'x', 'keep');"
+        );
+        await assert.rejects(worker.invoke('insertRowWithHistory', 't', {}), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), [[1, 'x', 'keep']]);
+    });
+
+    it('refuses an oversized-cell replacement that collides with a UNIQUE ON CONFLICT REPLACE row', async () => {
+        const worker = await seeded(
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT REPLACE, v TEXT); ' +
+            "INSERT INTO t VALUES (1, 'x', 'keep'), (2, 'yyyyyyyyyyyy', 'other');"
+        );
+        const before = await rows(worker);
+        // An 8-byte edit limit makes the 12-byte value oversized.
+        await assert.rejects(
+            worker.invoke('replaceOversizedCell', 't', 2, 'k', 'x', { storageClass: 'text', byteLength: 12 }, 8),
+            CONFLICT
+        );
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses undoing a cell edit whose old value now collides', async () => {
+        const worker = await seeded(UNIQUE_REPLACE);
+        const affectedCells = await worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'w' }]);
+        await worker.invoke('runQuery', "INSERT INTO t (id, k, v) VALUES (3, 'y', 'external')");
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('undoModification', {
+            modificationType: 'cell_update',
+            targetTable: 't',
+            affectedCells
+        }), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses redoing an inserted row that now collides', async () => {
+        const worker = await seeded(UNIQUE_REPLACE);
+        const insertedRow = await worker.invoke('insertRowWithHistory', 't', { k: 'z', v: 'inserted' });
+        const modification = {
+            modificationType: 'row_insert',
+            targetTable: 't',
+            targetRowId: insertedRow.rowId,
+            insertedRow
+        };
+        await worker.invoke('undoModification', modification);
+        await worker.invoke('runQuery', "INSERT INTO t (id, k, v) VALUES (9, 'z', 'external')");
+        const before = await rows(worker);
+        await assert.rejects(worker.invoke('redoModification', modification), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), before);
+    });
+
+    it('refuses NULL into a NOT NULL ON CONFLICT REPLACE column instead of taking the default', async () => {
+        const worker = await seeded(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'd')"
+        );
+        await assert.rejects(
+            worker.invoke('insertRowWithHistory', 't', { id: 1, v: null }),
+            /NOT NULL constraint failed/
+        );
+        assert.deepStrictEqual(await rows(worker), []);
+        // Leaving the column out still takes its default.
+        await worker.invoke('insertRowWithHistory', 't', { id: 2 });
+        assert.deepStrictEqual(await rows(worker), [[2, 'd']]);
+    });
+
+    it('probes triggers and foreign-key actions with the OR ABORT its writes use', async () => {
+        // A REPLACE resolution deletes the conflicting row, which runs DELETE
+        // triggers (with recursive triggers on) and foreign-key DELETE actions
+        // that an OR ABORT write never runs; a probe without OR ABORT would
+        // refuse a non-conflicting edit the write itself allows.
+        const triggered = await seeded(
+            UNIQUE_REPLACE +
+            ' CREATE TABLE log (id); ' +
+            'CREATE TRIGGER t_deleted AFTER DELETE ON t BEGIN INSERT INTO log VALUES (OLD.id); END; ' +
+            'PRAGMA recursive_triggers = ON;'
+        );
+        await triggered.invoke('insertRowWithHistory', 't', { id: 3, k: 'z', v: 'inserted' });
+        await triggered.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'w' }]);
+        assert.deepStrictEqual(
+            await rows(triggered),
+            [[1, 'x', 'keep'], [2, 'w', 'other'], [3, 'z', 'inserted']]
+        );
+
+        const referenced = await seeded(
+            UNIQUE_REPLACE +
+            ' CREATE TABLE child (parent REFERENCES t(id) ON DELETE CASCADE); INSERT INTO child VALUES (1);'
+        );
+        await referenced.invoke('setPragma', 'foreign_keys', true);
+        await referenced.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'w' }]);
+        assert.deepStrictEqual(await rows(referenced), [[1, 'x', 'keep'], [2, 'w', 'other']]);
+        // A colliding edit fails without deleting row 1 or cascading into child.
+        await assert.rejects(referenced.invoke('updateCell', 't', 2, 'k', 'x'), CONFLICT);
+        assert.deepStrictEqual(await rows(referenced), [[1, 'x', 'keep'], [2, 'w', 'other']]);
+        assert.strictEqual(await workerScalar(referenced, 'SELECT count(*) FROM child'), 1);
+    });
+
+    it('refuses a plain UNIQUE conflict and keeps the row (control)', async () => {
+        const worker = await seeded(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE); INSERT INTO t VALUES (1, 'x'), (2, 'y');"
+        );
+        await assert.rejects(worker.invoke('updateCell', 't', 2, 'k', 'x'), CONFLICT);
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: 2, column: 'k', value: 'x' }]),
+            CONFLICT
+        );
+        await assert.rejects(worker.invoke('insertRowWithHistory', 't', { k: 'x' }), CONFLICT);
+        assert.deepStrictEqual(await rows(worker), [[1, 'x'], [2, 'y']]);
+    });
+});
+
+// The desktop's WebAssembly engine runs this worker bundle, and its native
+// sidecar runs the same file over the sql.js shim (the native lane's
+// runReadBoundaryCase holds the sidecar to the checks below). Each read steps
+// with SQLite refusing writes on the connection; the probe view has a row only
+// while writes are allowed.
+describe('web demo worker reads refuse writes', () => {
+    const PROBE_VIEW = 'CREATE VIEW guard_probe AS SELECT 1 AS writable FROM pragma_query_only WHERE query_only = 0';
+    const SLOW_VIEW = 'CREATE VIEW slow_view AS WITH RECURSIVE n(x) AS ' +
+        '(SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000000) SELECT sum(x) AS total FROM n';
+    const seeded = async (options: { queryTimeout?: number } = {}) => {
+        const worker = await createWorkerHarness(options);
+        await worker.invoke('runQuery',
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, label TEXT); INSERT INTO notes (label) VALUES ('one'), ('two')");
+        return worker;
+    };
+
+    it('holds query_only for every read entry and releases it afterwards', async () => {
+        const worker = await seeded();
+        await worker.invoke('runQuery', PROBE_VIEW);
+        // Control: a statement that is not a read sees a writable connection,
+        // so an empty answer below is the boundary at work.
+        const control = await worker.invoke('runQuery', 'PRAGMA query_only; SELECT count(*) FROM guard_probe');
+        assert.strictEqual(control.at(-1).rows[0][0], 1);
+
+        const page = await worker.invoke('fetchTableData', 'guard_probe', { limit: 100, offset: 0 });
+        assert.strictEqual(page.rows.length, 0, 'grid page');
+        const filtered = await worker.invoke('fetchTableData', 'guard_probe', { limit: 100, offset: 0, globalFilter: '1' });
+        assert.strictEqual(filtered.rows.length, 0, 'filtered grid page');
+        assert.strictEqual((await worker.invoke('fetchTableCount', 'guard_probe', {})).count, 0, 'count');
+        for (const sql of [
+            'SELECT count(*) FROM guard_probe',
+            '/* lead */ WITH probe (writable) AS (SELECT writable FROM guard_probe) SELECT count(*) FROM probe;',
+            'VALUES ((SELECT count(*) FROM guard_probe))'
+        ]) {
+            assert.strictEqual(await workerScalar(worker, sql), 0, sql);
+        }
+        const exported = await worker.invoke('exportTable',
+            { table: 'guard_probe' }, ['writable'], null, null, { format: 'csv', header: false });
+        assert.strictEqual((exported.contentChunks ?? []).join('').trim(), '', 'table export');
+
+        // A statement that starts with WITH can still write, and does.
+        await worker.invoke('runQuery',
+            "WITH added (label) AS (VALUES ('three')) INSERT INTO notes (label) SELECT label FROM added");
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        assert.strictEqual((await worker.invoke('fetchTableCount', 'notes', {})).count, 3);
+    });
+
+    it('releases query_only after a read times out', async () => {
+        const worker = await seeded({ queryTimeout: 200 });
+        await worker.invoke('runQuery', SLOW_VIEW);
+        await assert.rejects(worker.invoke('runQuery', 'SELECT * FROM slow_view'), /timed out/i);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        await worker.invoke('runQuery', "UPDATE notes SET label = 'after the timeout' WHERE id = 1");
+        assert.strictEqual(await workerScalar(worker, 'SELECT label FROM notes WHERE id = 1'), 'after the timeout');
+    });
+});
+
+// importRows is the desktop's CSV/JSON import. Its inserts say OR ABORT, as the
+// worker's other edit writes do, so a row that collides with another row's
+// unique key fails the import instead of deleting that row (REPLACE) or being
+// skipped without notice (IGNORE).
+describe('web demo worker imports under schema ON CONFLICT clauses', () => {
+    for (const clause of ['REPLACE', 'IGNORE']) {
+        it(`refuses an import row that collides under ON CONFLICT ${clause} and keeps the table as it was`, async () => {
+            const worker = await createWorkerHarness();
+            await worker.invoke('runQuery',
+                `CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE ON CONFLICT ${clause}, v TEXT); ` +
+                "INSERT INTO t VALUES (1, 'x', 'keep');");
+            const target = await worker.invoke('getImportTarget', 't');
+            await assert.rejects(
+                worker.invoke('importRows', 't',
+                    [{ id: 2, k: 'new', v: 'a' }, { id: 3, k: 'x', v: 'collides' }],
+                    { expectedSchemaVersion: target.schemaVersion }),
+                /UNIQUE constraint failed/
+            );
+            const rows = (await worker.invoke('runQuery', 'SELECT * FROM t ORDER BY id'))[0].rows;
+            assert.deepStrictEqual(Array.from(rows, (row: unknown[]) => Array.from(row)), [[1, 'x', 'keep']]);
+        });
+    }
+});
+
+// The desktop SQL console types its parameters as SQLite types the same
+// literal, on both engines: a BigInt is an INTEGER over the whole 64-bit range,
+// a number a REAL. sql.js alone would bind 1 as INTEGER and 3000000000 as REAL.
+describe('web demo worker SQL console parameter types and reads', () => {
+    const PROBE_VIEW = 'CREATE VIEW guard_probe AS SELECT 1 AS writable FROM pragma_query_only WHERE query_only = 0';
+    const firstRow = (result: any) => Array.from(result.results.at(-1).rows[0]);
+
+    it('binds a BigInt as an exact INTEGER and a number as a REAL', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('runConsole',
+            'SELECT typeof(?1), typeof(?2), typeof(?3), ?4 = 9223372036854775807, ?2 / 2, ?3 / 2',
+            { params: [3000000000n, 1, 5n, 9223372036854775807n] });
+        assert.strictEqual(result.error, undefined);
+        assert.deepStrictEqual(firstRow(result), ['integer', 'real', 'integer', 1, 0.5, 2]);
+    });
+
+    it('leaves question marks in literals, names and comments alone', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('runConsole',
+            "SELECT '?' AS q, typeof(?) AS t, [?] -- ?\n FROM (SELECT 1 AS [?]) /* ? */",
+            { params: [3000000000n] });
+        assert.strictEqual(result.error, undefined);
+        assert.deepStrictEqual(firstRow(result), ['?', 'integer', 1]);
+    });
+
+    it('numbers named parameters as SQLite does and types them too', async () => {
+        const worker = await createWorkerHarness();
+        // A named parameter takes the next index on its first use, so the bare
+        // ? after it is the second value, not the first.
+        const after = await worker.invoke('runConsole', 'SELECT :a, ?', { params: [3000000000n, 'x'] });
+        assert.strictEqual(after.error, undefined);
+        assert.deepStrictEqual(firstRow(after), [3000000000, 'x']);
+        const typed = await worker.invoke('runConsole',
+            'SELECT typeof(:a), typeof(?), typeof(@b), typeof(:a), typeof($c)',
+            { params: ['x', 3000000000n, 1, 5n] });
+        assert.strictEqual(typed.error, undefined);
+        assert.deepStrictEqual(firstRow(typed), ['text', 'integer', 'real', 'text', 'integer']);
+    });
+
+    it('heads a typed placeholder\'s column with what was typed, not the rewrite', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('runConsole', 'SELECT ?, ?2 + 1, :a, typeof(@b)',
+            { params: [1, 2, 3000000000n, 4] });
+        assert.strictEqual(result.error, undefined);
+        assert.deepStrictEqual(result.results.at(-1).headers, ['?', '?2 + 1', ':a', 'typeof(@b)']);
+    });
+
+    it('keeps a Tcl-style $name(suffix) parameter whole', async () => {
+        const worker = await createWorkerHarness();
+        const result = await worker.invoke('runConsole', 'SELECT typeof($a(x)), typeof(?), $b::c', { params: [1, 3000000000n, 'z'] });
+        assert.strictEqual(result.error, undefined);
+        assert.deepStrictEqual(firstRow(result), ['real', 'integer', 'z']);
+    });
+
+    it('types the parameters of every statement of a script', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE typed (x)');
+        const result = await worker.invoke('runConsole',
+            'INSERT INTO typed VALUES (?); SELECT typeof(x), x = ? FROM typed',
+            { params: [4000000000n] });
+        assert.strictEqual(result.error, undefined);
+        assert.strictEqual(result.mutated, true);
+        assert.deepStrictEqual(firstRow(result), ['integer', 1]);
+    });
+
+    it('runs a SELECT with writes refused and a write as before', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', "CREATE TABLE notes (id INTEGER PRIMARY KEY, label TEXT); " + PROBE_VIEW);
+        // Control: not a read, so the view sees a writable connection.
+        const control = await worker.invoke('runConsole', 'PRAGMA query_only');
+        assert.deepStrictEqual(firstRow(control), [0]);
+        const read = await worker.invoke('runConsole', 'SELECT count(*) FROM guard_probe');
+        assert.deepStrictEqual(firstRow(read), [0]);
+        const script = await worker.invoke('runConsole',
+            "INSERT INTO notes (label) VALUES ('kept'); WITH p AS (SELECT * FROM guard_probe) SELECT count(*) FROM p");
+        assert.strictEqual(script.mutated, true);
+        assert.deepStrictEqual(firstRow(script), [0]);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        assert.strictEqual(await workerScalar(worker, 'SELECT count(*) FROM notes'), 1);
+    });
+
+    it('refuses writes to a read that follows an empty statement too', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', PROBE_VIEW);
+        // The compiled text of the second statement starts with the empty
+        // statement's `;`, which isReadStatement does not read as a read.
+        const script = await worker.invoke('runConsole', 'SELECT 1;; SELECT count(*) FROM guard_probe; ; VALUES ((SELECT count(*) FROM guard_probe))');
+        assert.strictEqual(script.error, undefined);
+        assert.deepStrictEqual(Array.from(script.results, (set: any) => set.rows[0][0]), [1, 0, 0]);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+    });
+});
+
+// A read-only database runs the console's reads, as the extension's query
+// console does. SQLite refuses every write there (query_only is armed for the
+// whole session), and a statement that is not a read is refused by name
+// BEFORE it is compiled: some pragmas act while being prepared (preparing
+// `PRAGMA query_only = 0` disarms the guard without a step), so compiling one
+// and declining to step it would already be too late.
+describe('web demo worker SQL console on a read-only database', () => {
+    const readOnlyWorker = async () => {
+        const writable = await createWorkerHarness();
+        await writable.invoke('runQuery',
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t (v) VALUES ('one'), ('two')");
+        const content = new Uint8Array(await writable.invoke('exportDatabase', 'test.db'));
+        // The engine's own connection: every read path of the worker arms
+        // query_only for its statement when it finds the flag off, so no RPC
+        // can see whether a refused statement disarmed it.
+        const connections: any[] = [];
+        const worker = await createWorkerHarness({
+            readOnlyMode: true,
+            content,
+            initSqlJs: async (config: any) => {
+                const sqlJs = await initSqlJs(config);
+                const Database = new Proxy(sqlJs.Database, {
+                    construct(Target: any, args: any[]): object {
+                        const connection = Reflect.construct(Target, args) as object;
+                        connections.push(connection);
+                        return connection;
+                    }
+                });
+                return { ...sqlJs, Database };
+            }
+        });
+        const image = async () => new Uint8Array(await worker.invoke('exportDatabase', 'test.db'));
+        const queryOnly = () => connections.at(-1).exec('PRAGMA query_only')[0].values[0][0];
+        return { worker, image, before: await image(), queryOnly };
+    };
+    const scalar = async (worker: WorkerHarness, sql: string) =>
+        (await worker.invoke('executeReadQuery', sql)).rows[0][0];
+    // Read back after every refusal: the flags a pragma sets while it is
+    // prepared (foreign_keys, which the worker pins ON, and locking_mode, read
+    // where nothing re-arms them; query_only, read off the connection itself),
+    // an empty temp schema, and the rows.
+    const assertUntouched = async (
+        { worker, queryOnly }: { worker: WorkerHarness; queryOnly: () => unknown },
+        label: string
+    ) => {
+        assert.strictEqual(queryOnly(), 1, `${label}: query_only`);
+        assert.strictEqual(await scalar(worker, 'SELECT foreign_keys FROM pragma_foreign_keys'), 1, `${label}: foreign_keys`);
+        assert.strictEqual(await scalar(worker, 'SELECT locking_mode FROM pragma_locking_mode'), 'normal', `${label}: locking_mode`);
+        assert.strictEqual(await scalar(worker, 'SELECT count(*) FROM sqlite_temp_schema'), 0, `${label}: temp schema`);
+        assert.strictEqual(await scalar(worker, "SELECT group_concat(v, ',') FROM (SELECT v FROM t ORDER BY id)"),
+            'one,two', `${label}: rows`);
+    };
+    const refusal = (index: number, name: string) => new RegExp(
+        `^statement ${index}: ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is unavailable because the database is read-only`
+    );
+
+    it('answers reads, one or a script of them', async () => {
+        const session = await readOnlyWorker();
+        const { worker } = session;
+        const one = await worker.invoke('runConsole', 'SELECT id, v FROM t ORDER BY id');
+        assert.strictEqual(one.error, undefined);
+        assert.strictEqual(one.mutated, false);
+        assert.deepStrictEqual(Array.from(one.results[0].rows, (row: unknown[]) => Array.from(row)), [[1, 'one'], [2, 'two']]);
+        const script = await worker.invoke('runConsole',
+            '-- note\nSELECT count(*) FROM t; ; VALUES (2); /* x */ WITH a (n) AS (SELECT 3) SELECT n FROM a;');
+        assert.strictEqual(script.error, undefined);
+        assert.deepStrictEqual(Array.from(script.results, (set: any) => set.rows[0][0]), [2, 2, 3]);
+        const bound = await worker.invoke('runConsole', 'SELECT v FROM t WHERE id = ?', { params: [2n] });
+        assert.deepStrictEqual(Array.from(bound.results[0].rows[0]), ['two']);
+        await assertUntouched(session, 'reads');
+    });
+
+    it('refuses every statement that is not a read by name, before it runs', async () => {
+        const session = await readOnlyWorker();
+        const { worker, image, before } = session;
+        for (const [sql, name] of [
+            ["INSERT INTO t (v) VALUES ('three')", 'INSERT'],
+            ["UPDATE t SET v = 'x'", 'UPDATE'],
+            ['DELETE FROM t', 'DELETE'],
+            ['PRAGMA query_only = 0', 'PRAGMA'],
+            ['PRAGMA query_only', 'PRAGMA'],
+            ['PRAGMA journal_mode = delete', 'PRAGMA'],
+            ['PRAGMA foreign_keys = OFF', 'PRAGMA'],
+            ['PRAGMA locking_mode = EXCLUSIVE', 'PRAGMA'],
+            ['/* lead */ ;; pragma query_only = off', 'PRAGMA'],
+            ['CREATE TEMP TABLE scratch (a)', 'CREATE'],
+            ["ATTACH DATABASE ':memory:' AS other", 'ATTACH'],
+            ['BEGIN', 'BEGIN'],
+            ['EXPLAIN SELECT 1', 'EXPLAIN'],
+            ['(SELECT 1)', 'This statement'],
+            ["WITH a AS (SELECT 1) INSERT INTO t (v) SELECT 'w' FROM a", 'A WITH statement that is not a SELECT']
+        ]) {
+            const result = await worker.invoke('runConsole', sql);
+            assert.match(result.error ?? '', refusal(1, name), sql);
+            assert.strictEqual(result.mutated, false, sql);
+            assert.strictEqual(result.multiStatement, false, sql);
+            await assertUntouched(session, sql);
+        }
+        // The script's other statements report as any failing script's do: the
+        // statements before the refusal ran, none after it did.
+        const mixed = await worker.invoke('runConsole', "SELECT 1; INSERT INTO t (v) VALUES ('x'); SELECT 2");
+        assert.match(mixed.error ?? '', refusal(2, 'INSERT'));
+        assert.strictEqual(mixed.multiStatement, true);
+        assert.strictEqual(mixed.mutated, false);
+        // The pragma is refused uncompiled, so the guard is still armed for the
+        // INSERT behind it -- which never runs either.
+        const disarm = await worker.invoke('runConsole', "SELECT 1; PRAGMA query_only = 0; INSERT INTO t (v) VALUES ('x')");
+        assert.match(disarm.error ?? '', refusal(2, 'PRAGMA'));
+        const unpin = await worker.invoke('runConsole', 'VALUES (1); PRAGMA foreign_keys = OFF');
+        assert.match(unpin.error ?? '', refusal(2, 'PRAGMA'));
+        await assertUntouched(session, 'mixed scripts');
+        // A capped run leaves a pragma tail uncompiled, as on a writable database.
+        const capped = await worker.invoke('runConsole', 'SELECT 1; PRAGMA foreign_keys = OFF; PRAGMA query_only = 0', { maxStatements: 1 });
+        assert.strictEqual(capped.error, undefined);
+        assert.strictEqual(capped.statementsSkipped, true);
+        await assertUntouched(session, 'capped run');
+        assert.deepStrictEqual(await image(), before);
+    });
+
+    it('reads a Tcl-style variable as SQLite does, and refuses what follows it', async () => {
+        const session = await readOnlyWorker();
+        const { worker, image, before } = session;
+        // SQLite reads `$x(')` as one variable, so this is an INSERT. It starts
+        // with WITH, so it may compile; it is refused before it steps.
+        const insert = await worker.invoke('runConsole',
+            "WITH a AS (SELECT $x(')) INSERT INTO t (v) VALUES ('x') -- ')) SELECT 1");
+        assert.match(insert.error ?? '', refusal(1, 'A WITH statement that is not a SELECT'));
+        assert.strictEqual(insert.mutated, false);
+        // ...and this is three statements: the read runs, and the pragma after
+        // it is refused before it compiles.
+        const split = await worker.invoke('runConsole', "SELECT $a(') ; PRAGMA query_only = 0; SELECT ')");
+        assert.match(split.error ?? '', refusal(2, 'PRAGMA'));
+        assert.strictEqual(split.multiStatement, true);
+        await assertUntouched(session, 'suffixed variables');
+        assert.deepStrictEqual(await image(), before);
+    });
+
+    it('explains a statement without running it', async () => {
+        const session = await readOnlyWorker();
+        const { worker, image, before } = session;
+        const plan = await worker.invoke('runConsole', 'SELECT v FROM t WHERE id = ?', { explain: true, params: [1n] });
+        assert.strictEqual(plan.error, undefined);
+        assert.strictEqual(plan.explain, true);
+        assert.strictEqual(plan.mutated, false);
+        assert.ok(plan.results[0].rows.length > 0);
+        // A plan lists a write's program and never runs it.
+        const dml = await worker.invoke('runConsole', 'DELETE FROM t WHERE id = 1', { explain: true });
+        assert.strictEqual(dml.error, undefined);
+        assert.strictEqual(dml.mutated, false);
+        for (const sql of ['PRAGMA query_only = 0', 'PRAGMA foreign_keys = OFF', 'PRAGMA locking_mode = EXCLUSIVE']) {
+            const pragma = await worker.invoke('runConsole', sql, { explain: true });
+            assert.match(pragma.error ?? '', /PRAGMA statements have no query plan/, sql);
+        }
+        await worker.invoke('runConsole', "SELECT $a(') ; PRAGMA query_only = 0; SELECT ')", { explain: true });
+        await assertUntouched(session, 'explain');
+        assert.deepStrictEqual(await image(), before);
+    });
+});
+
+describe('web demo worker grid reads under the query deadline', () => {
+    const SLOW_VIEW = 'CREATE VIEW slow_view AS WITH RECURSIVE n(x) AS ' +
+        '(SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000000000) SELECT sum(x) AS total FROM n';
+
+    it('fails a page or a count that runs past the deadline, and the database stays usable', async () => {
+        const worker = await createWorkerHarness({ queryTimeout: 200 });
+        await worker.invoke('runQuery', 'CREATE TABLE notes (id INTEGER PRIMARY KEY, label TEXT); ' + SLOW_VIEW);
+        await assert.rejects(worker.invoke('fetchTableData', 'slow_view', { limit: 10, offset: 0 }), /timed out/i);
+        await assert.rejects(worker.invoke('fetchTableCount', 'slow_view', {}), /timed out/i);
+        assert.strictEqual(await workerScalar(worker, 'PRAGMA query_only'), 0);
+        await worker.invoke('runQuery', "INSERT INTO notes (label) VALUES ('after')");
+        assert.strictEqual((await worker.invoke('fetchTableCount', 'notes', {})).count, 1);
+    });
+});
+
+describe('web demo worker undo budgets for cell edits and deletes', () => {
+    const MiB = 1024 * 1024;
+    const cells = async (worker: WorkerHarness, table: string) => (await worker.invoke(
+        'runQuery',
+        `SELECT CAST(rowid AS TEXT), typeof(v), length(CAST(v AS BLOB)), hex(substr(CAST(v AS BLOB), 1, 4)) FROM ${table} ORDER BY rowid`
+    ))[0]?.rows ?? [];
+
+    it('refuses a cell batch whose prior values pass the budget before writing anything', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (v)');
+        await worker.invoke(
+            'runQuery',
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) " +
+            "INSERT INTO t (rowid, v) SELECT i, printf('%.*c', 1048576, 'x') FROM n"
+        );
+        const before = await cells(worker, 't');
+        const updates = [1, 2, 3].map(rowId => ({ rowId, column: 'v', value: 'y' }));
+        // Three 1 MiB TEXT priors count 2 bytes per stored byte: 6 MiB and a key each.
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', updates, null, null, null, null, 6 * MiB),
+            /Batch update undo snapshot exceeds the 6291456-byte memory budget/
+        );
+        assert.deepEqual(await cells(worker, 't'), before);
+
+        const results = await worker.invoke('updateCellBatch', 't', updates, null, null, null, null, 7 * MiB);
+        assert.equal(results.length, 3);
+        assert.deepEqual((await cells(worker, 't')).map((row: unknown[]) => row[2]), [1, 1, 1]);
+    });
+
+    it('reads a null edit limit as absent, as the native JSON lane carries it', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (v)');
+        await worker.invoke('runQuery', `INSERT INTO t (rowid, v) VALUES (1, zeroblob(${DEFAULT_MAX_CELL_EDIT_BYTES + 1}))`);
+        const results = await worker.invoke(
+            'updateCellBatch', 't', [{ rowId: 1, column: 'v', value: 'x' }], null, null, null, null, 64 * MiB
+        );
+        assert.equal(results[0].priorState.value.byteLength, DEFAULT_MAX_CELL_EDIT_BYTES + 1);
+        assert.deepEqual(await cells(worker, 't'), [['1', 'text', 1, '78']]);
+    });
+
+    it('refuses a delete whose row images pass the budget before deleting anything', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE d (v)');
+        await worker.invoke('runQuery', 'INSERT INTO d (rowid, v) VALUES (1, zeroblob(1048576)), (2, zeroblob(1048576))');
+        const before = await cells(worker, 'd');
+        await assert.rejects(
+            worker.invoke('deleteRows', 'd', [1, 2], MiB),
+            /Delete undo snapshot exceeds the 1048576-byte memory budget/
+        );
+        assert.deepEqual(await cells(worker, 'd'), before);
+
+        const deleted = await worker.invoke('deleteRows', 'd', [1, 2], 4 * MiB);
+        assert.equal(deleted.length, 2);
+        assert.deepEqual(await cells(worker, 'd'), []);
+    });
+});
+
+describe('web demo worker undo memory limits name what the edit needs', () => {
+    const MiB = 1024 * 1024;
+    const cells = async (worker: WorkerHarness, table: string) => (await worker.invoke(
+        'runQuery',
+        `SELECT CAST(rowid AS TEXT), typeof(v), length(CAST(v AS BLOB)) FROM ${table} ORDER BY rowid`
+    ))[0]?.rows ?? [];
+    const refusal = (subject: string, limit: number, outcome: string) => new RegExp(
+        `^${subject} needs (\\d+) bytes of undo memory; the limit is ${limit} bytes\\. ` +
+        `.+, or raise the undo memory limit\\. ${outcome}$`
+    );
+    const needed = async (promise: Promise<unknown>, pattern: RegExp) => {
+        const error = await promise.then(() => null, (failure: Error) => failure);
+        assert.ok(error, 'the edit must be refused');
+        const match = pattern.exec(error!.message);
+        assert.ok(match, error!.message);
+        return Number(match![1]);
+    };
+
+    it('a cell batch states the whole entry against the configured limit, never the remainder', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (v)');
+        await worker.invoke(
+            'runQuery',
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3) " +
+            "INSERT INTO t (rowid, v) SELECT i, printf('%.*c', 1048576, 'x') FROM n"
+        );
+        const before = await cells(worker, 't');
+        const updates = [1, 2, 3].map(rowId => ({ rowId, column: 'v', value: 'y' }));
+        // Three 1 MiB TEXT priors at 2 bytes a stored byte, a key each, and the reserve.
+        assert.equal(await needed(
+            worker.invoke('updateCellBatch', 't', updates, null, null, null, null, { limitBytes: 6 * MiB, reservedBytes: 1000 }),
+            refusal('Editing 3 cells in t', 6 * MiB, 'Nothing was changed\\.')
+        ), 1000 + 6 * MiB + 3 * 24);
+        assert.deepEqual(await cells(worker, 't'), before);
+
+        // What the rest of the entry takes may alone pass the limit (a paste of
+        // large new values): the refusal still names what is needed and the limit.
+        const paste = await worker.invoke('updateCellBatch', 't', updates, null, null, null, null,
+            { limitBytes: 1000, reservedBytes: 50000 }).then(() => null, (failure: Error) => failure.message);
+        assert.match(String(paste), /^Editing 3 cells in t needs 6341528 bytes of undo memory; the limit is 1000 bytes\./);
+        assert.doesNotMatch(String(paste), /0-byte/);
+
+        const results = await worker.invoke('updateCellBatch', 't', updates, null, null, null, null,
+            { limitBytes: 7 * MiB, reservedBytes: 1000 });
+        assert.equal(results.length, 3);
+    });
+
+    it('a delete, an insert and an import name what they need against the limit', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE d (v)');
+        await worker.invoke('runQuery', 'INSERT INTO d (rowid, v) VALUES (1, zeroblob(1048576)), (2, zeroblob(1048576))');
+        assert.equal(await needed(
+            worker.invoke('deleteRows', 'd', [1, 2], { limitBytes: MiB, reservedBytes: 100 }),
+            refusal('Deleting 2 rows from d', MiB, 'Nothing was changed\\.')
+        ), 100 + projectDeletedRowEntryBytes({ insertableColumns: ['v'], rowIds: [1, 2], rowCount: 2, valueBytes: 2 * MiB }));
+        assert.equal((await cells(worker, 'd')).length, 2);
+
+        await worker.invoke('runQuery', 'CREATE TABLE t (v)');
+        const inserted = await needed(
+            worker.invoke('insertRowWithHistory', 't', { v: new Uint8Array(MiB) }, 2 * MiB, { limitBytes: 1000, reservedBytes: 10 }),
+            refusal('Inserting a row into t', 1000, 'Nothing was changed\\.')
+        );
+        assert.ok(inserted > MiB, String(inserted));
+        assert.deepEqual(await cells(worker, 't'), []);
+
+        await needed(
+            worker.invoke('importRows', 't', [{ v: 'a'.repeat(1000) }, { v: 'b'.repeat(1000) }],
+                { maxUndoSnapshotBytes: { limitBytes: 1000, reservedBytes: 10 } }),
+            refusal('Importing 2 rows into t', 1000, 'No rows were imported\\.')
+        );
+        assert.deepEqual(await cells(worker, 't'), []);
+    });
+
+    it('names the setting its host says the user can raise', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (v)');
+        await worker.invoke('runQuery', "INSERT INTO t (rowid, v) VALUES (1, 'x')");
+        const setting = "'maxUndoMemory' in settings.json";
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: 1, column: 'v', value: 'y' }], null, null, null, null,
+                { limitBytes: 10, reservedBytes: 10, setting }),
+            { message: "Editing a cell in t needs 36 bytes of undo memory; the limit is 10 bytes. Edit fewer cells at a time, or raise 'maxUndoMemory' in settings.json. Nothing was changed." }
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 't', [1], { limitBytes: 10, reservedBytes: 10, setting: 7 }),
+            /undo memory limit's setting must be a short description/
+        );
+    });
+
+    it('does not advise raising a limit its host says is already the largest', async () => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', 'CREATE TABLE t (v)');
+        await worker.invoke('runQuery', "INSERT INTO t (rowid, v) VALUES (1, 'x')");
+        const setting = "'maxUndoMemory' in settings.json";
+        await assert.rejects(
+            worker.invoke('updateCellBatch', 't', [{ rowId: 1, column: 'v', value: 'y' }], null, null, null, null,
+                { limitBytes: 10, reservedBytes: 10, setting, raisable: false }),
+            { message: "Editing a cell in t needs 36 bytes of undo memory; the limit is 10 bytes, the largest 'maxUndoMemory' in settings.json allows. Edit fewer cells at a time. Nothing was changed." }
+        );
+        await assert.rejects(
+            worker.invoke('deleteRows', 't', [1], { limitBytes: 10, reservedBytes: 10, setting, raisable: 'no' }),
+            /undo memory limit's raisable must be false when given/
+        );
+    });
+});
+
+describe('web demo worker undo memory limits count the identities an edit changes', () => {
+    // desktop-host.js cellBatchUndoBudget's reserve and buildModification's entry, mirrored.
+    const reserveOf = (table: string, updates: Array<Record<string, any>>) => estimateUndoMemoryBytes({
+        label: 'Edit', description: 'Edit', modificationType: 'cell_update', targetTable: table,
+        affectedCells: updates.map(update => ({
+            rowId: update.rowId, newRowId: update.rowId, columnName: update.column, newValue: update.value,
+            priorState: { storageClass: 'null', value: null }, postState: { storageClass: 'text', value: update.value }, operation: 'set'
+        }))
+    });
+    const entryOf = (table: string, result: Array<Record<string, any>>) => estimateUndoMemoryBytes({
+        label: 'Edit', description: 'Edit', modificationType: 'cell_update', targetTable: table,
+        affectedCells: result.map(cell => ({
+            rowId: cell.rowId, newRowId: cell.newRowId ?? cell.rowId, columnName: cell.columnName, newValue: cell.newValue,
+            priorState: cell.priorState, postState: cell.postState, operation: cell.operation
+        }))
+    });
+    /** The real entry's size, from an edit under an ample limit on a fresh copy. */
+    const realEntry = async (seed: string, table: string, updates: Array<Record<string, any>>) => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', seed);
+        const result = await worker.invoke('updateCellBatch', table, updates, null, null, null, null,
+            { limitBytes: 512 * 1024 * 1024, reservedBytes: reserveOf(table, updates) });
+        return entryOf(table, result);
+    };
+    const attempt = async (seed: string, table: string, updates: Array<Record<string, any>>, limitBytes: number) => {
+        const worker = await createWorkerHarness();
+        await worker.invoke('runQuery', seed);
+        return worker.invoke('updateCellBatch', table, updates, null, null, null, null,
+            { limitBytes, reservedBytes: reserveOf(table, updates) }).then(() => 'accepted', (error: Error) => error.message);
+    };
+
+    it('a primary-key edit is held to the size of its new key, not the old one', async () => {
+        const seed = "CREATE TABLE p (k TEXT PRIMARY KEY, v) WITHOUT ROWID; INSERT INTO p VALUES ('a', 1);";
+        const rowId = encodePrimaryKeyRecordId([{ identifier: 'k', declaredType: 'TEXT', position: 1 }], ['a']);
+        const updates = [{ rowId, column: 'k', value: '\u4e2d'.repeat(100000) }, { rowId, column: 'v', value: 2 }];
+        const real = await realEntry(seed, 'p', updates);
+        // Each cell keeps the new key's record id: 9 URI characters a CJK character.
+        assert.ok(real > 2 * 100000 * 18, String(real));
+        assert.match(await attempt(seed, 'p', updates, real - 1), /needs \d+ bytes of undo memory; the limit is/);
+        assert.equal(await attempt(seed, 'p', updates, real + 4096), 'accepted');
+    });
+
+    it('a rowid moved to a long decimal identity is held to it', async () => {
+        const seed = "CREATE TABLE t (id INTEGER PRIMARY KEY, v); INSERT INTO t VALUES (1, 'x');";
+        const updates = [{ rowId: 1, column: 'id', value: '4611686018427387904' }, { rowId: 1, column: 'v', value: 'y' }];
+        const real = await realEntry(seed, 't', updates);
+        assert.match(await attempt(seed, 't', updates, real - 1), /needs \d+ bytes of undo memory/);
+        assert.equal(await attempt(seed, 't', updates, real + 4096), 'accepted');
+    });
+
+    it('an insert is held to the entry that keeps its identity twice', async () => {
+        // An ASCII key: TEXT values are counted at two bytes per stored UTF-8
+        // byte, which over-counts any other text, so only ASCII is exact.
+        const reserved = estimateUndoMemoryBytes({
+            label: 'Insert row', description: 'Insert row', modificationType: 'row_insert', targetTable: 'p', targetRowId: null, insertedRow: null
+        });
+        const insert = async (limitBytes: number) => {
+            const worker = await createWorkerHarness();
+            await worker.invoke('runQuery', 'CREATE TABLE p (k TEXT PRIMARY KEY, v) WITHOUT ROWID');
+            return worker.invoke('insertRowWithHistory', 'p', { k: 'k'.repeat(100000), v: 1 }, 16 * 1024 * 1024,
+                { limitBytes, reservedBytes: reserved });
+        };
+        const result = await insert(512 * 1024 * 1024);
+        const real = estimateUndoMemoryBytes({
+            label: 'Insert row', description: 'Insert row', modificationType: 'row_insert', targetTable: 'p',
+            targetRowId: result.rowId, insertedRow: result
+        });
+        await assert.rejects(insert(real - 1), /needs \d+ bytes of undo memory/);
+        assert.ok(await insert(real + 4096));
+    });
+    it('a delete is held to the entry its rows make', async () => {
+        const reserved = estimateUndoMemoryBytes({
+            label: 'Delete rows', description: 'Delete rows', modificationType: 'row_delete', targetTable: 'd', deletedRows: []
+        });
+        const remove = async (limitBytes: number) => {
+            const worker = await createWorkerHarness();
+            await worker.invoke('runQuery', "CREATE TABLE d (a INTEGER, b TEXT, c BLOB); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) INSERT INTO d SELECT i, 'row ' || i, zeroblob(i) FROM n");
+            return worker.invoke('deleteRows', 'd', Array.from({ length: 500 }, (_, index) => index + 1), { limitBytes, reservedBytes: reserved });
+        };
+        const deleted = await remove(512 * 1024 * 1024);
+        const real = estimateUndoMemoryBytes({
+            label: 'Delete rows', description: 'Delete rows', modificationType: 'row_delete', targetTable: 'd', deletedRows: deleted
+        });
+        await assert.rejects(remove(real - 1), /needs \d+ bytes of undo memory/);
+        // Every column is counted with the longest storage-class name
+        // ('integer'): 6 bytes over for each TEXT or BLOB cell, and no more.
+        assert.equal((await remove(real + 500 * 2 * 6)).length, 500);
+    });
+});

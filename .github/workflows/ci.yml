@@ -1,9 +1,13 @@
 name: CI
 
-# The committed viewer-dist/ carries the Apple Silicon macOS native runtime, so
-# the shell is tested on the platform those artifacts were built for. Other
-# targets need their native artifacts synced from the upstream pin first (see
-# CONTRIBUTING.md); installed-app checks remain manual (docs/*-release-qa.md).
+# viewer-dist/ is committed for Apple Silicon macOS and is what viewer/ builds:
+# every job checks that, so a source change committed without its rebuilt
+# output fails on all three systems. The script and viewer tests run on all
+# three as well; the shell's unit tests and clippy too, because its lock,
+# file-identity and session code differs per system. The native lane (the
+# real tjs engine through the shipped sidecar bundle) runs on macOS. The
+# --ignored live-sidecar tests are not run here. Installed-app checks remain
+# manual (docs/qa/).
 on:
   pull_request:
   push:
@@ -15,6 +19,12 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # The live lock tests drive sqlite3 as a second process. Where it is
+  # missing they skip, which in CI would read as a pass; this makes it a
+  # failure instead, on every runner.
+  SQLX_REQUIRE_SQLITE3: '1'
 
 jobs:
   test:
@@ -33,11 +43,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify viewer artifacts against the manifest
-        run: node scripts/sync-viewer.mjs --verify
+      - name: The committed viewer-dist is what viewer/ builds
+        run: |
+          node scripts/build-viewer.mjs --verify
+          node scripts/build-viewer.mjs --check
 
-      - name: Script tests
+      - name: Type-check the viewer
+        run: npm run typecheck:viewer
+
+      - name: Script and viewer tests
         run: npm test
+
+      - name: Native lane (the real engine through the shipped sidecar bundle)
+        run: npm run native-lane
 
       # Pinned so a new stable's lints cannot turn `-D warnings` red on an
       # unchanged tree; bump together with the notices' Rust inventory.
@@ -49,6 +67,90 @@ jobs:
       # A dependency bump fails here until the inventory and notices cover it.
       - name: Third-party notices match the release dependency graph
         run: node scripts/release/notices.mjs
+
+      # macOS ships sqlite3 (/usr/bin/sqlite3) for the live lock tests.
+      - name: The sqlite3 the live lock tests use
+        run: sqlite3 -version
+
+      - name: Shell unit tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  shell:
+    name: Shell tests & lint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # sqlite3 from sqlite.org's own tools build, pinned by sha256 (the
+          # download page publishes SHA3-256; both were checked against it).
+          - os: ubuntu-latest
+            sqlite-tools: sqlite-tools-linux-x64-3540100.zip
+            sqlite-tools-sha256: a21062b333c7d66d7d8c42054c0fab1c1899729185289ad14bd4f25f9f576d14
+          - os: windows-latest
+            sqlite-tools: sqlite-tools-win-x64-3540100.zip
+            sqlite-tools-sha256: fb20997ade5583a5fbf1e36db7bc3c82c9416b3f314f16961e1572aa4e49487d
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same packages release.yml builds the Linux app with.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev libsm-dev libice-dev patchelf file
+
+      - name: Install sqlite3 3.54.1 for the live lock tests
+        env:
+          ZIP: ${{ matrix.sqlite-tools }}
+          SHA256: ${{ matrix.sqlite-tools-sha256 }}
+        run: |
+          dir="$RUNNER_TEMP/sqlite-tools"
+          mkdir -p "$dir/bin"
+          curl -fsSL --retry 3 -o "$dir/$ZIP" "https://www.sqlite.org/2026/$ZIP"
+          echo "$SHA256  $dir/$ZIP" | sha256sum -c -
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z x -y -o"$dir/bin" "$dir/$ZIP" > /dev/null
+            cygpath -w "$dir/bin" >> "$GITHUB_PATH"
+          else
+            unzip -q "$dir/$ZIP" -d "$dir/bin"
+            chmod +x "$dir/bin/sqlite3"
+            echo "$dir/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: The sqlite3 the live lock tests use
+        run: sqlite3 -version
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The same bytes from a Linux or Windows checkout as from the macOS one.
+      - name: The committed viewer-dist is what viewer/ builds
+        run: node scripts/build-viewer.mjs --check --target aarch64-macos
+
+      - name: Script and viewer tests
+        run: npm test
+
+      # Pinned with the macOS job's toolchain (see there).
+      - name: Install Rust 1.93.0
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal --component clippy
+          rustup default 1.93.0
 
       - name: Shell unit tests
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib

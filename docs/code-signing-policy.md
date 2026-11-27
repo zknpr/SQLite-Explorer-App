@@ -1,11 +1,12 @@
 # Code signing policy
 
 Every release package is built by the [release workflow](../.github/workflows/release.yml)
-on GitHub-hosted runners from a tagged commit of this repository. The viewer and
-native runtime come from the exact
-[SQLite Explorer extension](https://github.com/zknpr/SQLite-Explorer) commit
-recorded in `viewer-dist/manifest.json`. Releases are drafted automatically and
-published by a maintainer.
+on GitHub-hosted runners from a tagged commit of this repository, the viewer
+included: each runner builds it from `viewer/` in that commit. The native
+database engine (`tjs`, built by the
+[zknpr/txiki.js](https://github.com/zknpr/txiki.js) fork's own workflow) and
+the query-plan library are prebuilt binaries under `viewer/natives/`, pinned
+by SHA-256. Releases are drafted automatically and published by a maintainer.
 
 ## Current signing status
 
@@ -30,10 +31,13 @@ On Windows, use the PowerShell `Get-FileHash` command from the release notes.
 ### Windows: what signing will and will not cover
 
 Once signing is approved, the application executable and the installer will be
-signed. The bundled native database engine (`tjs.exe`, from the
-[txiki.js](https://github.com/zknpr/txiki.js) runtime) and its query-plan
-library are built by another project and stay unsigned inside the signed
-installer, as the SignPath Foundation's terms allow for upstream binaries.
+signed. The bundled native database engine (`tjs.exe`, built by the
+[zknpr/txiki.js](https://github.com/zknpr/txiki.js) fork's workflow) stays
+unsigned inside the signed installer, as the SignPath Foundation's terms allow
+for upstream binaries. The query-plan library (`query-plan.dll`) is built
+from this repository's source, but outside the release workflow, so it is not
+signed either; whether SignPath accepts it as it is, or the workflow must build
+it, is still open.
 
 Windows **Smart App Control** blocks unsigned programs and offers no per-app
 override. While it is on, the current unsigned installer cannot run. After

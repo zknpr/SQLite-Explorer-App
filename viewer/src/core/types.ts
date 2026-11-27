@@ -1,0 +1,964 @@
+/**
+ * Core Type Definitions for SQLite Explorer
+ *
+ * Contains all type definitions used throughout the extension.
+ * Uses a consistent naming scheme different from external libraries.
+ */
+
+// ============================================================================
+// Primitive Types
+// ============================================================================
+
+/**
+ * Content type information for cell values.
+ * Used when opening cell editors to determine file extension and handling.
+ */
+export interface CellContentType {
+  /** MIME type (e.g., 'image/png', 'application/json') */
+  mime?: string;
+  /** File extension (e.g., 'png', 'json') */
+  ext?: string;
+  /** Content type category or SQL type name */
+  type?: string;
+}
+
+/**
+ * Represents any value that can be stored in a SQLite cell.
+ * Includes text, integers, floats, binary data, and NULL.
+ */
+export type CellValue = string | number | bigint | null | Uint8Array;
+
+/**
+ * Sparse exact SQLite text for numeric cells whose Number transport is lossy
+ * (unsafe INTEGERs) or whose REAL text differs from JavaScript formatting.
+ */
+export type ExactIntegerTextMap = Record<number, Record<number, string>>;
+
+/** SQLite storage classes whose grid values can require bounded previews. */
+export type OversizedCellStorageClass = 'text' | 'blob';
+
+/** Exact source metadata for one grid cell whose transported value is a preview. */
+export interface OversizedCellMetadata {
+  storageClass: OversizedCellStorageClass;
+  byteLength: number;
+}
+
+/** Sparse row/column metadata for cells bounded at the query boundary. */
+export type OversizedCellMap = Record<number, Record<number, OversizedCellMetadata>>;
+
+/** Stable logical address for one table cell. */
+export interface CellReadTarget {
+  table: string;
+  rowId: RecordId;
+  column: string;
+}
+
+/** SQLite storage classes returned by typeof(). */
+export type CellStorageClass = 'null' | 'integer' | 'real' | 'text' | 'blob';
+
+/** Exact value and SQLite storage class used to guard cell-history replay. */
+export interface StoredCellState {
+  storageClass: CellStorageClass;
+  value: CellValue;
+  /** Present only when malformed TEXT cannot round-trip through a JS string. */
+  rawTextBytes?: Uint8Array;
+}
+
+/** Database encoding used by byte-windowed TEXT reads. */
+export type CellTextEncoding = 'utf-8' | 'utf-16le' | 'utf-16be';
+
+/** Source metadata captured without transporting the complete cell. */
+export interface CellMetadata {
+  storageClass: CellStorageClass;
+  /** Number of bytes in SQLite's database encoding. */
+  byteLength: number;
+  /** Present only for TEXT, whose byte windows must be decoded as a stream. */
+  textEncoding?: CellTextEncoding;
+}
+
+/** Opaque handle for a snapshot-consistent sequence of bounded reads. */
+export interface CellReadSession {
+  sessionId: string;
+  metadata: CellMetadata;
+  /** Epoch milliseconds for the current idle/absolute expiry boundary. */
+  expiresAt: number;
+}
+
+/** One bounded database-encoded byte window. */
+export interface CellReadChunk {
+  byteOffset: number;
+  bytes: Uint8Array;
+  done: boolean;
+}
+
+/** Persistence metadata returned when a save replaces a paged engine's base. */
+export interface DatabaseWriteResult {
+  /** The current engine still reads the frozen pre-save inode and must be reopened. */
+  requiresReopen: boolean;
+}
+
+/** Sparse reasons for rows that cannot safely be mutated from their grid identity. */
+export type ReadOnlyRowReasonMap = Record<number, string>;
+
+/** Page relationship of a keyset (seek) fetch to its anchor row. */
+export type KeysetNavigationMode = 'first' | 'after' | 'atOrAfter' | 'before' | 'last';
+
+/**
+ * Webview request to fetch a page by seeking from an engine-issued anchor
+ * instead of scanning to OFFSET. The webview is untrusted: engines strictly
+ * re-validate the anchor (canonical decode + query-identity tag) and fall back
+ * to the unchanged LIMIT/OFFSET query on any mismatch.
+ */
+export interface KeysetPaginationRequest {
+  mode: KeysetNavigationMode;
+  /** Opaque anchor token from a prior page; required for after/atOrAfter/before. */
+  anchor?: string;
+  /** Exact row count of the final page. Omit when the total is only an upper bound. */
+  lastPageRowCount?: number;
+}
+
+/** Opaque seek anchors for the first and last rows of a fetched page. */
+export interface KeysetAnchorSet {
+  first?: string;
+  last?: string;
+}
+
+/**
+ * Unique identifier for a database row.
+ * Can be numeric ROWID or string for compatibility.
+ */
+export type RecordId = string | number;
+
+/** One declared member of a WITHOUT ROWID table's ordered primary key. */
+export interface PrimaryKeyColumn {
+  identifier: string;
+  declaredType: string;
+  position: number;
+  /** The collation the primary key compares this member with, when read from the schema. */
+  collation?: string;
+}
+
+/** The database identity mechanism for rows in one table. */
+export type TableIdentity =
+  | { kind: 'rowid' }
+  | { kind: 'primaryKey'; columns: PrimaryKeyColumn[] };
+
+// ============================================================================
+// Query Types
+// ============================================================================
+
+/**
+ * Result set from a database query execution.
+ * Contains column headers and row data.
+ * Internal engines retain multiple naming conventions for compatibility:
+ * - headers/rows: Primary naming convention
+ * - columns/values: sql.js compatible aliases
+ * HostBridge projects webview-bound results to the canonical headers/rows pair.
+ */
+export interface QueryResultSet {
+  /** Column names in order (primary naming) */
+  headers: string[];
+  /** Row data as 2D array (primary naming) */
+  rows: CellValue[][];
+  /** Sparse row/column sidecar for numeric text lost by the number-based grid contract. */
+  exactIntegerTexts?: ExactIntegerTextMap;
+  /** Sparse source metadata for TEXT/BLOB values returned as bounded previews. */
+  oversizedCells?: OversizedCellMap;
+  /** Rows whose database identity was deliberately not transported. */
+  readOnlyRowReasons?: ReadOnlyRowReasonMap;
+  /** Engine-issued seek anchors for this page; present only for anchorable tables. */
+  keysetAnchors?: KeysetAnchorSet;
+  /** Column names - sql.js compatible internal alias */
+  columns?: string[];
+  /** Row data - sql.js compatible internal alias */
+  values?: CellValue[][];
+  /** Column names - webview schema query compatibility */
+  columnNames?: string[];
+  /** Row data - webview schema query compatibility (core/ui/viewer.html) */
+  records?: CellValue[][];
+}
+
+/** Canonical result DTO crossing from HostBridge into the webview. */
+export type WebviewQueryResultSet = Omit<QueryResultSet, 'values' | 'records'>;
+
+/**
+ * Column metadata from PRAGMA table_xinfo.
+ */
+export interface ColumnMetadata {
+  /** Column index (0-based) */
+  ordinal: number;
+  /** Column name */
+  identifier: string;
+  /** Declared type */
+  declaredType: string;
+  /** NOT NULL constraint flag */
+  isRequired: number;
+  /** Default value expression */
+  defaultExpression: CellValue;
+  /** Primary key position (0 if not PK) */
+  primaryKeyPosition: number;
+  /** True for VIRTUAL or STORED generated columns, which SQLite computes. */
+  isGenerated?: boolean;
+  /** True only when this exact INTEGER PRIMARY KEY aliases the table rowid. */
+  isRowidAlias?: boolean;
+  /** The collation a WITHOUT ROWID primary key compares this member with. */
+  primaryKeyCollation?: string;
+}
+
+/**
+ * Table metadata for schema display.
+ */
+export interface TableMetadata {
+  /** Table name */
+  identifier: string;
+  /** Number of columns */
+  columnCount?: number;
+  /** Declared identity captured while loading the schema. */
+  identity?: TableIdentity;
+}
+
+/**
+ * View metadata for schema display.
+ */
+export interface ViewMetadata {
+  /** View name */
+  identifier: string;
+}
+
+/**
+ * SQL definition for an INSTEAD OF trigger attached to a view.
+ */
+export interface ViewTriggerDefinition {
+  /** Trigger name */
+  identifier: string;
+  /** Original CREATE TRIGGER statement from sqlite_schema */
+  sql: string;
+  /** True when the trigger belongs to the connection-local temp schema. */
+  temporary?: boolean;
+}
+
+/**
+ * Complete definition needed to recreate a view without losing its triggers.
+ */
+export interface ViewDefinition {
+  /** View name */
+  identifier: string;
+  /** Original CREATE VIEW statement from sqlite_schema */
+  sql: string;
+  /** SELECT body editable by the user */
+  selectSql: string;
+  /** Verbatim explicit output column-list SQL, including parentheses. */
+  columnListSql?: string;
+  /** Legacy reconstructed output names retained for serialized history compatibility. */
+  columns?: string[];
+  /** INSTEAD OF triggers owned by the view */
+  triggers: ViewTriggerDefinition[];
+  /**
+   * Unqualified TEMP trigger candidates whose historical target cannot be
+   * recovered while a same-named TEMP view shadows this main-schema view.
+   * Browsing remains available, but destructive view mutations must reject.
+   */
+  ambiguousTemporaryTriggerNames?: string[];
+}
+
+/** Whether validation/preview is for a new view or an existing replacement. */
+export type ViewDefinitionIntent = 'create' | 'edit';
+
+/**
+ * Atomic view replacement result used by undo/redo tracking.
+ */
+export interface ViewEditResult {
+  before: ViewDefinition;
+  after: ViewDefinition;
+}
+
+/**
+ * Index metadata for schema display.
+ */
+export interface IndexMetadata {
+  /** Index name */
+  identifier: string;
+  /** Parent table name */
+  parentTable: string;
+}
+
+/**
+ * Complete database schema structure.
+ */
+export interface SchemaSnapshot {
+  /** All tables in database */
+  tables: TableMetadata[];
+  /** All views in database */
+  views: ViewMetadata[];
+  /** All indexes in database */
+  indexes: IndexMetadata[];
+  /**
+   * Whether main or TEMP holds a trigger or a virtual table. Without either,
+   * a cell edit cannot change any table's row count, so the webview keeps
+   * those counts.
+   */
+  hasTriggers?: boolean;
+}
+
+// ============================================================================
+// Edit Tracking Types
+// ============================================================================
+
+/**
+ * Types of database modifications that can be tracked.
+ */
+export type ModificationType =
+  | 'cell_update'
+  | 'row_insert'
+  | 'row_delete'
+  | 'table_create'
+  | 'column_add'
+  | 'column_drop'
+  | 'view_create'
+  | 'view_edit'
+  | 'view_drop'
+  | 'pragma_update';
+
+/**
+ * How a cell value should be applied when replaying a cell update.
+ */
+export type CellUpdateOperation = 'set' | 'json_patch';
+
+/** One persistent schema object attached to a table and recreated by column-drop undo. */
+export interface ColumnDropSchemaObject {
+  type: 'index' | 'trigger';
+  identifier: string;
+  sql: string;
+}
+
+/** Exact table state on one side of a guarded column-drop history transition. */
+export interface ColumnDropTableState {
+  tableSql: string;
+  /** All visible schema columns in their SQLite ordinal order. */
+  columns: string[];
+  /** Generated columns omitted from INSERT...SELECT during a table rebuild. */
+  generatedColumns?: string[];
+  /** Connection-local SQLite data_version used to reject external row writes. */
+  dataVersion?: number;
+  identity: TableIdentity;
+  schemaObjects: ColumnDropSchemaObject[];
+}
+
+/** Pre/post schema pair required to rebuild a dropped column in its original position. */
+export interface ColumnDropSnapshot {
+  before: ColumnDropTableState;
+  after: ColumnDropTableState;
+}
+
+/**
+ * Record of a single database modification for undo/redo.
+ */
+export interface ModificationEntry {
+  /** Human-readable description */
+  description: string;
+  /** Type of modification */
+  modificationType: ModificationType;
+  /** Affected table name */
+  targetTable?: string;
+  /** Affected row ID */
+  targetRowId?: RecordId;
+  /** Row identity after this cell update. */
+  newTargetRowId?: RecordId;
+  /** Affected column name */
+  targetColumn?: string;
+  /** Database-persistent PRAGMA changed by a paged writable overlay. */
+  targetPragma?: string;
+  /** Value before modification */
+  priorValue?: CellValue;
+  /** Value after modification */
+  newValue?: CellValue;
+  /** Exact stored value before a guarded cell update; absent in legacy history. */
+  priorState?: StoredCellState;
+  /** Exact stored value after a guarded cell update; absent in legacy history. */
+  postState?: StoredCellState;
+  /** Cell update operation; missing values from older backups are treated as set. */
+  operation?: CellUpdateOperation;
+  /**
+   * A forward-only edit that cannot be crossed by in-memory undo. Stage D uses
+   * this when the prior cell was intentionally never materialized. A future
+   * file-backed snapshot can hook in here by replacing the barrier with a
+   * checksummed prior-value reference and a restorable undo policy.
+   */
+  undoPolicy?: 'barrier';
+  /** Why an edit is intentionally forward-only in the in-memory history. */
+  undoBarrierKind?: 'oversized_cell' | 'persistent_pragma';
+  /** Raw SQL executed */
+  executedQuery?: string;
+  /** Multiple affected rows */
+  affectedRowIds?: RecordId[];
+  /** Multiple affected cells (for batch updates) */
+  affectedCells?: {
+    rowId: RecordId;
+    /** Row identity after this update; omitted for legacy and unchanged identities. */
+    newRowId?: RecordId;
+    columnName: string;
+    priorValue?: CellValue;
+    newValue?: CellValue;
+    /** Exact stored value before this update; absent in legacy history. */
+    priorState?: StoredCellState;
+    /** Exact stored value after this update; absent in legacy history. */
+    postState?: StoredCellState;
+    /** Per-cell operation; missing values from older backups are treated as set. */
+    operation?: CellUpdateOperation;
+  }[];
+  /** Row data for insert/delete undo/redo */
+  rowData?: Record<string, CellValue>;
+  /** Authoritative post-insert row required for guarded undo/redo. */
+  insertedRow?: DeletedRow;
+  /** Authoritative post-images for one atomic, guarded bulk insert. */
+  insertedRows?: DeletedRow[];
+  /**
+   * Exact post-images of every row ONE bulk import inserted (a `row_insert`
+   * entry with many rows). A compact twin of `DeletedRow[]`: a 100,000-row
+   * import has to fit the undo memory budget and, on the desktop's native
+   * engine, a single 16 MiB response frame, which per-row
+   * `{column, storageClass}` pairs would not — see `ImportedRowSnapshots`.
+   */
+  importedRows?: ImportedRowSnapshots;
+  /** Multiple deleted rows data */
+  deletedRows?: DeletedRow[];
+  /** Table definition for create/drop undo/redo */
+  tableDef?: { columns: ColumnDefinition[]; options?: CreateTableOptions };
+  /** Exact post-create schema required before table_create undo may drop the table. */
+  tableCreateSnapshot?: ColumnDropTableState;
+  /** Column definition for add/drop undo/redo */
+  columnDef?: { type: string; defaultValue?: string };
+  /** Exact post-add schema required before column_add undo may drop the column. */
+  columnAddSnapshot?: ColumnDropTableState;
+  /** Exact pre-add schema required before column_add redo may alter the table. */
+  columnAddBeforeSnapshot?: ColumnDropTableState;
+  /** Deleted columns data for column_drop undo */
+  deletedColumns?: {
+      name: string;
+      type: string;
+      data: { rowId: RecordId; value: CellValue }[];
+      /**
+       * One storage-class letter per data entry (columnDropValueStates); a
+       * TEXT value is then its bytes when they are not plain UTF-8. History
+       * from older versions has none and restores values as given.
+       */
+      storageClasses?: string;
+  }[];
+  /** Exact guarded schema transition for positional column-drop undo. */
+  columnDropSnapshot?: ColumnDropSnapshot;
+  /** Indexes dropped before a column_drop; missing values from older backups mean none. */
+  droppedIndexes?: string[];
+  /** View definition before an edit/drop. */
+  viewDefBefore?: ViewDefinition;
+  /** View definition after a create/edit. */
+  viewDefAfter?: ViewDefinition;
+}
+
+/**
+ * Extended modification entry with UI label.
+ */
+export interface LabeledModification extends ModificationEntry {
+  /** Short label for undo/redo menu */
+  label: string;
+}
+
+// ============================================================================
+// Database Interface Types
+// ============================================================================
+
+/** Opaque handle for a bounded, incrementally stepped SELECT statement. */
+export interface QueryReadSession {
+  sessionId: string;
+}
+
+/** One bounded batch from an open query read session. */
+export interface QueryReadChunk {
+  rows: CellValue[][];
+  done: boolean;
+}
+
+/**
+ * Interface for database operations exposed by worker.
+ */
+export interface DatabaseOperations {
+  /** Engine type identifier: 'wasm' for sql.js, 'native' for txiki-js */
+  readonly engineKind: Promise<'wasm' | 'native'>;
+
+  /**
+   * Hold one SQLite read snapshot, and the public operation queue when present,
+   * for a multi-call read such as a streaming export.
+   */
+  runReadSnapshot?<T>(
+    operation: (snapshotOperations: DatabaseOperations) => Promise<T>
+  ): Promise<T>;
+
+  /**
+   * Whether the runtime's cell helpers can be called on this connection and
+   * read its TEXT as stored, which holds only for a UTF-8 database. The
+   * native engine loads them on first use.
+   */
+  prepareCellHelpers?(): Promise<boolean>;
+
+  /**
+   * Execute one bounded SELECT or its query plan; never a write/script.
+   * Unlike the other methods, a bigint parameter binds as INTEGER and every
+   * number as REAL, whole or not, as the console's literals are typed
+   * (parseQueryParameters).
+   */
+  executeReadQuery(sql: string, params?: CellValue[], explain?: boolean, signal?: AbortSignal): Promise<QueryResultSet>;
+
+  /** Execute SQL query */
+  executeQuery(
+    sql: string,
+    params?: CellValue[],
+    signal?: AbortSignal
+  ): Promise<QueryResultSet[]>;
+
+  /** Read exact cell metadata without materializing its value. */
+  getCellMetadata(target: CellReadTarget): Promise<CellMetadata>;
+
+  /** Open a bounded, auto-expiring snapshot read bracket for one cell. */
+  openCellReadSession(target: CellReadTarget): Promise<CellReadSession>;
+
+  /** Read a bounded byte window from an open snapshot session. */
+  readCellChunk(
+    sessionId: string,
+    byteOffset: number,
+    maxBytes: number
+  ): Promise<CellReadChunk>;
+
+  /** Idempotently release a snapshot read bracket. */
+  closeCellReadSession(sessionId: string): Promise<void>;
+
+  /** Open one SELECT for incremental reads when the backend exposes a cursor. */
+  openQueryReadSession?(sql: string): Promise<QueryReadSession>;
+
+  /**
+   * Step a bounded number of rows from an open query read session. With
+   * maxBytes, the read also stops after the row that brings its values to
+   * that many bytes, so rows of unknown size can be read in batches.
+   */
+  readQueryRows?(sessionId: string, maxRows: number, maxBytes?: number): Promise<QueryReadChunk>;
+
+  /** Idempotently finalize an incremental query read session. */
+  closeQueryReadSession?(sessionId: string): Promise<void>;
+
+  /** Export database to binary */
+  serializeDatabase(signal?: AbortSignal): Promise<Uint8Array>;
+
+  /** Apply pending modifications */
+  applyModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+
+  /** Undo a single modification */
+  undoModification(mod: ModificationEntry): Promise<void>;
+
+  /** Redo a single modification */
+  redoModification(mod: ModificationEntry): Promise<void>;
+
+  /** Persist all changes */
+  flushChanges(signal?: AbortSignal): Promise<void>;
+
+  /** Discard pending changes */
+  discardModifications(mods: ModificationEntry[], signal?: AbortSignal): Promise<void>;
+
+  /**
+   * Move the live database to its saved checkpoint in one atomic transition.
+   * `discard` is undone newest-first; `restore` is replayed in the given order.
+   */
+  revertModifications?(
+    discard: ModificationEntry[],
+    restore: ModificationEntry[],
+    signal?: AbortSignal
+  ): Promise<void>;
+
+  /** Update a single cell value */
+  updateCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    patch?: string,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
+
+  /** Atomically replace a confirmed oversized prior without materializing it. */
+  replaceOversizedCell(
+    table: string,
+    rowId: RecordId,
+    column: string,
+    value: CellValue,
+    expected: OversizedCellMetadata,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | void>;
+
+  /** Insert a new row */
+  insertRow(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number
+  ): Promise<RecordId | undefined>;
+
+  /** Insert and capture the authoritative post-image before releasing SQLite. */
+  insertRowWithHistory?(
+    table: string,
+    data: Record<string, CellValue>,
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow>;
+
+  /**
+   * Insert rows atomically with the same guards and post-image history as
+   * insertRowWithHistory. maxUndoSnapshotBytes is the budget for all returned
+   * snapshots, accounted in order like successive single-row calls.
+   */
+  insertRowsWithHistory?(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
+
+  /** Insert multiple rows in a batch */
+  insertRowBatch(
+    table: string,
+    rows: Record<string, CellValue>[],
+    maxEditValueBytes?: number
+  ): Promise<void>;
+
+  /** Delete rows by ID, optionally refusing before an oversized exact undo snapshot. */
+  deleteRows(
+    table: string,
+    rowIds: RecordId[],
+    maxUndoSnapshotBytes?: number
+  ): Promise<DeletedRow[]>;
+
+  /** Delete columns by name */
+  deleteColumns(
+    table: string,
+    columns: string[],
+    dropDependentIndexes?: string[],
+    expectedCurrentState?: ColumnDropTableState
+  ): Promise<ColumnDropTableState>;
+
+  /** Find indexes that depend on specific columns */
+  findDependentIndexes(table: string, columns: string[]): Promise<string[]>;
+
+  /** Create a new table */
+  createTable(table: string, columns: ColumnDefinition[], options?: CreateTableOptions): Promise<ColumnDropTableState>;
+
+  /** Read a view and the INSTEAD OF triggers that must survive replacement. */
+  getViewDefinition(view: string): Promise<ViewDefinition>;
+
+  /** Compile a proposed SELECT body without changing the schema. */
+  validateViewDefinition(
+    view: string,
+    selectSql: string,
+    intent?: ViewDefinitionIntent
+  ): Promise<void>;
+
+  /** Compile and execute a bounded preview of a proposed SELECT body. */
+  previewViewDefinition(
+    view: string,
+    selectSql: string,
+    limit?: number,
+    intent?: ViewDefinitionIntent,
+    signal?: AbortSignal
+  ): Promise<QueryResultSet>;
+
+  /** Create a view from a SELECT body. */
+  createView(view: string, selectSql: string): Promise<ViewDefinition>;
+
+  /** Atomically replace a view, optionally guarded by its expected stored definition. */
+  editView(
+    view: string,
+    selectSql: string,
+    preserveTriggers?: boolean,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewEditResult>;
+
+  /** Drop a view and return its undo definition, optionally guarded by a confirmed snapshot. */
+  dropView(
+    view: string,
+    expectedSql?: string,
+    expectedTriggers?: readonly ViewTriggerDefinition[]
+  ): Promise<ViewDefinition>;
+
+  /** Update multiple cells in a batch */
+  updateCellBatch(
+    table: string,
+    updates: CellUpdate[],
+    maxEditValueBytes?: number,
+    maxUndoSnapshotBytes?: number
+  ): Promise<CellUpdateResult[]>;
+
+  /** Add a new column to a table */
+  addColumn(
+    table: string,
+    column: string,
+    type: string,
+    defaultValue?: string,
+    expectedCurrentState?: ColumnDropTableState
+  ): Promise<ColumnDropTableState>;
+
+  /** Fetch table data */
+  fetchTableData(table: string, options: TableQueryOptions): Promise<QueryResultSet>;
+
+  /** Fetch an exact row count or a safe upper bound. */
+  fetchTableCount(table: string, options: TableCountOptions): Promise<TableCountResult>;
+
+  /** Fetch database schema */
+  fetchSchema(): Promise<SchemaSnapshot>;
+
+  /** Get table metadata (columns) */
+  getTableInfo(table: string): Promise<ColumnMetadata[]>;
+
+  /** Get PRAGMA settings */
+  getPragmas(): Promise<Record<string, CellValue>>;
+
+  /** Set PRAGMA value */
+  setPragma(pragma: string, value: CellValue): Promise<void>;
+
+  /** Test database connection */
+  ping(): Promise<boolean>;
+
+  /** Write database directly to file system (optimization) */
+  writeToFile(path: string, signal?: AbortSignal): Promise<DatabaseWriteResult | void>;
+}
+
+/**
+ * Represents a single cell update.
+ */
+export interface CellUpdate {
+  rowId: RecordId;
+  column: string;
+  value: CellValue;
+  originalValue?: CellValue;
+  operation?: CellUpdateOperation;
+}
+
+/** Authoritative before/after state captured by an atomic batch update. */
+export interface CellUpdateResult {
+  rowId: RecordId;
+  /** Row identity to use after this update. */
+  newRowId?: RecordId;
+  columnName: string;
+  priorValue?: CellValue;
+  newValue?: CellValue;
+  priorState: StoredCellState;
+  postState: StoredCellState;
+  operation: CellUpdateOperation;
+}
+
+/** Full row state captured atomically before deletion. */
+export interface DeletedRow {
+  rowId: RecordId;
+  row: Record<string, CellValue>;
+  /** Exact storage classes paired with `row`; absent in legacy history. */
+  storageClasses?: Array<{ column: string; storageClass: CellStorageClass }>;
+}
+
+/**
+ * Exact post-images of the rows one bulk import inserted, stored once per
+ * batch rather than once per row. `columns` are the table's insertable columns
+ * in snapshot order; each row's `values` are parallel to them and `pattern`
+ * indexes `storageClassPatterns`, the distinct per-column storage-class rows
+ * the batch produced (most imports have exactly one). Expanding a row back to a
+ * `DeletedRow` is `Object.fromEntries` over `columns`/`values` plus the
+ * pattern's classes, which is what the replay engines do before reusing the
+ * row-history delete/restore paths.
+ */
+export interface ImportedRowSnapshots {
+  columns: string[];
+  storageClassPatterns: CellStorageClass[][];
+  rows: ImportedRowSnapshot[];
+}
+
+/** One row of {@link ImportedRowSnapshots}. */
+export interface ImportedRowSnapshot {
+  rowId: RecordId;
+  values: CellValue[];
+  pattern: number;
+}
+
+/**
+ * Definition for a new column when creating a table.
+ */
+export interface ColumnDefinition {
+  name: string;
+  type: string;
+  primaryKey: boolean;
+  notNull: boolean;
+  defaultValue?: string;
+}
+
+export interface CreateTableOptions {
+  withoutRowid?: boolean;
+}
+
+// ============================================================================
+// Read Query Types
+// ============================================================================
+
+export interface TableQueryOptions {
+  columns?: string[];
+  /** Displayed columns eligible for the global filter, excluding identity-only SELECT fields. */
+  globalFilterColumns?: string[];
+  orderBy?: string;
+  /** Internal stable ordering for identities composed from more than one column. */
+  orderByColumns?: string[];
+  orderDir?: 'ASC' | 'DESC';
+  limit?: number;
+  offset?: number;
+  /**
+   * Rows per page of the paging this request belongs to, when `limit` can be
+   * lower: the grid bounds a final page's LIMIT to the rows its count leaves.
+   * Keyset anchors are tagged with it, so they stay valid across such a page.
+   * Omitted, the page size is `limit`.
+   */
+  pageSize?: number;
+  filters?: {
+    column: string;
+    value: string;
+  }[];
+  globalFilter?: string;
+  /**
+   * Keyset (seek) navigation request. When the engine validates it, the page
+   * is fetched by anchor predicate and `offset` is ignored; otherwise the
+   * LIMIT/OFFSET query runs byte-identical to a request without this field.
+   */
+  keyset?: KeysetPaginationRequest;
+  /** Maximum source bytes transported inline for any one TEXT/BLOB grid cell. */
+  maxInlineCellBytes?: number;
+  /** Maximum aggregate inline-cell preview bytes allocated across one page. */
+  maxPageResponseBytes?: number;
+}
+
+export interface TableCountOptions {
+  columns?: string[];
+  /** Displayed columns eligible for the global filter, matching TableQueryOptions. */
+  globalFilterColumns?: string[];
+  filters?: {
+    column: string;
+    value: string;
+  }[];
+  globalFilter?: string;
+}
+
+/** Count value plus the semantic distinction required for safe page math. */
+export interface TableCountResult {
+  count: number;
+  isExact: boolean;
+}
+
+// ============================================================================
+// Export Types
+// ============================================================================
+
+/**
+ * Parameters identifying the database and table for export.
+ */
+export interface DbParams {
+  /** Database filename */
+  filename?: string;
+  /** Table name to export */
+  table: string;
+  /** Schema/display name */
+  name?: string;
+  /** Document URI */
+  uri?: string;
+}
+
+/**
+ * Options controlling export format and behavior.
+ */
+export interface ExportOptions {
+  /** Output format */
+  format?: string;
+  /** Include column header row */
+  header?: boolean;
+  /** Include table name in SQL output */
+  includeTableName?: boolean;
+  /** Specific row IDs to export */
+  rowIds?: RecordId[];
+}
+
+// ============================================================================
+// Worker Communication Types
+// ============================================================================
+
+/**
+ * Configuration for initializing a database connection.
+ */
+export interface DatabaseInitConfig {
+  /** Database binary content */
+  content: Uint8Array | null;
+  /** Path to database file (for direct reading in worker) */
+  filePath?: string;
+  /** Refusal cap in bytes when an in-memory open would be required; 0 = unlimited. */
+  maxSize: number;
+  /** Path mappings for resources */
+  resourceMap?: Record<string, string>;
+  /** Pre-loaded WASM module */
+  wasmBinary?: Uint8Array;
+  /** Open in read-only mode */
+  readOnlyMode?: boolean;
+  /** Query execution timeout in milliseconds */
+  queryTimeout?: number;
+  /**
+   * Desktop worker only: permit page-on-demand opens for local `filePath`
+   * inputs above the dedicated paging threshold. Set by workerFactory after
+   * its sibling `-wal` gate; writable paging is preferred, then read-only
+   * paging, then the ordinary maxSize refusal or in-memory fallback.
+   */
+  allowPagedFallback?: boolean;
+  /** Internal/test override for the paging threshold; not a user setting. */
+  pagedOpenThresholdBytes?: number;
+  /** Internal/test override for the paged exact-count gate; not a user setting. */
+  pagedExactCountMaxFileBytes?: number;
+  /** Internal/test override; not exposed as a user setting. */
+  cellReadSessionIdleTimeoutMs?: number;
+  /** Internal/test override; not exposed as a user setting. */
+  cellReadSessionAbsoluteTimeoutMs?: number;
+}
+
+/**
+ * Result from database initialization.
+ */
+export interface DatabaseInitResult {
+  /** Database operations handle */
+  operations?: DatabaseOperations;
+  /** Whether opened in read-only mode */
+  isReadOnly: boolean;
+  /**
+   * How the database is backed: 'memory' (bytes in the WASM filesystem —
+   * the editable buffer path) or 'paged' (page-on-demand host reads, backed
+   * by either a writable overlay or a read-only snapshot). Absent from older
+   * workers; treat as 'memory'.
+   */
+  storage?: 'memory' | 'paged';
+}
+
+// ============================================================================
+// Dialog Types
+// ============================================================================
+
+/**
+ * Options for modal dialogs.
+ */
+export interface DialogConfig {
+  /** Show as modal dialog */
+  modal?: boolean;
+  /** Additional detail text */
+  detailText?: string;
+}
+
+/**
+ * Button in a dialog.
+ */
+export interface DialogButton {
+  /** Button label */
+  caption: string;
+  /** Whether clicking closes dialog */
+  isCloseAction?: boolean;
+}

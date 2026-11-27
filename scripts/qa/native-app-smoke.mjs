@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run inside a Linux/Windows guest against its installed app and native WebDriver.
+// Run on a Linux or Windows machine against its installed app and native WebDriver.
 // No bridge stubs: independent SQLite reads verify the file behind the UI.
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';

@@ -1,12 +1,13 @@
 node_modules/
 .worktrees/
 src-tauri/target/
-docs/superpowers/
 .DS_Store
-.superpowers/
-
-# Playwright MCP scratch (page snapshots, console logs) — debugging artifacts, never source
-.playwright-mcp/
+# A build's staging folder and the previous viewer-dist it moves aside (scripts/build-viewer.mjs);
+# a killed build can leave them, and the next build repairs or removes them.
+/.viewer-dist.build-*/
 
 # Local installers and QA evidence.
 artifacts/
+# Viewer build output and test scratch (viewer/scripts/build.mjs, viewer tests)
+viewer/dist/
+viewer/.tmp/

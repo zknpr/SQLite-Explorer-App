@@ -1,13 +1,13 @@
 # SQLite Explorer
 
 A desktop application for browsing and editing SQLite databases on macOS,
-Linux and Windows. It shares its viewer with the
-[SQLite Explorer VS Code extension](https://github.com/zknpr/SQLite-Explorer)
-and runs in a Tauri desktop shell.
+Linux and Windows: a Tauri shell around a web viewer. The viewer began as the
+one in the [SQLite Explorer VS Code extension](https://github.com/zknpr/SQLite-Explorer)
+(its v1.9.0) and is developed here, in `viewer/`; this repository builds the
+whole app.
 
-The current desktop version is **0.3.2**, integrating the extension's **1.8.3**
-release and desktop-specific fixes. Packages for macOS, Linux and Windows are
-attached to each [release](https://github.com/zknpr/SQLite-Explorer-App/releases);
+The current desktop version is **0.4.0**. Packages for macOS, Linux and Windows
+are attached to each [release](https://github.com/zknpr/SQLite-Explorer-App/releases);
 see [Install](#install). See [release readiness](docs/release-readiness.md) for
 the remaining distribution gates.
 
@@ -26,14 +26,14 @@ refuse; retain pending work with a separate export before reloading.
 
 ## Platform status
 
-| Platform tested | Package | Coverage |
-| --- | --- | --- |
-| macOS, Apple Silicon | `.app` | Native/WASM workflows; remaining OS checks are recorded in [macOS QA](docs/macos-release-qa.md) |
-| Ubuntu 24.04, x86-64, Xfce/X11 | Debian package | Installed-app checks, shutdown/restart |
-| Windows 11, x86-64 | NSIS installer | Installed-app checks, shutdown/restart and post-boot saves |
+| Platform tested | Package | Last checked | Coverage |
+| --- | --- | --- | --- |
+| macOS, Apple Silicon | `.app` | 0.4.0 | Native and WASM engines, SQL console, multiple windows and reload refusal in a QA build; the release bundle's signature |
+| Ubuntu 24.04, x86-64, Xfce/X11 | Debian package | 0.4.0 | Installed-app smoke checks and a real-input regression; shutdown/restart last on 0.2.0 |
+| Windows 11, x86-64 | NSIS installer | 0.4.0 | Installed-app smoke checks and a real-input regression; shutdown/restart and post-boot saves last on 0.2.0 |
 
-See [Linux and Windows QA](docs/linux-windows-release-qa.md) for tested package
-hashes and limits. Other Linux desktops and Wayland remain unverified. Linux
+The [QA records](docs/qa/README.md) list what each release was checked for.
+Other Linux desktops and Wayland remain unverified. Linux
 session-end cancellation requires a working inherited XSMP session connection.
 Forced termination or power loss cannot preserve unsaved edits.
 
@@ -78,9 +78,9 @@ offers no override, so the installer cannot run there. To uninstall, use
 sudo apt install ./SQLite-Explorer-<version>-linux-amd64.deb
 ```
 
-To uninstall, run `sudo apt remove sq-lite-explorer` (the package name Tauri
-derives from the product name). AppImage packages are not
-provided.
+To uninstall, run `sudo apt remove sqlite-explorer`. Releases before 0.4.0
+were packaged as `sq-lite-explorer`; installing 0.4.0 replaces that package.
+AppImage packages are not provided.
 
 ## Build from a checkout
 
@@ -91,24 +91,17 @@ and `libice-dev` on Ubuntu.
 
 ```sh
 npm ci
-node scripts/sync-viewer.mjs --verify
+npm run build:viewer
 ```
 
-`viewer-dist/manifest.json` identifies the viewer source commit, native target
-and file hashes. The committed native binaries target **Apple Silicon macOS**.
-On that target, the checked-in viewer is enough to build the shell. For any
-other target, first sync from a checkout containing the exact source commit:
+`npm run build:viewer` builds the viewer from `viewer/` into `viewer-dist/`,
+with the native engine for the machine it runs on, and checks it against the
+shell. `viewer-dist/` is committed as built for **Apple Silicon macOS**, so on
+that target the checkout is enough; `npm run check:viewer` confirms the
+committed files are what `viewer/` builds. `viewer-dist/manifest.json`
+records the native target and every file's hash.
 
-```sh
-git clone --branch desktop-dev-port https://github.com/zknpr/SQLite-Explorer ../SQLite-Explorer
-node scripts/sync-viewer.mjs --source ../SQLite-Explorer --ref b7cf55aece690860c2c1be7e498b0503e7ff18de
-node scripts/sync-viewer.mjs --verify
-```
-
-The pin is on the extension repository's `desktop-dev-port` branch.
-Substituting the extension's `v1.8.3` tag omits the desktop fixes validated here.
-
-Build on the destination OS and CPU:
+Test on the destination OS and CPU:
 
 ```sh
 npm test
@@ -122,23 +115,24 @@ npm run tauri build
 ```
 
 Packages appear under `src-tauri/target/release/bundle/`: `.app` and DMG on
-macOS, Debian on Linux and NSIS on Windows. `src-tauri/tauri.macos.conf.json`
+macOS, Debian on Linux and NSIS on Windows. A local Linux build keeps the Debian
+package name Tauri derives, `sq-lite-explorer`; the release workflow renames it
+`sqlite-explorer` (`scripts/release/deb-control.mjs`). `src-tauri/tauri.macos.conf.json`
 signs the macOS app ad-hoc with the hardened runtime, which seals its resources
 so `codesign --verify --deep --strict` passes; it is not Developer ID signing or
-notarization. Selecting another native target in the sync script stages its
-resources; it does not cross-compile the app.
+notarization. Building the viewer for another `--target` stages that target's
+engine; it does not cross-compile the app.
 
 Release packages are built by the [release workflow](.github/workflows/release.yml),
-which runs these steps on each OS from the pinned viewer source and drafts a
-release for a `v*` tag.
+which runs these steps on each OS and drafts a release for a `v*` tag.
 
 For development, run `npm run tauri dev`. Packaged-app checks are still required
 for native dialogs, OS integration and the custom asset protocol.
 
 ## Contributing and license
 
-[CONTRIBUTING.md](CONTRIBUTING.md) explains the two-repository source layout,
-artifact regeneration and validation. Report reproducible app bugs through
+[CONTRIBUTING.md](CONTRIBUTING.md) explains the source layout, how the viewer
+is built and checked, and validation. Report reproducible app bugs through
 [GitHub issues](https://github.com/zknpr/SQLite-Explorer-App/issues), including the
 OS, app version, selected database engine and a small synthetic database when
 possible. Avoid attaching private databases. Report security vulnerabilities

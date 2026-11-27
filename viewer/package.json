@@ -1,0 +1,5 @@
+{
+  "name": "sqlite-explorer-desktop-viewer",
+  "private": true,
+  "description": "The desktop viewer sources. No \"type\": like the extension repository they come from, plain .js files here are CommonJS to Node, which the vendored sql.js bundle relies on; the build and the tests run them through esbuild and tsx."
+}

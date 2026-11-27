@@ -11,17 +11,19 @@
  * - the inventory's Cargo components are exactly the packages a release build
  *   resolves (`cargo metadata` with default features, all targets). The test-only
  *   `qa-webdriver` feature is not in a release, so it is not resolved;
- * - the inventory was built for the viewer pin that viewer-dist/ ships (the
- *   viewer's JS graph and the native runtime both come from that pin);
+ * - the inventory's viewer npm components are exactly the packages the viewer
+ *   build bundles (viewer/scripts/build.mjs viewerNpmPackages), at the versions
+ *   it builds with;
  * - every inventoried component appears in THIRD_PARTY_NOTICES.txt.
  *
- * On failure, regenerate the inventory and notices for the new graph (see
+ * On failure, update the inventory and notices by hand for the new graph (see
  * third-party/README.md) rather than editing this check.
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { viewerNpmPackages } from '../../viewer/scripts/build.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -34,7 +36,7 @@ export function releaseCargoPackages(metadata) {
     .map((pkg) => `${pkg.name} ${pkg.version}`));
 }
 
-export function checkNotices({ releasePackages, inventory, noticesText, viewerRef }) {
+export function checkNotices({ releasePackages, inventory, noticesText, viewerPackages }) {
   const problems = [];
   const cargo = new Set(inventory.components.filter((c) => c.ecosystem === 'Cargo').map((c) => c.component));
   for (const pkg of [...releasePackages].sort()) {
@@ -43,8 +45,12 @@ export function checkNotices({ releasePackages, inventory, noticesText, viewerRe
   for (const pkg of [...cargo].sort()) {
     if (!releasePackages.has(pkg)) problems.push(`inventory lists ${pkg}, which a release no longer ships`);
   }
-  if (inventory.viewerSource !== viewerRef) {
-    problems.push(`inventory was built for viewer ${inventory.viewerSource}, but viewer-dist is pinned to ${viewerRef}`);
+  const viewer = new Set(inventory.components.filter((c) => c.ecosystem === 'viewer npm').map((c) => c.component));
+  for (const pkg of [...viewerPackages].sort()) {
+    if (!viewer.has(pkg)) problems.push(`the viewer bundles ${pkg}, which the inventory and notices omit`);
+  }
+  for (const pkg of [...viewer].sort()) {
+    if (!viewerPackages.has(pkg)) problems.push(`inventory lists ${pkg}, which the viewer no longer bundles`);
   }
   for (const { component } of inventory.components) {
     if (!noticesText.includes(component)) problems.push(`THIRD_PARTY_NOTICES.txt has no section for ${component}`);
@@ -52,7 +58,7 @@ export function checkNotices({ releasePackages, inventory, noticesText, viewerRe
   return problems;
 }
 
-function main() {
+async function main() {
   const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--locked', '--format-version', '1',
     '--manifest-path', path.join(repoRoot, 'src-tauri', 'Cargo.toml')], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }));
   const read = (file) => fs.readFileSync(path.join(repoRoot, file), 'utf8');
@@ -60,16 +66,16 @@ function main() {
     releasePackages: releaseCargoPackages(metadata),
     inventory: JSON.parse(read('third-party/inventory.json')),
     noticesText: read('THIRD_PARTY_NOTICES.txt'),
-    viewerRef: JSON.parse(read('viewer-dist/manifest.json')).ref
+    viewerPackages: await viewerNpmPackages()
   });
   if (problems.length > 0) {
     for (const problem of problems) console.error(`notices: ${problem}`);
-    console.error(`notices: ${problems.length} problem(s); regenerate third-party/inventory.json and THIRD_PARTY_NOTICES.txt`);
+    console.error(`notices: ${problems.length} problem(s); update third-party/inventory.json and THIRD_PARTY_NOTICES.txt (third-party/README.md)`);
     process.exit(1);
   }
-  console.log('notices: inventory and notices match the release dependency graph and viewer pin');
+  console.log('notices: inventory and notices match the release dependency graph and the viewer build');
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  main();
+  await main();
 }

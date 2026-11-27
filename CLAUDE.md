@@ -1,17 +1,27 @@
-# SQLite Explorer — Desktop Shell
+# SQLite Explorer — Desktop App
 
-Thin Tauri v2 shell around the extension repo's `desktop/` build target. The viewer UI,
-worker, and sql.js runtime are **generated upstream** (`../SQLite-Explorer`, `node
-scripts/build.mjs`) and synced here — never hand-edit `viewer-dist/`.
+Tauri v2 shell (`src-tauri/`) around a web viewer whose sources live in `viewer/`
+(imported from the SQLite Explorer extension's desktop port of v1.9.0, developed here
+since; nothing syncs from the extension). `npm run build:viewer` builds them into
+`viewer-dist/` — never hand-edit `viewer-dist/`.
 
 ## Architecture
 
-- `viewer-dist/` — synced upstream artifacts (`viewer.html`, `worker.js`, `sql-wasm.{js,wasm}`,
-  `codicons/`, `dev-harness.html`) + a sha256 `manifest.json`. Produced by
-  `scripts/sync-viewer.mjs`, never by hand.
-- `src-tauri/` — the shell (Rust, Tauri v2). Owns the window, the native menus (File:
-  Open / Open Recent / Save / Export / Import CSV/JSON / Refresh; Edit: native items; View: Theme submenu, Zoom
-  ⌘+/⌘−/⌘0, Toggle Developer Tools in debug builds only; Window: predefined items),
+- `viewer/` — the viewer's sources: the page (`core/ui`, entry `desktop-viewer.js`), the
+  native engine bridge (`core/native`), the shared TypeScript core (`src/core`), the WASM
+  worker (`worker/worker.js`), sql.js and the query-plan library
+  (`vendor/`, `src/runtime/query-plan.c`), the pinned engine binaries (`natives/<target>/`),
+  the unit tests (`tests/unit`) and the native lane. `viewer/scripts/build.mjs` is the
+  esbuild build.
+- `viewer-dist/` — the built viewer: `web/` (`viewer.html`, `worker.js`, `sql-wasm.{js,wasm}`,
+  `codicons/`; the app's embedded pages, `frontendDist`), `native/` (the engine, bundled as
+  resources and never served) and a sha256 `manifest.json`, written by
+  `scripts/build-viewer.mjs`, never by hand. Committed as built for `aarch64-macos`; CI
+  requires `npm run check:viewer` to reproduce it byte for byte.
+- `src-tauri/` — the shell (Rust, Tauri v2). Owns the window, the native menus (app menu: About / Hide /
+  Quit; File: Open in New Window / Open / Open Recent / Save / Export / Import CSV/JSON /
+  Refresh From Disk; Edit: native items; View: Theme submenu, SQL Console, Zoom ⌘+/⌘−/⌘0,
+  Toggle Developer Tools in debug builds only; Window: predefined items),
   dialog-mediated file access behind a **session allowlist**, atomic saves, the settings
   store, zoom persistence, the recents store, Finder file associations
   (`bundle.fileAssociations` mirrors `DB_EXTENSIONS` — a cargo test holds them in
@@ -34,20 +44,31 @@ scripts/build.mjs`) and synced here — never hand-edit `viewer-dist/`.
   `native/query-plan.dylib` beside `tjs` on the same database connection; the shell
   requires the library, binary, and worker before reporting native availability.
 
-The UI's only backend seam is `core/ui/modules/api.js` upstream; the desktop build swaps in
+The UI's only backend seam is `viewer/core/ui/modules/api.js`; the build swaps in
 `desktop-api.js` (esbuild `onResolve`), which calls an in-page `desktop-host.js` that owns
 the worker, the `ModificationTracker` undo/redo history, and file I/O via the bridge.
 
 ## Commands
 
-- `npm run sync-viewer -- --local` — pull artifacts from the sibling checkout's working tree
-- `npm run sync-viewer -- --ref <commit>` — pull from a pinned upstream commit
-- `node scripts/sync-viewer.mjs --verify` — check `viewer-dist/` against its manifest
+- `npm ci`, then `npm run build:viewer` — build `viewer/` into `viewer-dist/` with this
+  machine's engine (`-- --target <t>` for another: `aarch64-macos`, `x86_64-macos`,
+  `aarch64-linux-gnu`, `x86_64-linux-gnu`, `x86_64-windows`). All-or-nothing: it stages
+  beside `viewer-dist/`, runs every check there (the `KNOWN_METHODS` and transfer pins
+  against `native.rs` included), then swaps by rename, so a failed build leaves
+  `viewer-dist/` byte-identical.
+- `npm run check:viewer` — fail unless `viewer/` builds the committed `viewer-dist/` byte for
+  byte (CI runs it on every OS with `--target aarch64-macos`)
+- `node scripts/build-viewer.mjs --verify` — check `viewer-dist/` against its manifest
 - `npm run tauri dev` — fast iteration, **but serves over localhost with NO CSP**
 - `cargo run --features tauri/custom-protocol` (from `src-tauri/`) — the real `tauri://`
   asset protocol with CSP enforced. **Use this to verify any CSP / asset-protocol claim** —
   `tauri dev` cannot.
-- `npm test` — sync-script tests; `cd src-tauri && cargo test --lib` — shell unit tests.
+- `npm test` — script tests (`scripts/`, `scripts/release/`) and the viewer's unit tests
+  (`viewer/tests/unit`); `npm run typecheck:viewer` — tsc over `viewer/`; `npm run
+  native-lane` — the real tjs engine through the built sidecar bundle; `cd src-tauri &&
+  cargo test --lib` — shell unit tests.
+  The live lock tests drive `sqlite3` and skip without it; `SQLX_REQUIRE_SQLITE3=1` (set by
+  CI on every runner, macOS, Linux and Windows) turns that skip into a failure.
   `cargo test --lib -- --ignored` also runs three live-sidecar tests and one runtime-pool measurement.
 - `npm run test:gui` — headless Chrome checks against `viewer-dist/` and the real WASM
   worker, with isolated fixtures, saved-byte checks via sqlite3, screenshots and an
@@ -58,7 +79,7 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   refuses any synthetic event while another app is frontmost, `wait-idle.sh` + `winid.swift`
   + `islocked.swift` gate a scripted batch on the human being away and capture the app window
   by CGWindowID only, `smoke-checklist.md` is the macOS pass) — must fully pass
-  before a release. Steps 21-22 need a **bundled app**
+  before a release. Steps 21-22, 57-67, 69 and 80 need a **bundled app**
   (`npm run tauri build -- --debug`): LaunchServices only registers `.app` bundles, never the
   bare `cargo run` binary — and stale registrations from raw dev binaries can intercept
   Finder opens with a "(null)" permission error (`lsregister -f <the .app>` to clean).
@@ -81,7 +102,16 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   in `tauri dev` only); `blob:` is judged by its embedded origin. CSP `connect-src` does
   not cover navigation, so without it a compromised page exfiltrates through `location`.
   A plugin hook runs for every webview, so `db-<n>` windows cannot be built without it.
-  `window.open` is already refused: no new-window handler is installed.
+  `window.open` is already refused: no new-window handler is installed. The same hook
+  refuses a document load on the app's own origin (a reload: WebView2's F5 and Ctrl+R, a
+  context menu's Reload, `location.reload()`) while the window's page reports unsaved
+  work (`navigation_refusal`): the document's heap is where every pending edit lives,
+  and the shell reaps the window's sidecars on the next page load.
+- **Windows menu shortcuts** (`shell_keys.rs`): a focused WebView2 sends its keys to
+  the browser process, so no menu accelerator fires. WebView2's `AcceleratorKeyPressed`
+  takes the ones the viewer's own keydown handler does not (Quit, New Window, Refresh,
+  SQL Console, Minimize) and swallows the browser's reload keys. It sees real key
+  presses only, so the page gains nothing it can call.
 - **Windows request pin** (`request_pin.rs`): WebView2 SENDS a refused navigation's request.
   `NavigationStarting` is cancelled synchronously and the page stays, but `location.href`,
   `location.assign`, link clicks and meta refresh still delivered their URL to a foreign
@@ -123,9 +153,36 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   pair). A push can only ever narrow or widen its OWN window's set, never touch another's,
   and never the native flag. Never claim on a read without an expiry: the shell has no
   "the page closed this database" signal, and a hold with no release breaks
-  close-then-reopen-elsewhere for the session.
+  close-then-reopen-elsewhere for the session. The registry and the WASM save's
+  generations are keyed by canonical path, so a file whose location the volume will not
+  resolve (`canonicalize` failing with anything but NotFound: some Windows RAM disks never
+  answer) cannot be guarded and is refused by name (`resolved_for_guard`,
+  `ERR_FILE_UNRESOLVABLE`) at the WASM read, its in-place save and a Save As adoption; a
+  launch argument or a page-reported open path that cannot be resolved is told to the user
+  in a dialog rather than dropped on stderr. A Save As or export destination is refused
+  (`destination_refusal`) when its volume resolves it to an open database or to a journal
+  file (`-wal`, `-shm`, `-journal`) one has now, or resolves it minus a journal suffix to
+  an open database; and, whatever is open, when its name ends in a journal suffix (the
+  spelling rule below) and the name that suffix leaves is a regular file, or a link to
+  one (`ERR_DESTINATION_JOURNAL_NAME`), since SQLite reads such a file as part of that
+  database. Nothing there, a folder, or a link to nothing admits it (`trip-journal` with
+  no `trip`, `notes-journal` beside a folder `notes`); any other lookup failure refuses. Entries are looked up with no final-component follow and compared by
+  identity (device + inode, volume serial + file id; FAT32 and exFAT, which refuse
+  `FileIdInfo`, give the 32-bit serial + 64-bit file index instead), so for every EXISTING file the
+  volume's own case and Unicode folding decide (APFS folds U+017F onto s: `x.db-ſhm` is
+  the live `x.db-shm`). A journal name that does not exist yet is matched by
+  spelling: the suffix in any ASCII case, with U+017F also taken as s (the one non-ASCII
+  spelling APFS folds onto a suffix letter); why, and what was not measured, is in
+  `open_database_refusal`'s comment. On Windows every one of these rules judges the name
+  Win32 will write (`win32_final_name`): trailing dots and spaces dropped and a trailing
+  `::$DATA` taken as the file, so `x.db-shm.` is `x.db-shm`; a name with any other `:`
+  names a data stream and is refused (`ERR_DESTINATION_STREAM`); and when something is
+  already at the name, its long name (`GetLongPathNameW`) is judged too, so an 8.3 short
+  name of a journal file draws the journal file's refusal. Not on Unix, where those
+  characters are part of the name. Only NotFound clears a name; any
+  other lookup failure refuses (`ERR_DESTINATION_UNCHECKED`).
 - **Import sources are a READ-ONLY grant on their own list.** CSV/JSON import
-  (`pick_import_source` / `read_import_text`, upstream `import-data.js`) keeps picked
+  (`pick_import_source` / `read_import_text`, `viewer/core/ui/modules/import-data.js`) keeps picked
   files on `ImportSourceAllowlist`, never `SessionAllowlist` and never the recents: the
   session list is a read-AND-write grant (`save_database` overwrites any path on it),
   and an import source must not become a file a compromised page can rewrite or reopen
@@ -159,7 +216,34 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   the descriptor's full generation (dev, ino, size, mtime, ctime) per window and
   `save_database` refuses (`ERR_FILE_CHANGED`) unless the file is still exactly that
   generation — writing a stale image back would discard another writer's changes. The
-  connection is not retired there; Export and Reload are the remedies.
+  connection is not retired there; Export and Reload are the remedies. A WAL writer
+  changes only its `-wal` until it checkpoints, which no generation sees, so the WASM
+  read and save also refuse a file with a log beside it (`log_beside`: a `-wal` holding
+  frames, another process's WAL-mode connection — its shared lock on byte 128 of the
+  `-shm`, which a TRUNCATE checkpoint's empty `-wal` cannot show, or in EXCLUSIVE
+  locking mode, which keeps no `-shm`, a write lock on SQLite's shared byte range of
+  the main file (`0x40000002`, 510 bytes) under a header whose version bytes say WAL —
+  or a journal whose
+  header still has the magic; every log is opened without blocking and judged by its
+  descriptor), and `destination_refusal` refuses the same beside a Save As or export
+  destination's own name (`log_beside_destination`: the write replaces a link rather
+  than follow it): SQLite applies such a log to whatever file is next opened under that
+  name. The logs are looked for where SQLite names them: beside the canonical path on
+  Unix, beside the absolute path as given on Windows (`GetFullPathNameW`, which resolves
+  no link; `canonicalize` fails outright on some Windows volumes), and for a Windows
+  read through a file link beside its target as well, where a program that opened the
+  target by its own name keeps them (the read takes the target's bytes either way). Only NotFound means "no log": a log that exists but cannot be opened, a main
+  file that exists but cannot be opened for its lock probe, or (Unix) a destination
+  folder that cannot be resolved refuses as unchecked (`ERR_DATABASE_LOG_UNCHECKED`,
+  `ERR_DESTINATION_UNCHECKED`) wherever SQLite would read it (on the WASM read and save
+  a file whose location cannot be resolved is refused first, as `ERR_FILE_UNRESOLVABLE`); where sqlite3 3.54.1
+  ignores one (an empty `-wal` or `-journal`, or a `-shm` beside no non-empty `-wal`,
+  under a rollback header) it passes
+  (`a_log_that_cannot_be_opened_is_judged_as_sqlite_judges_it`). A lock query the volume
+  itself cannot answer is different: a failed `F_GETLK`, or a `LockFileEx` try that fails
+  with anything but a lock violation (logged on stderr), reads as "no lock held", because
+  SQLite needs those same locks to run a connection there, so no WAL-mode or EXCLUSIVE
+  connection can be holding one.
 - **maxFileSize is the shell's to enforce, on BOTH engines.** `native_open` (before
   spawning) and `read_database_bytes` (on the open descriptor, before allocating) take
   the page's bound and refuse with one `ERR_FILE_TOO_LARGE` sentence; the host never
@@ -167,9 +251,10 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   the VS Code host refuses before choosing an engine for the same reason). The desktop's
   default is the setting's ceiling, 4000 MiB, not the extension's 200: the primary engine
   maps the file, so a 400 MiB database is the flagship case (smoke 37). 0 = unlimited.
-- Viewer artifacts are sha256-manifested — run `--verify` before building a release.
+- Viewer artifacts are sha256-manifested — run `node scripts/build-viewer.mjs --verify` and
+  `npm run check:viewer` before building a release.
 
-### Deferred security hardening (fast-follow, tracked)
+### Deferred security hardening
 
 Not yet closed; all inside the "local attacker already owns the DB's directory" threat model
 (F1, the arbitrary-overwrite exploit, IS closed):
@@ -194,7 +279,8 @@ Not yet closed; all inside the "local attacker already owns the DB's directory" 
 
 ## Repo model
 
-The public repository starts from a single snapshot commit on `main`. The current
-viewer pin is on the extension repository's public `desktop-v1.8.1-port` branch; see
-`docs/extension-1.8.1-port.md` for that integration's scope and verification.
-`docs/superpowers/` and `.superpowers/` are gitignored working files.
+The public repository starts from a single snapshot commit on `main`. The viewer
+was imported into `viewer/` from the extension repository's desktop port of v1.9.0 and is
+developed here since; the two codebases diverge from that point.
+`docs/superpowers/`, `.superpowers/` and `.playwright-mcp/` are local working files, excluded
+through `.git/info/exclude` rather than `.gitignore`; never commit them.

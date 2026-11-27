@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQLite Explorer</title>
+    <!--HEAD-->
+    <style nonce="<!--NONCE-->">
+<!--STYLES-->
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar Panel -->
+        <div class="sidebar-panel" id="sidebarPanel">
+            <div class="sidebar-header">
+                <span>Explorer</span>
+                <div class="sidebar-actions">
+                    <button type="button" class="icon-button" id="btnReload" title="Reload" aria-label="Reload database">
+                        <span class="codicon codicon-refresh"></span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="sidebar-filter-container">
+                <input type="text" class="sidebar-filter-input" id="sidebarFilterInput" placeholder="Filter..." aria-label="Filter tables, views, and indexes">
+            </div>
+
+            <button type="button" class="section-title hidden" id="btnOpenQuery"
+                title="Open a SQL editor for this database" aria-label="New SQL query">
+                <span class="codicon codicon-code mr-6" aria-hidden="true"></span>
+                <span>SQL Query</span>
+            </button>
+
+            <div class="sidebar-scroll-area">
+                <!-- Open Databases Section (desktop only). The shell holds N
+                     databases at once; this is the overview half of that, the
+                     tab strip below being the switcher. Ships hidden and empty
+                     like #btnSqlConsole and #engineBadge — only the desktop
+                     entry runs modules/db-tabs.js, which unhides both from the
+                     second open database on and owns everything inside the
+                     list. Collapsing works through the shared toggleSection
+                     path (data-section + the matching `${section}List` id). -->
+                <div class="section-title" id="sectionOpenDatabases" hidden>
+                    <button type="button" class="section-toggle" data-section="openDatabases"
+                        aria-expanded="true" aria-controls="openDatabasesList">
+                        <span class="arrow" aria-hidden="true">▼</span>
+                        <span>Open Databases</span>
+                        <span class="badge" id="openDatabasesBadge">0</span>
+                    </button>
+                </div>
+                <ul class="item-list" id="openDatabasesList" hidden></ul>
+
+                <!-- Tables Section -->
+                <div class="section-title" id="sectionTables">
+                    <button type="button" class="section-toggle" data-section="tables"
+                        aria-expanded="true" aria-controls="tablesList">
+                        <span class="arrow" aria-hidden="true">▼</span>
+                        <span>Tables</span>
+                        <span class="badge" id="tablesBadge">0</span>
+                    </button>
+                    <button type="button" class="icon-button" id="btnOpenCreateTable" title="Create Table" aria-label="Create table">
+                        <span class="codicon codicon-add"></span>
+                    </button>
+                </div>
+                <ul class="item-list" id="tablesList"></ul>
+
+                <!-- Views Section -->
+                <div class="section-title collapsed" id="sectionViews">
+                    <button type="button" class="section-toggle" data-section="views"
+                        aria-expanded="false" aria-controls="viewsList">
+                        <span class="arrow" aria-hidden="true">▼</span>
+                        <span>Views</span>
+                        <span class="badge" id="viewsBadge">0</span>
+                    </button>
+                    <button type="button" class="icon-button" id="btnOpenCreateView" title="Create View" aria-label="Create view">
+                        <span class="codicon codicon-add"></span>
+                    </button>
+                </div>
+                <ul class="item-list hidden" id="viewsList"></ul>
+
+                <!-- Indexes Section -->
+                <div class="section-title collapsed" id="sectionIndexes">
+                    <button type="button" class="section-toggle" data-section="indexes"
+                        aria-expanded="false" aria-controls="indexesList">
+                        <span class="arrow" aria-hidden="true">▼</span>
+                        <span>Indexes</span>
+                        <span class="badge" id="indexesBadge">0</span>
+                    </button>
+                </div>
+                <ul class="item-list hidden" id="indexesList"></ul>
+
+                <!-- Batch Update Section -->
+                <button type="button" class="section-title hidden" id="batchUpdateSectionTitle"
+                    data-section="batchUpdate" data-preserve-grid-selection aria-expanded="true"
+                    aria-controls="batchUpdateList">
+                    <span class="arrow" aria-hidden="true">▼</span>
+                    <span>Batch Update</span>
+                    <span class="badge" id="batchUpdateCount">0</span>
+                </button>
+                <div class="item-list hidden" id="batchUpdateList" data-preserve-grid-selection>
+                    <div class="batch-update-container">
+                        <button type="button" class="btn-primary batch-update-btn" id="btnApplyBatchUpdate">Apply Changes</button>
+                        <div id="batchUpdateFields"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Configuration Section -->
+            <button type="button" class="section-title settings-section" id="btnOpenSettings">
+                <span class="codicon codicon-settings mr-6"></span>
+                <span>Configuration</span>
+            </button>
+
+            <div class="resize-handle" id="resizeHandle" role="separator" tabindex="0"
+                aria-label="Resize sidebar" aria-orientation="vertical" aria-valuemin="150"
+                aria-valuemax="400" aria-valuenow="220"></div>
+        </div>
+
+        <!-- Main Panel -->
+        <div class="main-panel">
+            <!-- Database tab strip (desktop only): one tab per open database,
+                 the primary in-window switcher. Ships hidden and empty like the
+                 Open Databases section above; modules/db-tabs.js fills it and
+                 unhides it from the second database on. `role="group"` rather
+                 than a tablist: there is one grid pane, not one per tab. -->
+            <div class="db-tab-strip" id="dbTabStrip" role="group" aria-label="Open databases" hidden></div>
+
+            <!-- Toolbar -->
+            <div class="toolbar-panel">
+                <div class="toolbar-left">
+                    <div class="current-table" id="currentTable">
+                        <span class="codicon codicon-table"></span>
+                        <span id="tableNameLabel">No table selected</span>
+                    </div>
+                </div>
+                <div class="toolbar-right">
+                    <button type="button" class="toolbar-button" id="btnSqlConsole" hidden>
+                        <span class="codicon codicon-terminal"></span> SQL
+                    </button>
+                    <button type="button" class="toolbar-button" id="btnAddRow" disabled>
+                        <span class="codicon codicon-add"></span> Add Row
+                    </button>
+                    <button type="button" class="toolbar-button" id="btnAddColumn" disabled>
+                        <span class="codicon codicon-insert"></span> Add Column
+                    </button>
+                    <button type="button" class="toolbar-button" id="btnDeleteRows" data-preserve-grid-selection disabled>
+                        <span class="codicon codicon-trash"></span> Delete
+                    </button>
+                    <button type="button" class="toolbar-button" id="btnExport" data-preserve-grid-selection disabled>
+                        <span class="codicon codicon-export"></span> Export
+                    </button>
+                    <button type="button" class="toolbar-button" id="btnImportData" data-preserve-grid-selection hidden>
+                        <span class="codicon codicon-desktop-download"></span> Import
+                    </button>
+                    <div class="filter-group" data-preserve-grid-selection>
+                        <div class="filter-input-wrap">
+                            <input type="text" class="filter-input" id="filterInput" placeholder="Filter..." aria-label="Filter table data">
+                            <button type="button" class="filter-clear-btn" id="btnClearFilter" aria-label="Clear table filter" title="Clear table filter" hidden><span class="codicon codicon-close"></span></button>
+                            <span class="filter-match-counter" id="filterMatchCounter"></span>
+                        </div>
+                        <button type="button" class="filter-apply-btn filter-apply-btn-toolbar" id="btnApplyFilter"
+                            title="Search — Enter: next match, Shift+Enter: previous" aria-label="Search table"><span class="codicon codicon-search"></span></button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Grid Container -->
+            <div class="grid-container" id="gridContainer">
+                <div class="loading-view" id="loadingView">
+                    <div class="loading-spinner"></div>
+                    <span>Connecting to database...</span>
+                </div>
+            </div>
+
+            <!-- SQL Console (desktop only). Ships hidden and inert: VS Code and
+                 the web demo never run the desktop init that unhides it, and
+                 console.js owns everything inside #consoleHost (it clears the
+                 element before mounting, so nothing may be authored in there).
+                 data-preserve-grid-selection keeps grid-events.js's
+                 handleDocumentClick from reading a click in here as an
+                 outside-click and dropping the grid's live selection. -->
+            <div class="console-container" id="consoleContainer" hidden data-preserve-grid-selection>
+                <div class="sql-console-host" id="consoleHost"></div>
+                <div class="sql-console-results" id="consoleResults"></div>
+                <div class="sql-console-page-notice" id="consoleNotice" hidden></div>
+            </div>
+
+            <!-- Footer -->
+            <div class="footer-panel">
+                <div class="footer-left">
+                    <span id="statusText" role="status" aria-live="polite" aria-atomic="true">Ready</span>
+                    <!-- Engine badge (desktop only): which engine serves the
+                         current open, 'native' or 'wasm'. Ships hidden in the
+                         shared template like #btnSqlConsole; only
+                         desktop-viewer.js unhides and fills it. -->
+                    <span id="engineBadge" class="engine-badge" hidden></span>
+                </div>
+                <div class="footer-right">
+                    <div class="page-selector">
+                        <label for="pageSizeSelect">Rows:</label>
+                        <select id="pageSizeSelect" aria-describedby="pageSizeNote">
+                            <option value="100">100</option>
+                            <option value="250">250</option>
+                            <option value="500">500</option>
+                            <option value="1000">1000</option>
+                            <option value="2500">2500</option>
+                            <option value="5000" selected>5000</option>
+                            <option value="10000">10000</option>
+                        </select>
+                        <span id="pageSizeNote" class="page-size-note" hidden></span>
+                    </div>
+                    <div class="page-selector">
+                        <label for="dateFormatSelect">Date Format:</label>
+                        <select id="dateFormatSelect">
+                            <option value="raw">Raw</option>
+                            <option value="local">Local</option>
+                            <option value="iso">ISO</option>
+                            <option value="relative">Relative</option>
+                        </select>
+                    </div>
+                    <div class="pagination-controls">
+                        <button type="button" id="btnFirst" aria-label="First page" disabled>⏮</button>
+                        <button type="button" id="btnPrev" aria-label="Previous page" disabled>◀</button>
+                        <span id="pageIndicator">0 / 0</span>
+                        <button type="button" id="btnNext" aria-label="Next page" disabled>▶</button>
+                        <button type="button" id="btnLast" aria-label="Last page" disabled>⏭</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <p id="multilineEditorKeyboardHint" class="visually-hidden">
+        Press Escape, then Tab to move focus out of the editor.
+    </p>
+
+    <!-- Create/Edit View Modal -->
+    <div class="modal-overlay hidden" id="viewModal" role="dialog" aria-modal="true"
+        aria-labelledby="viewModalTitle">
+        <div class="modal-dialog modal-dialog-lg view-editor-dialog">
+            <div class="modal-header">
+                <span class="modal-title" id="viewModalTitle">Create View</span>
+                <button type="button" class="modal-close" data-modal="viewModal" aria-label="Close view editor">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label for="viewNameInput">View Name</label>
+                    <input type="text" id="viewNameInput" placeholder="view_name">
+                </div>
+                <div class="form-field">
+                    <label for="viewSelectSql">SELECT Definition</label>
+                    <textarea id="viewSelectSql" class="view-sql-editor" spellcheck="false"
+                        aria-describedby="multilineEditorKeyboardHint"></textarea>
+                </div>
+                <div class="view-trigger-options" id="viewTriggerOptions" hidden>
+                    <label class="view-trigger-label">
+                        <input type="checkbox" id="viewPreserveTriggers" checked>
+                        <span id="viewTriggerSummary">Preserve INSTEAD OF triggers</span>
+                    </label>
+                </div>
+                <div class="view-validation-status" id="viewValidationStatus" role="status"></div>
+                <div class="view-preview" id="viewPreview" hidden></div>
+            </div>
+            <div class="modal-footer view-modal-footer">
+                <button type="button" class="btn-secondary" id="btnOpenViewInVsCode" hidden>Edit in VS Code</button>
+                <button type="button" class="btn-secondary" id="btnReloadViewDefinition" hidden>Reload Latest</button>
+                <span class="flex-spacer"></span>
+                <button type="button" class="btn-secondary" id="btnValidateView">Validate</button>
+                <button type="button" class="btn-secondary" id="btnPreviewView">Preview</button>
+                <button type="button" class="btn-secondary modal-cancel" data-modal="viewModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSaveView">Create View</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Row Modal -->
+    <div class="modal-overlay hidden" id="addRowModal" role="dialog" aria-modal="true"
+        aria-labelledby="addRowModalTitle">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title" id="addRowModalTitle">Add New Row</span>
+                <button type="button" class="modal-close" data-modal="addRowModal" aria-label="Close add row">&times;</button>
+            </div>
+            <div class="modal-body" id="addRowForm"></div>
+            <div class="modal-error" id="addRowModalError" role="alert" hidden></div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary modal-cancel" data-modal="addRowModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitAddRow">Add Row</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Delete Confirmation Modal -->
+    <div class="modal-overlay hidden" id="deleteModal" role="dialog" aria-modal="true"
+        aria-labelledby="deleteModalTitle">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title" id="deleteModalTitle">Confirm Delete</span>
+                <button type="button" class="modal-close" data-modal="deleteModal" aria-label="Close delete confirmation">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p id="deleteConfirmText">Are you sure you want to delete the selected rows?</p>
+            </div>
+            <div class="modal-error" id="deleteModalError" role="alert" hidden></div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary modal-cancel" data-modal="deleteModal">Cancel</button>
+                <button type="button" class="btn-danger" id="btnSubmitDelete">Delete</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create Table Modal -->
+    <div class="modal-overlay hidden" id="createTableModal" role="dialog" aria-modal="true"
+        aria-labelledby="createTableModalTitle">
+        <div class="modal-dialog modal-dialog-md">
+            <div class="modal-header">
+                <span class="modal-title" id="createTableModalTitle">Create New Table</span>
+                <button type="button" class="modal-close" data-modal="createTableModal" aria-label="Close create table">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label for="newTableName">Table Name</label>
+                    <input type="text" id="newTableName" placeholder="my_table">
+                </div>
+                <div class="form-field">
+                    <span class="form-group-label" id="columnDefinitionsLabel">Columns</span>
+                    <div id="columnDefinitions" role="group" aria-labelledby="columnDefinitionsLabel"></div>
+                    <button type="button" class="btn-secondary mt-8" id="btnAddColumnDef">+ Add Column</button>
+                </div>
+                <label for="newTableWithoutRowid">
+                    <input type="checkbox" id="newTableWithoutRowid"> WITHOUT ROWID (requires a primary key)
+                </label>
+            </div>
+            <div class="modal-error" id="createTableModalError" role="alert" hidden></div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary modal-cancel" data-modal="createTableModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitCreateTable">Create Table</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Column Modal -->
+    <div class="modal-overlay hidden" id="addColumnModal" role="dialog" aria-modal="true"
+        aria-labelledby="addColumnModalTitle">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title" id="addColumnModalTitle">Add Column</span>
+                <button type="button" class="modal-close" data-modal="addColumnModal" aria-label="Close add column">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label for="newColumnName">Column Name</label>
+                    <input type="text" id="newColumnName" placeholder="column_name">
+                </div>
+                <div class="form-field">
+                    <label for="newColumnType">Type</label>
+                    <select id="newColumnType">
+                        <option value="TEXT">TEXT</option>
+                        <option value="INTEGER">INTEGER</option>
+                        <option value="REAL">REAL</option>
+                        <option value="BLOB">BLOB</option>
+                        <option value="NUMERIC">NUMERIC</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <label for="newColumnDefault">Default Value (optional)</label>
+                    <input type="text" id="newColumnDefault" placeholder="NULL">
+                </div>
+            </div>
+            <div class="modal-error" id="addColumnModalError" role="alert" hidden></div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary modal-cancel" data-modal="addColumnModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitAddColumn">Add Column</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Export Modal -->
+    <div class="modal-overlay hidden" id="exportModal" role="dialog" aria-modal="true"
+        aria-labelledby="exportModalTitle">
+        <div class="modal-dialog">
+            <div class="modal-header">
+                <span class="modal-title" id="exportModalTitle">Export Table</span>
+                <button type="button" class="modal-close" data-modal="exportModal" aria-label="Close export">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-field">
+                    <label for="exportFormat">Format</label>
+                    <select id="exportFormat">
+                        <option value="csv">CSV</option>
+                        <option value="json">JSON</option>
+                        <option value="sql">SQL INSERT</option>
+                        <option value="excel">Excel</option>
+                    </select>
+                </div>
+                <div class="form-field">
+                    <span class="form-group-label" id="exportColumnsLabel">Columns</span>
+                    <div id="exportColumns" class="export-columns-list" role="group"
+                        aria-labelledby="exportColumnsLabel">
+                        <!-- Columns populated by JS -->
+                    </div>
+                </div>
+                <div class="form-field">
+                    <span class="form-group-label" id="exportOptionsLabel">Options</span>
+                    <div id="exportOptions" role="group" aria-labelledby="exportOptionsLabel">
+                        <!-- Options populated by JS based on format -->
+                    </div>
+                </div>
+            </div>
+            <div class="modal-error" id="exportModalError" role="alert" hidden></div>
+            <div class="modal-footer">
+                <button type="button" class="btn-secondary modal-cancel" data-modal="exportModal">Cancel</button>
+                <button type="button" class="btn-primary" id="btnSubmitExport">Export</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div class="modal-overlay hidden" id="settingsModal" role="dialog" aria-modal="true"
+        aria-labelledby="settingsModalTitle">
+        <div class="modal-dialog modal-dialog-lg">
+            <div class="modal-header">
+                <span class="modal-title" id="settingsModalTitle">Configuration</span>
+                <button type="button" class="modal-close" data-modal="settingsModal" aria-label="Close configuration">&times;</button>
+            </div>
+            <div class="modal-body" id="pragmaSettingsContainer">
+                <!-- Populated by JS -->
+            </div>
+            <div class="modal-error" id="settingsModalError" role="alert" hidden></div>
+            <div class="modal-footer">
+                <button type="button" class="btn-primary modal-cancel" data-modal="settingsModal">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Cell Preview/Edit Modal - Floating window for viewing and editing large cell values -->
+    <div class="cell-preview-modal hidden" id="cellPreviewModal" role="dialog" aria-modal="true"
+        aria-labelledby="cellPreviewTitle">
+        <div class="cell-preview-dialog">
+            <div class="cell-preview-header">
+                <div class="cell-preview-title" id="cellPreviewTitle">
+                    <span>Column:</span>
+                    <span class="cell-preview-column-name" id="cellPreviewColumnName"></span>
+                    <span class="cell-preview-type-badge" id="cellPreviewTypeBadge"></span>
+                </div>
+                <button type="button" class="cell-preview-close" id="btnCloseCellPreview"
+                    aria-label="Close cell preview">&times;</button>
+            </div>
+            <div class="cell-preview-toolbar">
+                <button type="button" class="cell-preview-toolbar-btn" id="formatJsonBtn" title="Format as JSON">
+                    <span class="codicon codicon-json"></span> Format JSON
+                </button>
+                <button type="button" class="cell-preview-toolbar-btn" id="compactJsonBtn" title="Compact JSON">
+                    <span class="codicon codicon-fold"></span> Compact
+                </button>
+                <button type="button" class="cell-preview-toolbar-btn" id="wrapTextBtn" title="Toggle word wrap">
+                    <span class="codicon codicon-word-wrap"></span> Wrap
+                </button>
+                <button type="button" class="cell-preview-toolbar-btn" id="cellPreviewEmptyBtn"
+                    title="Store an empty string">Empty string</button>
+                <button type="button" class="cell-preview-toolbar-btn" id="cellPreviewNullBtn"
+                    title="Store SQL NULL explicitly">SQL NULL</button>
+                <div class="flex-spacer"></div>
+                <button type="button" class="cell-preview-toolbar-btn" id="cellPreviewDownloadBtn"
+                    title="Download the stored cell, without changing the draft">Download stored cell</button>
+                <button type="button" class="cell-preview-toolbar-btn" id="openInVsCodeBtn" title="Edit in VS Code editor">
+                    <span class="codicon codicon-code"></span> Edit in VS Code
+                </button>
+            </div>
+            <div class="cell-preview-body">
+                <textarea class="cell-preview-textarea" id="cellPreviewTextarea" spellcheck="false"
+                    aria-labelledby="cellPreviewTitle" aria-describedby="multilineEditorKeyboardHint"></textarea>
+            </div>
+            <div class="modal-error" id="cellPreviewModalError" role="alert" hidden></div>
+            <div class="cell-preview-footer">
+                <div class="cell-preview-info">
+                    <span id="cellPreviewCharCount">0 characters</span>
+                    <span id="cellPreviewReadonlyBadge" class="readonly-badge">Read-only (View)</span>
+                </div>
+                <div class="cell-preview-actions">
+                    <button type="button" class="btn-secondary" id="btnCancelCellPreview">Cancel</button>
+                    <button type="button" class="btn-primary" id="cellPreviewSaveBtn">Save</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Blob Inspector Modal -->
+    <div id="blob-inspector-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+        aria-labelledby="blobInspectorModalTitle">
+        <div class="modal-dialog blob-inspector blob-inspector-dialog">
+            <div class="modal-header">
+                <span class="modal-title" id="blobInspectorModalTitle">BLOB Inspector</span>
+                <button type="button" class="modal-close" data-modal="blob-inspector-modal"
+                    aria-label="Close BLOB inspector">&times;</button>
+            </div>
+            <div class="modal-body blob-inspector-body">
+                <div class="tabs blob-inspector-tabs">
+                    <button class="tab-btn active" data-tab="preview">Preview</button>
+                    <button class="tab-btn" data-tab="hex">Hex</button>
+                </div>
+                <div id="blob-info" class="blob-info-bar"></div>
+                <div class="tab-content blob-preview-pane" id="tab-preview">
+                    <!-- Dynamic Content -->
+                    <span class="blob-preview-placeholder">Select a BLOB to inspect</span>
+                </div>
+                <div class="tab-content blob-hex-pane" id="tab-hex">
+                    <div class="blob-hex-navigation" aria-label="Loaded Hex pages">
+                        <button type="button" class="btn-secondary" id="blob-hex-previous">Previous Hex page</button>
+                        <span id="blob-hex-position" role="status"></span>
+                        <button type="button" class="btn-secondary" id="blob-hex-next">Next Hex page</button>
+                    </div>
+                    <pre class="hex-dump hex-dump-content" tabindex="0" role="region"
+                        aria-label="BLOB hexadecimal data"></pre>
+                </div>
+            </div>
+            <div class="modal-error" id="blob-inspector-modalError" role="alert" hidden></div>
+            <div class="modal-footer">
+                <button id="blob-replace-btn" class="btn-secondary">Replace...</button>
+                <button id="blob-load-more-btn" class="btn-secondary" hidden>Load more</button>
+                <button id="blob-save-full-btn" class="btn-secondary" hidden>Download complete cell</button>
+                <button id="blob-download-btn" class="btn-primary">Download</button>
+            </div>
+        </div>
+    </div>
+
+    <script nonce="<!--NONCE-->">
+<!--SCRIPTS-->
+    </script>
+    <!--BODY-->
+</body>
+</html>

@@ -19,9 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 import { readVersions, resolveVersion } from './version.mjs';
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const REPOSITORY = 'zknpr/SQLite-Explorer-App';
-export const VIEWER_REPOSITORY = 'zknpr/SQLite-Explorer';
 
 export const PLATFORMS = {
   macos: { asset: (v) => `SQLite-Explorer-${v}-macos-aarch64.dmg`, label: 'macOS, Apple Silicon' },
@@ -48,7 +46,7 @@ export function sha256File(file) {
   return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
-export function buildManifest({ version, tag, commit, runUrl, viewerRef, assets }) {
+export function buildManifest({ version, tag, commit, runUrl, assets }) {
   return {
     product: 'SQLite Explorer',
     version,
@@ -58,7 +56,6 @@ export function buildManifest({ version, tag, commit, runUrl, viewerRef, assets 
     repository: REPOSITORY,
     commit,
     buildRun: runUrl,
-    viewerSource: { repository: VIEWER_REPOSITORY, ref: viewerRef },
     signing: {
       macos: 'the app has an ad-hoc signature with the hardened runtime; the disk image is unsigned; not Developer ID signed or notarized',
       windows: 'unsigned',
@@ -85,11 +82,11 @@ export function windowsChecksumCommand(asset) {
   return `(Get-FileHash .\\${asset}).Hash -eq ((Select-String -Path SHA256SUMS -SimpleMatch '${asset}').Line -split ' ')[0]`;
 }
 
-export function releaseNotes({ version, commit, runUrl, viewerRef }) {
+export function releaseNotes({ version, commit, runUrl }) {
   const rows = Object.values(PLATFORMS).map((p) => `| ${p.label} | \`${p.asset(version)}\` |`);
   return `SQLite Explorer ${version}: a desktop SQLite browser and editor built on the SQLite Explorer viewer.
 
-Built by [this workflow run](${runUrl}) from ${REPOSITORY}@${commit}, with the viewer from ${VIEWER_REPOSITORY}@${viewerRef}.
+Built by [this workflow run](${runUrl}) from ${REPOSITORY}@${commit}, viewer included (it is built from viewer/ in the same commit).
 
 | Platform | Download |
 | --- | --- |
@@ -154,16 +151,15 @@ function main(argv) {
   if (problems) {
     throw new Error(`dist is not the release: missing [${problems.missing.join(', ')}], unexpected [${problems.unexpected.join(', ')}]`);
   }
-  const viewerRef = JSON.parse(fs.readFileSync(path.join(repoRoot, 'viewer-dist', 'manifest.json'), 'utf8')).ref;
   const assets = expectedAssets(version).map((name) => {
     const file = path.join(dist, name);
     return { name, bytes: fs.statSync(file).size, sha256: sha256File(file) };
   });
   const manifestPath = path.join(dist, 'release-manifest.json');
-  fs.writeFileSync(manifestPath, JSON.stringify(buildManifest({ version, tag, commit, runUrl, viewerRef, assets }), null, 2) + '\n');
+  fs.writeFileSync(manifestPath, JSON.stringify(buildManifest({ version, tag, commit, runUrl, assets }), null, 2) + '\n');
   const sums = [...assets, { name: 'release-manifest.json', sha256: sha256File(manifestPath) }];
   fs.writeFileSync(path.join(dist, 'SHA256SUMS'), checksumsText(sums));
-  fs.writeFileSync(notesPath, releaseNotes({ version, commit, runUrl, viewerRef }));
+  fs.writeFileSync(notesPath, releaseNotes({ version, commit, runUrl }));
   for (const { name, sha256 } of sums) console.log(`assemble: ${sha256}  ${name}`);
 }
 
