@@ -2592,6 +2592,12 @@ fn finish_app_exit(app: &AppHandle) {
         // app exit requests use code 0; this also covers a committed OS logoff.
         // Revisit when Tauri adopts https://github.com/tauri-apps/tao/pull/1157.
         app.cleanup_before_exit();
+        // Tauri restarts only after this callback returns, which the exit below
+        // pre-empts: the Restart offered when an update's installer could not
+        // start relaunches here instead.
+        if updater::relaunch_requested() {
+            tauri::process::restart(&app.env());
+        }
         std::process::exit(0);
     }
 }

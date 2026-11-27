@@ -16,7 +16,11 @@
 //! GitHub repository alone cannot ship an update.
 //!
 //! Each check is one GET of that manifest from github.com, plus the package's
-//! download when there is an update. Nothing about the user or their files is sent.
+//! download when there is an update; GitHub redirects both to its download server
+//! (release-assets.githubusercontent.com). `allowed_download` holds the package
+//! request to this repository's releases; the redirect is GitHub's and is not
+//! pinned, since a host list here would stop every installed copy updating if
+//! GitHub moved its downloads. Nothing about the user or their files is sent.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,7 +64,7 @@ pub(crate) struct UpdaterState {
 
 /// The first-launch question.
 const CONSENT_QUESTION: &str = "Check for updates automatically?\n\n\
-When it starts, at most once a day, SQLite Explorer can check github.com for a new version. \
+When it starts, at most once a day, SQLite Explorer can check GitHub for a new version. \
 If there is one, it downloads it from the project's releases there and asks before installing it. \
 GitHub sees your IP address and the updater's name, nothing about you or your files. \
 You can change this later in the SQLite Explorer menu.";
@@ -333,7 +337,7 @@ fn run(app: &AppHandle, trigger: Trigger) {
             eprintln!("updater: could not record the check: {e}");
         }
     }
-    let update = match found {
+    let mut update = match found {
         Ok(Some(update)) => update,
         Ok(None) => {
             if manual {
@@ -368,6 +372,9 @@ fn run(app: &AppHandle, trigger: Trigger) {
         );
         return;
     }
+    // The builder's deadline covers the manifest request only: the plugin builds
+    // the update with `timeout: None`, and the download reads that.
+    update.timeout = Some(UPDATE_REQUEST_TIMEOUT);
     let bytes = match tauri::async_runtime::block_on(update.download(|_, _| {}, || {})) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -395,6 +402,9 @@ fn run(app: &AppHandle, trigger: Trigger) {
                 update.version
             );
             if ask(app, TITLE, &text, true, ("Restart", "Quit")) {
+                // `finish_app_exit` ends a Windows process inside RunEvent::Exit,
+                // before Tauri's own restart runs; this has it relaunch there.
+                RELAUNCH_ON_EXIT.store(true, Ordering::Release);
                 app.request_restart();
             } else {
                 app.exit(0);
@@ -488,7 +498,8 @@ fn updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, Unanswered>
     builder.build().map_err(|e| Unanswered::Failed(e.to_string()))
 }
 
-/// A bound on the manifest request and on the package download, each: without
+/// A bound on the manifest request (the builder's) and on the package download
+/// (set on the update in `run`), each: without
 /// one a stalled connection kept the flight slot, and every later Check for
 /// Updates… said a check was in progress, until the app restarted. Long enough
 /// for a package of about 25 MB on a slow link.
@@ -496,6 +507,16 @@ const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Set by the Windows hook once every engine process is closed (see `run`).
 static ENGINES_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Set when the user picks Restart after a failed Windows installer handoff, so
+/// `finish_app_exit` relaunches the app (see `run`).
+static RELAUNCH_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+/// Whether the app relaunches itself as it exits (Windows; see `run`).
+#[cfg(windows)]
+pub(crate) fn relaunch_requested() -> bool {
+    RELAUNCH_ON_EXIT.load(Ordering::Acquire)
+}
 
 /// How this copy installs an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -890,5 +911,35 @@ mod tests {
         assert!(dpkg_route(exe, true, Some("/usr/bin/something-else\n")).is_err());
         // Not built as a .deb (an AUR source build, a local build).
         assert!(dpkg_route(exe, false, Some(list)).is_err());
+    }
+
+    /// tauri-plugin-updater 2.14.1 builds the update with `timeout: None`
+    /// (`update_from_release`), and `download` reads only that: the builder's
+    /// deadline covered the manifest request, never the package.
+    #[test]
+    fn the_package_download_has_its_own_deadline() {
+        let source = include_str!("updater.rs");
+        let run = &source[source.find("fn run(app: &AppHandle").expect("fn run")..];
+        let run = &run[..run.find("\n}\n").expect("its end")];
+        let bound = run.find("update.timeout = Some(UPDATE_REQUEST_TIMEOUT);").expect("no deadline on the download");
+        assert!(bound < run.find("update.download(").expect("the download"));
+    }
+
+    /// On Windows `finish_app_exit` ends the process inside `RunEvent::Exit`,
+    /// before Tauri's restart-on-exit runs, so the Restart offered after a
+    /// failed installer handoff has to relaunch there.
+    #[test]
+    fn restart_after_a_failed_windows_handoff_relaunches() {
+        let source = include_str!("updater.rs");
+        let run = &source[source.find("fn run(app: &AppHandle").expect("fn run")..];
+        let run = &run[..run.find("\n}\n").expect("its end")];
+        let asked = run.find("RELAUNCH_ON_EXIT.store(true").expect("Restart does not ask for a relaunch");
+        assert!(asked < run.find("app.request_restart()").expect("the restart"));
+        let lib = include_str!("lib.rs");
+        let exit = &lib[lib.find("fn finish_app_exit(").expect("fn finish_app_exit")..];
+        let exit = &exit[..exit.find("\n}\n").expect("its end")];
+        let relaunch = exit.find("updater::relaunch_requested()").expect("the exit never relaunches");
+        assert!(exit.contains("tauri::process::restart(&app.env())"));
+        assert!(relaunch < exit.find("std::process::exit(0)").expect("the exit"));
     }
 }

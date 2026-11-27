@@ -258,11 +258,16 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   The trusted key is `plugins.updater.pubkey`, pinned by
   `the_updater_trusts_the_release_key_not_the_qa_key`; its private half is offline and
   `scripts/release/sign-update.mjs` signs a draft before it is published. A package is
-  fetched only from the configured endpoint's origin and releases path
-  (`allowed_download`: the manifest is unsigned), within `UPDATE_REQUEST_TIMEOUT`. An
+  requested only from the configured endpoint's origin and releases path
+  (`allowed_download`: the manifest is unsigned; GitHub's redirect to its download
+  server is followed, not pinned), and the manifest and the package each within
+  `UPDATE_REQUEST_TIMEOUT` (the package's is set on the update in `run`: the plugin
+  gives it none). An
   install asks Quit's unsaved-changes question before, and again before restarting
   (Linux and macOS wait on an authorization prompt meanwhile). Windows stops every sidecar in the
-  plugin's `on_before_exit` (it exits the process with no `RunEvent::Exit`); macOS
+  plugin's `on_before_exit` (it exits the process with no `RunEvent::Exit`), and when
+  the installer then fails to start, Restart relaunches from `finish_app_exit`
+  (`relaunch_requested`); macOS
   installs only from inside an `.app` (the plugin swaps the directory three levels above
   the executable, which for a bare binary is the checkout); Linux runs `pkexec dpkg -i`
   itself, only for a copy dpkg installed (never the plugin's .deb path, which on a failed
