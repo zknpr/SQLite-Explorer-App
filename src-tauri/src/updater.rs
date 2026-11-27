@@ -329,16 +329,24 @@ fn run(app: &AppHandle, trigger: Trigger) {
     if !ask(app, TITLE, &question, false, ("Install and Restart", "Later")) {
         return;
     }
-    if !unsaved_work_may_close(app) {
+    if !unsaved_work_may_close(app, "Installing the update closes them without saving. Install anyway?", "Install Anyway") {
         return;
     }
-    match install(&update, &bytes, route) {
-        Ok(()) => app.request_restart(),
-        Err(e) => say(
+    if let Err(e) = install(&update, &bytes, route) {
+        say(app, &format!("SQLite Explorer {} was not installed: {e}", update.version), MessageDialogKind::Warning);
+        return;
+    }
+    // Asked again: on Linux the install waited on pkexec and dpkg, and on macOS
+    // perhaps on an administrator prompt, while the windows stayed editable.
+    // Windows does not get here; the plugin has ended the process.
+    if unsaved_work_may_close(app, "The update is installed; restarting closes them without saving. Restart now?", "Restart Now") {
+        app.request_restart();
+    } else {
+        say(
             app,
-            &format!("SQLite Explorer {} was not installed: {e}", update.version),
-            MessageDialogKind::Warning,
-        ),
+            &format!("SQLite Explorer {} is installed and starts the next time you open the app.", update.version),
+            MessageDialogKind::Info,
+        );
     }
 }
 
@@ -478,9 +486,10 @@ fn install_with_dpkg(bytes: &[u8]) -> Result<(), String> {
 }
 
 /// Installing restarts the app, so every window's unsaved work goes: asked as
-/// Quit asks, in the same single slot (`QuitPrompt`), so a Quit and an update
-/// never put two of these questions on screen.
-fn unsaved_work_may_close(app: &AppHandle) -> bool {
+/// Quit asks, with `question` for Quit's "Close anyway?", in the same single slot
+/// (`QuitPrompt`), so a Quit and an update never put two of these questions on
+/// screen.
+fn unsaved_work_may_close(app: &AppHandle, question: &str, confirm: &str) -> bool {
     let CloseDecision::Confirm { databases } = quit_decision_for(&app.state::<Windows>()) else {
         return true;
     };
@@ -488,9 +497,8 @@ fn unsaved_work_may_close(app: &AppHandle) -> bool {
         say(app, "Answer the open question about unsaved changes first.", MessageDialogKind::Info);
         return false;
     };
-    let text = unsaved_prompt(databases)
-        .replace("Close anyway?", "Installing the update closes them without saving. Install anyway?");
-    ask(app, "Unsaved Changes", &text, true, ("Install Anyway", "Cancel"))
+    let text = unsaved_prompt(databases).replace("Close anyway?", question);
+    ask(app, "Unsaved Changes", &text, true, (confirm, "Cancel"))
 }
 
 /// Asks on the focused window and waits; `true` only for the first button.
@@ -576,6 +584,23 @@ mod tests {
 
     /// scripts/qa/updater: the key the end-to-end QA builds sign with.
     const QA_ONLY_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMxMjNBRjY4ODE5NkI5M0MKUldROHVaYUJhSzhqTVRiaUs4d1ZzUmJwTVBKaWp1cmxTa0I2K29NdTFrTENXU3oxd0xZNGJjKzYK";
+
+    /// On Linux the install waits on pkexec and dpkg, and on macOS possibly on an
+    /// administrator prompt, while every window stays editable: an edit made
+    /// then must not be discarded by the restart (Codex review, #9).
+    #[test]
+    fn a_restart_after_an_install_asks_about_unsaved_work_again() {
+        let source = include_str!("updater.rs");
+        let run = &source[source.find("fn run(app: &AppHandle").expect("fn run")..];
+        let run = &run[..run.find("\nenum Unanswered").expect("the end of fn run")];
+        let install = run.find("install(&update").expect("run installs");
+        let restart = run.find("request_restart()").expect("run restarts");
+        assert!(install < restart);
+        assert!(
+            run[install..restart].contains("unsaved_work_may_close("),
+            "no unsaved-changes question between the install and the restart"
+        );
+    }
 
     #[test]
     fn no_release_build_enables_the_qa_mode() {
