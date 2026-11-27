@@ -165,6 +165,20 @@ fn show_mark(app: &AppHandle, enabled: bool) {
     }
 }
 
+/// QA builds only (`--features qa-updater`, never in a release): with
+/// `SQLITE_EXPLORER_QA_UPDATE=1` the app runs one Check for Updates… a few
+/// seconds after launch and answers every question with its first button, both
+/// logged on stderr, so an end-to-end update runs with nobody at the screen.
+#[cfg(feature = "qa-updater")]
+fn qa_mode() -> bool {
+    std::env::var("SQLITE_EXPLORER_QA_UPDATE").as_deref() == Ok("1")
+}
+
+#[cfg(not(feature = "qa-updater"))]
+fn qa_mode() -> bool {
+    false
+}
+
 /// One check, download or install at a time, app-wide.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
@@ -197,6 +211,13 @@ pub(crate) fn schedule_automatic_check(app: &AppHandle) {
         return;
     }
     let app = app.clone();
+    if qa_mode() {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            run(&app, Trigger::Menu);
+        });
+        return;
+    }
     std::thread::spawn(move || {
         std::thread::sleep(AUTO_CHECK_DELAY);
         let state = {
@@ -474,6 +495,10 @@ fn unsaved_work_may_close(app: &AppHandle) -> bool {
 
 /// Asks on the focused window and waits; `true` only for the first button.
 fn ask(app: &AppHandle, title: &str, text: &str, warning: bool, buttons: (&str, &str)) -> bool {
+    if qa_mode() {
+        eprintln!("qa-updater: {title}: {text} -> {}", buttons.0);
+        return true;
+    }
     let parent = target_window(app).and_then(|label| app.get_webview_window(&label));
     let attached = parent.as_ref().map(|window| window.as_ref().window());
     answer_on(attached.as_ref(), title, text, warning, Some(buttons), || {
@@ -492,6 +517,10 @@ fn ask(app: &AppHandle, title: &str, text: &str, warning: bool, buttons: (&str, 
 }
 
 fn say(app: &AppHandle, text: &str, kind: MessageDialogKind) {
+    if qa_mode() {
+        eprintln!("qa-updater: {text}");
+        return;
+    }
     inform(app, target_window(app).as_deref(), TITLE, text.to_string(), kind);
 }
 
@@ -547,6 +576,16 @@ mod tests {
 
     /// scripts/qa/updater: the key the end-to-end QA builds sign with.
     const QA_ONLY_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMxMjNBRjY4ODE5NkI5M0MKUldROHVaYUJhSzhqTVRiaUs4d1ZzUmJwTVBKaWp1cmxTa0I2K29NdTFrTENXU3oxd0xZNGJjKzYK";
+
+    #[test]
+    fn no_release_build_enables_the_qa_mode() {
+        for workflow in [include_str!("../../.github/workflows/release.yml"), include_str!("../../.github/workflows/ci.yml")] {
+            assert!(!workflow.contains("qa-updater"), "a workflow enables the qa-updater feature");
+        }
+        let manifest = include_str!("../Cargo.toml");
+        let default = manifest.lines().find(|line| line.trim_start().starts_with("default")).unwrap_or("");
+        assert!(!default.contains("qa-updater"), "qa-updater is a default feature");
+    }
 
     #[test]
     fn nothing_is_checked_until_asked_and_the_state_survives_a_bad_file() {

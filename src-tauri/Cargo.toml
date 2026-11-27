@@ -16,6 +16,9 @@ tauri-build = { version = "2.7.6", features = [] }
 [features]
 # Explicitly opted into by the macOS app test runner; never part of a release.
 qa-webdriver = ["dep:tauri-plugin-wdio-webdriver"]
+# End-to-end update runs on test machines (src/updater.rs `qa_mode`); never part of
+# a release, which a test holds against the workflows.
+qa-updater = []
 
 [dependencies]
 tauri = { version = "2.12.7", features = [] }
