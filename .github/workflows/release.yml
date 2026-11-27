@@ -126,6 +126,11 @@ jobs:
           hdiutil verify "${dmgs[0]}"
           mkdir dist
           cp "${dmgs[0]}" "dist/$(node scripts/release/assemble.mjs asset-name macos)"
+          # The update the app installs itself (src-tauri/src/updater.rs): the bundle,
+          # archived with the app at its root and without AppleDouble files.
+          update="dist/$(node scripts/release/assemble.mjs asset-name macos-update)"
+          COPYFILE_DISABLE=1 tar -C "$(dirname "$app")" -czf "$update" "$(basename "$app")"
+          [ "$(tar -tzf "$update" | cut -d/ -f1 | sort -u)" = "SQLite Explorer.app" ] || { echo "the update archive's root is not the app"; exit 1; }
 
       - name: Check and stage the Linux package
         if: matrix.platform == 'linux'

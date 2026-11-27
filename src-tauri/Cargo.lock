@@ -3634,6 +3634,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-updater",
  "tauri-plugin-wdio-webdriver",
+ "tempfile",
  "tokio",
  "webview2-com",
  "windows",

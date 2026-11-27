@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 use tauri_plugin_dialog::DialogExt;
 
 mod native;
+mod updater;
 #[cfg(target_os = "linux")]
 mod linux_session;
 #[cfg(windows)]
@@ -2566,8 +2567,9 @@ fn join_reapers(windows: &Windows) {
 }
 
 /// Drain every window together, then wait for earlier detached reapers. A native
-/// session must not outlive the shell and keep a user's database open.
-fn finish_app_exit(app: &AppHandle) {
+/// session must not outlive the shell and keep a user's database open. Also the
+/// Windows updater's last step before its installer starts (`updater`).
+fn close_all_sidecars(app: &AppHandle) {
     let windows = app.state::<Windows>();
     let states = all_window_states(&windows);
     let registries: Vec<&native::NativeSidecar> =
@@ -2577,6 +2579,10 @@ fn finish_app_exit(app: &AppHandle) {
         "ERR_NATIVE_SIDECAR_EXITED: the application is exiting",
     );
     join_reapers(&windows);
+}
+
+fn finish_app_exit(app: &AppHandle) {
+    close_all_sidecars(app);
 
     #[cfg(windows)]
     {
@@ -2911,7 +2917,9 @@ fn recent_menu_entries(recents: &[PathBuf]) -> Vec<(String, String, PathBuf)> {
         .collect()
 }
 
-fn build_menu(app: &AppHandle) -> tauri::Result<(Menu<tauri::Wry>, ThemeItems, RecentItems)> {
+fn build_menu(
+    app: &AppHandle,
+) -> tauri::Result<(Menu<tauri::Wry>, ThemeItems, RecentItems, CheckMenuItem<tauri::Wry>)> {
     // `N` is a plain letter key, reachable on every layout — unlike `=`, which AppKit
     // resolved against the active layout and silently dropped (see the zoom-in
     // accelerator note below). Shift+letter is likewise layout-stable.
@@ -3044,12 +3052,24 @@ fn build_menu(app: &AppHandle) -> tauri::Result<(Menu<tauri::Wry>, ThemeItems, R
         true,
         Some("CmdOrCtrl+Q"),
     )?;
+    // Software updates: shell-only, see `updater`. Neither item reaches the page.
+    let check_updates = MenuItem::with_id(app, updater::MENU_CHECK_NOW, "Check for Updates…", true, None::<&str>)?;
+    let check_automatically = CheckMenuItem::with_id(
+        app,
+        updater::MENU_CHECK_AUTOMATICALLY,
+        "Check for Updates Automatically",
+        true,
+        updater::checks_automatically(app),
+        None::<&str>,
+    )?;
     let app_menu = Submenu::with_items(
         app,
         "SQLite Explorer",
         true,
         &[
             &PredefinedMenuItem::about(app, None, None)?,
+            &check_updates,
+            &check_automatically,
             &PredefinedMenuItem::separator(app)?,
             &PredefinedMenuItem::hide(app, None)?,
             &quit,
@@ -3163,7 +3183,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<(Menu<tauri::Wry>, ThemeItems, R
         .into_iter()
         .map(|(id, item)| (id.to_string(), item))
         .collect();
-    Ok((menu, theme_map, recent_map))
+    Ok((menu, theme_map, recent_map, check_automatically))
 }
 
 /// Rebuilds the menu bar from scratch and swaps it in. Called whenever the Open Recent
@@ -3181,7 +3201,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<(Menu<tauri::Wry>, ThemeItems, R
 /// the same timing: it must describe the menu that is actually on screen.
 fn rebuild_menu(app: &AppHandle) {
     match build_menu(app) {
-        Ok((menu, theme_items, recent_items)) => {
+        Ok((menu, theme_items, recent_items, check_automatically)) => {
             if let Err(e) = app.set_menu(menu) {
                 // The OLD menu is still the visible one, so its id→path
                 // snapshot has to stay too — installing the new map here
@@ -3191,6 +3211,7 @@ fn rebuild_menu(app: &AppHandle) {
             }
             *app.state::<ThemeMenu>().0.lock().unwrap() = theme_items;
             *app.state::<RecentMenu>().0.lock().unwrap() = recent_items;
+            *app.state::<updater::UpdaterMenu>().0.lock().unwrap() = Some(check_automatically);
         }
         Err(e) => eprintln!("could not rebuild the menu: {e}"),
     }
@@ -3675,6 +3696,9 @@ pub fn run() {
     let builder = builder.plugin(shell_keys::plugin());
     builder
         .plugin(tauri_plugin_dialog::init())
+        // Driven from Rust only (`updater`): the capability set grants the page none
+        // of its commands.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // App-global: paths the user picked (layer 1 of the path authority), the
         // shared menu bar's theme checkmarks, and the one recents MRU. Everything
         // that belongs to a single window — its sidecar registry, its zoom, its
@@ -3684,6 +3708,7 @@ pub fn run() {
         .manage(ThemeMenu::default())
         .manage(RecentsStore::default())
         .manage(RecentMenu::default())
+        .manage(updater::UpdaterMenu::default())
         .manage(Windows::default())
         // App-global on purpose, and the ONLY native state that is: it is the
         // only place with a view ACROSS windows, which is what "this file is
@@ -3843,10 +3868,12 @@ pub fn run() {
             };
             *app.state::<RecentsStore>().0.lock().unwrap() = recents;
 
-            let (menu, theme_items, recent_items) = build_menu(app.handle())?;
+            let (menu, theme_items, recent_items, check_automatically) = build_menu(app.handle())?;
             app.set_menu(menu)?;
             *app.state::<ThemeMenu>().0.lock().unwrap() = theme_items;
             *app.state::<RecentMenu>().0.lock().unwrap() = recent_items;
+            *app.state::<updater::UpdaterMenu>().0.lock().unwrap() = Some(check_automatically);
+            updater::schedule_automatic_check(app.handle());
 
             // Restore the persisted zoom. Config-declared windows are created before
             // `setup` runs, so the webview is there; if it ever is not, say so rather
@@ -3886,6 +3913,8 @@ pub fn run() {
                     // see the `quit` item in `build_menu` for why this is not
                     // `PredefinedMenuItem::quit`.
                     "quit-app" => request_quit(app),
+                    updater::MENU_CHECK_NOW => updater::check_now(app),
+                    updater::MENU_CHECK_AUTOMATICALLY => updater::toggle_automatic_checks(app),
                     "zoom-in" | "zoom-out" | "zoom-reset" => {
                         let direction = match id {
                             "zoom-in" => 1,

@@ -100,11 +100,12 @@ test('the MPL crates are pinned in Cargo.lock and listed in the notice inventory
   }
 });
 
-test('a release directory must hold exactly the three packages and the shared assets', async () => {
+test('a release directory must hold exactly the three packages, the macOS update and the shared assets', async () => {
   const { checkDist, expectedAssets } = await import('./assemble.mjs');
   const full = expectedAssets('0.3.0');
   assert.deepEqual(full, [
     'SQLite-Explorer-0.3.0-linux-amd64.deb',
+    'SQLite-Explorer-0.3.0-macos-aarch64.app.tar.gz',
     'SQLite-Explorer-0.3.0-macos-aarch64.dmg',
     'SQLite-Explorer-0.3.0-windows-x64-setup.exe',
     'THIRD_PARTY_NOTICES.txt',

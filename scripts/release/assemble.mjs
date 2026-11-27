@@ -3,7 +3,7 @@
  * Release asset names and the release job's bookkeeping, in one place so the
  * build jobs and the release job cannot drift apart.
  *
- *   node scripts/release/assemble.mjs asset-name <macos|linux|windows>
+ *   node scripts/release/assemble.mjs asset-name <macos|linux|windows|macos-update>
  *   node scripts/release/assemble.mjs assemble --dist <dir> --tag <vX.Y.Z>
  *       --commit <sha> --run-url <url> --notes <file>
  *
@@ -27,10 +27,24 @@ export const PLATFORMS = {
   windows: { asset: (v) => `SQLite-Explorer-${v}-windows-x64-setup.exe`, label: 'Windows x86-64' }
 };
 export const SHARED_ASSETS = ['THIRD_PARTY_NOTICES.txt', 'mpl-dependency-sources.tar.gz'];
+
+/**
+ * The packages the app installs itself (src-tauri/src/updater.rs), keyed by the
+ * updater's target names ({os}-{arch}-{bundle type}). Windows and Linux install
+ * the same files people download; macOS replaces the app bundle, from an archive
+ * of it the macOS build job makes. scripts/release/sign-update.mjs signs exactly
+ * these and lists them in latest.json.
+ */
+export const MACOS_UPDATE = (v) => `SQLite-Explorer-${v}-macos-aarch64.app.tar.gz`;
+export const UPDATER_PACKAGES = {
+  'darwin-aarch64-app': MACOS_UPDATE,
+  'windows-x86_64-nsis': PLATFORMS.windows.asset,
+  'linux-x86_64-deb': PLATFORMS.linux.asset
+};
 const GENERATED = ['release-manifest.json', 'SHA256SUMS'];
 
 export function expectedAssets(version) {
-  return [...Object.values(PLATFORMS).map((p) => p.asset(version)), ...SHARED_ASSETS].sort();
+  return [...Object.values(PLATFORMS).map((p) => p.asset(version)), MACOS_UPDATE(version), ...SHARED_ASSETS].sort();
 }
 
 /** Missing and unexpected files, or null when the directory is exactly the release. */
@@ -100,6 +114,10 @@ ${rows.join('\n')}
 
 See the [installation notes](https://github.com/${REPOSITORY}#install) for uninstalling and for the platforms this release was tested on.
 
+## Updating
+
+From 0.4.0 on, the app checks for updates once a day (SQLite Explorer menu → Check for Updates Automatically turns it off) and asks before it installs one. It installs only a package signed with the project's update key. \`${MACOS_UPDATE(version)}\` is the macOS update it installs; to install by hand, use the disk image.
+
 ## Verify the download
 
 Download \`SHA256SUMS\` next to the package, then check it:
@@ -131,11 +149,11 @@ function main(argv) {
     return;
   }
   if (command === 'asset-name') {
-    const platform = PLATFORMS[rest[0]];
-    if (!platform) throw new Error(`asset-name needs one of ${Object.keys(PLATFORMS).join(', ')}`);
+    const name = rest[0] === 'macos-update' ? MACOS_UPDATE : PLATFORMS[rest[0]]?.asset;
+    if (!name) throw new Error(`asset-name needs one of ${[...Object.keys(PLATFORMS), 'macos-update'].join(', ')}`);
     const version = resolveVersion(readVersions());
     if (version instanceof Error) throw version;
-    console.log(platform.asset(version));
+    console.log(name(version));
     return;
   }
   if (command !== 'assemble') throw new Error('usage: assemble.mjs asset-name <platform> | assemble --dist ... --tag ... --commit ... --run-url ... --notes ...');
