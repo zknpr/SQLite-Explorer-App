@@ -85,9 +85,9 @@ AppImage packages are not provided.
 ### Updating
 
 From 0.4.0, the app updates itself. At first launch it asks whether to check
-for updates automatically, once a day; **SQLite Explorer → Check for Updates
-Automatically** changes the answer, and **Check for Updates…** checks at any
-time. It asks before installing an update, and asks again if any window has
+for updates automatically: when it starts, if a day has passed since the last
+check. **SQLite Explorer → Check for Updates Automatically** changes the answer,
+and **Check for Updates…** checks at any time. It asks before installing an update, and asks again if any window has
 unsaved changes. It installs only a package signed with the project's update
 key, checked against the public key built into the app.
 
@@ -98,8 +98,10 @@ key, checked against the public key built into the app.
   prompt. A copy installed another way, such as from the AUR, is told about the
   new version and updates through its package manager.
 
-A check is one request to github.com, which sees your IP address. Nothing
-about your files or settings is sent.
+A check is one request to github.com. When there is a newer version, its
+package (several megabytes) is downloaded from this project's releases there
+before the app asks to install it; the app downloads from nowhere else. GitHub
+sees your IP address. Nothing about your files or settings is sent.
 
 ## Build from a checkout
 

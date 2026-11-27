@@ -257,8 +257,11 @@ the worker, the `ModificationTracker` undo/redo history, and file I/O via the br
   agrees at first launch (the code signing policy's privacy statement depends on it).
   The trusted key is `plugins.updater.pubkey`, pinned by
   `the_updater_trusts_the_release_key_not_the_qa_key`; its private half is offline and
-  `scripts/release/sign-update.mjs` signs a draft before it is published. An install
-  asks Quit's unsaved-changes question first. Windows stops every sidecar in the
+  `scripts/release/sign-update.mjs` signs a draft before it is published. A package is
+  fetched only from the configured endpoint's origin and releases path
+  (`allowed_download`: the manifest is unsigned), within `UPDATE_REQUEST_TIMEOUT`. An
+  install asks Quit's unsaved-changes question before, and again before restarting
+  (Linux and macOS wait on an authorization prompt meanwhile). Windows stops every sidecar in the
   plugin's `on_before_exit` (it exits the process with no `RunEvent::Exit`); macOS
   installs only from inside an `.app` (the plugin swaps the directory three levels above
   the executable, which for a bare binary is the checkout); Linux runs `pkexec dpkg -i`

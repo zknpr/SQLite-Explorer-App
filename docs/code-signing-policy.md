@@ -63,9 +63,11 @@ Build scripts and workflow files count as source and get the same review.
 This program will not transfer any information to other networked systems
 unless specifically requested by the user or the person installing or operating
 it. It has no telemetry or crash reporting. It checks for updates only when the
-user chooses Check for Updates…, or once a day if the user agreed when the
-first launch asked; a check requests the release manifest from github.com and,
-when there is a newer version, downloads its package from there. GitHub
+user chooses Check for Updates…, or, if the user agreed when the first launch
+asked, when the app starts and a day has passed since the last check. A check
+requests the release manifest from github.com and, when there is a newer
+version, downloads its package (several megabytes) from this project's releases
+there before asking to install it; the app downloads from nowhere else. GitHub
 receives the request, with the user's IP address and the updater's name and
 version, under [GitHub's privacy statement](https://docs.github.com/site-policy/privacy-policies/github-general-privacy-statement);
 nothing about the user's files or settings is sent. The bundled

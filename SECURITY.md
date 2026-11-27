@@ -96,7 +96,9 @@ About updates:
 
 - The manifest a check reads (`latest.json`) is not signed. Whoever controls
   the GitHub repository can withhold an update, or announce one that then fails
-  its signature check; they cannot install anything the update key did not sign.
+  its signature check; they cannot install anything the update key did not sign,
+  and the app fetches a package only from the endpoint's origin and the
+  repository's releases path, whatever the manifest names.
 - The update key cannot be replaced without a manual reinstall. If it leaked,
   installed copies would accept packages signed with it until their users
   installed a release with a new key by hand.

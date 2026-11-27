@@ -116,7 +116,7 @@ See the [installation notes](https://github.com/${REPOSITORY}#install) for unins
 
 ## Updating
 
-From 0.4.0 on, the app can update itself. At first launch it asks whether to check for updates once a day (SQLite Explorer menu → Check for Updates Automatically changes the answer; Check for Updates… checks at any time), and it asks before it installs one. It installs only a package signed with the project's update key. \`${MACOS_UPDATE(version)}\` is the macOS update it installs; to install by hand, use the disk image.
+From 0.4.0 on, the app can update itself. At first launch it asks whether to check for updates when it starts, at most once a day (SQLite Explorer menu → Check for Updates Automatically changes the answer; Check for Updates… checks at any time), and it asks before it installs one. It installs only a package signed with the project's update key. \`${MACOS_UPDATE(version)}\` is the macOS update it installs; to install by hand, use the disk image.
 
 ## Verify the download
 

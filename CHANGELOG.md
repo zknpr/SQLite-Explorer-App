@@ -18,8 +18,10 @@
 ### Updates
 
 - The app can update itself: SQLite Explorer → Check for Updates…, and, if
-  you agree when the first launch asks, a check once a day. It asks before
-  installing, and again when a window has unsaved changes. Updates are signed
+  you agree when the first launch asks, a check when the app starts, at most
+  once a day. A newer version is downloaded from the project's releases, then
+  the app asks before installing it, and again when a window has unsaved
+  changes. Updates are signed
   with the project's update key, kept offline; the app installs nothing else.
   macOS replaces the app, Windows runs the new installer, and Linux installs
   the new `.deb` through the administrator prompt.
