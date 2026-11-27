@@ -63,6 +63,17 @@ test('latest.json lists exactly the three update packages, by their release down
     signatures: { ...signatures, 'linux-x86_64-deb': '' } }), /no signature for linux-x86_64-deb/);
 });
 
+test('the signer runs through node on every platform, never through a .cmd shim', async () => {
+  // execFileSync cannot start npm's tauri.cmd on Windows without a shell, so a
+  // Windows signing run stopped before uploading anything (Codex review, #9).
+  const source = fs.readFileSync(new URL('./sign-update.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /tauri\.cmd/);
+  const { signerCommand } = await import('./sign-update.mjs');
+  const [node, cli] = signerCommand();
+  assert.equal(node, process.execPath);
+  assert.match(execFileSync(node, [cli, '--version'], { encoding: 'utf8' }), /^tauri-cli \d/);
+});
+
 test('the draft checksums are read in sha256sum format', () => {
   const sums = parseChecksums(`${'a'.repeat(64)}  one.deb\n${'b'.repeat(64)}  two words.exe\nnot a line\n`);
   assert.equal(sums.get('one.deb'), 'a'.repeat(64));

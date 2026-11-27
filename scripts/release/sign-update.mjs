@@ -111,6 +111,14 @@ export function parseChecksums(text) {
   return sums;
 }
 
+/**
+ * The Tauri CLI as node and its JavaScript entry point. The .cmd shim npm installs
+ * on Windows needs a shell, which execFileSync does not start.
+ */
+export function signerCommand(root = repoRoot) {
+  return [process.execPath, path.join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js')];
+}
+
 function gh(args, options = {}) {
   return execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'], ...options });
 }
@@ -163,11 +171,11 @@ function main(argv) {
     const env = { ...process.env, TAURI_SIGNING_PRIVATE_KEY_PASSWORD: keyPassword() };
     delete env.TAURI_SIGNING_PRIVATE_KEY;
     delete env.TAURI_SIGNING_PRIVATE_KEY_PATH;
-    const tauri = path.join(repoRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tauri.cmd' : 'tauri');
+    const [node, cli] = signerCommand();
     const signatures = {};
     for (const [target, asset] of Object.entries(UPDATER_PACKAGES)) {
       const file = path.join(work, asset(version));
-      execFileSync(tauri, ['signer', 'sign', '--private-key-path', keyPath, '--app-version', version, file], {
+      execFileSync(node, [cli, 'signer', 'sign', '--private-key-path', keyPath, '--app-version', version, file], {
         env, stdio: ['ignore', 'ignore', 'inherit']
       });
       signatures[target] = fs.readFileSync(`${file}.sig`, 'utf8').trim();
