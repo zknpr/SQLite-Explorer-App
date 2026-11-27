@@ -179,9 +179,14 @@ class StandInDatabase {
         } catch (error) {
             // The fork answers trivia-only SQL with an already-finalized
             // statement whose text is empty (sqlite3_prepare_v2 yielding NULL).
-            // node returns a statement too, but every access to it raises
-            // ERR_INVALID_STATE — including the configuration calls above.
-            if ((error as NodeSqliteError)?.code === 'ERR_INVALID_STATE') {
+            // node answers it one of two ways, depending on the release: a
+            // statement every access to which raises ERR_INVALID_STATE (the
+            // configuration calls above included; 24.12.0), or a refusal at
+            // prepare (ERR_INVALID_ARG_VALUE, "no statements"; 24.22.3). Any
+            // other invalid argument is still an error.
+            const { code, message } = error as NodeSqliteError;
+            if (code === 'ERR_INVALID_STATE'
+                || (code === 'ERR_INVALID_ARG_VALUE' && message === 'The SQL query contains no statements.')) {
                 return new StandInStatement(null, '');
             }
             return rethrowAsFork(error);
